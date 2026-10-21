@@ -7,14 +7,14 @@
 
 # Set up
 ## intallation
-'''bash
+````bash
 git clone https://github.com/c-ruprecht/strainer3.git
 cd strainer3/src 
 make
-'''
-
 cd ../
 conda env create -f strainer3_env.yml
+````
+
 
 ## Run test
 There are two tests in strainer3 based on commercially available in vitro cell mix sequencing data (downsampled).
@@ -28,12 +28,17 @@ The examples track strains in Zymo D6331 in a metagenome of D6331 and a metageno
 
 
 ### bash script
+````bash
 cd test
 bash example.sh
+````
+
 ### snakemake
+````bash
 conda activate strainer3_env
 cd test
 snakemake -s strainer3.smk --cores 12 --quiet rules
+````
 
 ## Pulling scrub database
 

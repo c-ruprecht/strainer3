@@ -16,15 +16,15 @@ conda env create -f strainer3_env.yml
 ````
 
 
-## Run test
+## Run tests
 There are two tests in strainer3 based on commercially available in vitro cell mix sequencing data (downsampled).
 The examples track strains in Zymo D6331 in a metagenome of D6331 and a metagenome of ATCC 10 even mix. There are 3 overlaping species between both mixes. The first test is a simple bash script of a tracking a single strain. Secondly, a more complex snakemake runs all target strains in D6331 in both samples.
 
-| Species | ATCC 10 Strain Even Mix (10% each) | Zymo D6331 strain(s) |
+| Species | ATCC 10 Strain Even Mix | Zymo D6331 |
 |---|---|---|
-| *Bifidobacterium adolescentis* | [ATCC 15703](https://www.atcc.org/products/15703) | LMG 10502 |
-| *Enterococcus faecalis* | [ATCC 47077](https://www.atcc.org/products/47077) | IP101412 AER FAA 2 |
-| *Escherichia coli* | [ATCC 700926](https://www.atcc.org/products/700926) | JM109, B-3008, B-2207, B-766, B-1109 |
+| *Bifidobacterium adolescentis* | ATCC 15703 | LMG 10502 |
+| *Enterococcus faecalis* | ATCC 47077| IP101412 AER FAA 2 |
+| *Escherichia coli* | ATCC 700926 | JM109, B-3008, B-2207, B-766, B-1109 |
 
 
 ### bash script
@@ -34,6 +34,8 @@ bash example.sh
 ````
 
 ### snakemake
+Output is created in test directory output-snake. Hit calls for all strains are in output-snake/hit_calls.tsv. The hit calls are based on the coverage_rare_kmers.  
+
 ````bash
 conda activate strainer3_env
 cd test
@@ -41,7 +43,9 @@ snakemake -s strainer3.smk --cores 12 --quiet rules
 ````
 
 ## Pulling scrub database
-
+# Understanding results:
+## hit calls
+- explain hit_call_pr
 # Example workflows
 
 # Functions

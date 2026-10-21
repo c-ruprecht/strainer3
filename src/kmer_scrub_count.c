@@ -1,81 +1,162 @@
 #include <zlib.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "kseq.h"
+#include <string.h>
+#include <strings.h>
+#include <unistd.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
 #include "genome_compare.h"
-#include <inttypes.h>
-KSEQ_INIT(gzFile, gzread)
+#include "kmer_scrub_streaming.h"
+#include "cli_common.h"
 
+/*
+	kmer_scrub_count (inverted-index variant)
 
-/* 
-	TO DO
+	All output goes to one directory (-O) under one basename (-n, or the
+	reference filename with its directory and extension stripped), or to
+	the path prefix given with -o (overrides -O/-n). The
+	presence file (3) is written only when -P is given:
 
-	1) switch to tommy hash (fixed size) to see if faster
+	  1) <dir>/<base>.global_counts.tsv.zst
+	       #kmer  reference_count  pangenome_count  metagenome_count
+	              [drug_count]
 
+	  2) <dir>/<base>.summary.tsv
+	       scrub_id  sample_type  sample_id  n_unique_kmers
+	                 coverage_pct  is_in_global
 
-	TIMINGS
-	took 16min on 1255 non redundant genomes in latest version of the culture database (Sept 2020)
-	took 68min on 1255 non redundant genomes in latest version of the culture database (Sept 2020) and FOCUS metagenomes
+	  3) <dir>/<base>.presence.tsv.zst
+	       #kmer  list_scrub_id
+	     where list_scrub_id is comma-separated u32 — the scrub_ids of
+	     all samples that hit that k-mer.
 
+	scrub_id is sequential u32 (starting at 0), assigned in completion
+	order. The same id ties the summary and presence files together.
+
+	Coverage threshold (-T): if coverage_pct > threshold, the sample's
+	counts are NOT folded into the global column (is_in_global=False).
+	The sample STILL gets a scrub_id, summary row, and presence appends.
+	Default 1.0 disables the gate.
+
+	Presence index (-P): only built and written when -P is given. Without
+	-P no per-sample k-mer indices are collected, no writer thread runs and
+	no presence file is written; scrub_ids in the summary are then still
+	sequential but not referenced by any file. With -P N, k-mers hit by
+	more than N samples are dropped from the presence file (their id-list
+	is freed and never written or grown), which bounds both output size and
+	peak memory for ubiquitous k-mers. -P 0 writes every hit k-mer (no cap).
+
+	Architecture: single-pass per file. Workers do hot loop + scratch
+	sweep in parallel; a single writer thread assigns scrub_ids and
+	appends them to per-bucket id-lists (one queue record per sample).
+	The presence file is materialized in one serial sweep at the end.
+
+	Diagnostic counters (writer-bound vs. worker-bound) are printed at
+	end. If the writer queue waits a lot for empty queue, workers are
+	the bottleneck (good). If workers wait a lot for full queue, the
+	writer is the bottleneck.
 */
 
-void usage();
-void calculate_coverage(const char *a_file, const char *file, const int seed, BIO_hash h);
-void all_coverage(const char *a_file, const char *B_file, const int seed, BIO_hash seqHash);
-void print_hash_counts(BIO_hash seqHash, const char *C_file);
+#define N_GLOBAL_COLS 4
+#define DEFAULT_COVERAGE_THRESHOLD 1.0
+#define GLOBAL_COUNTS_ZSTD_LEVEL 9
+
+static void usage(int status);
+static void  write_global_counts(BIO_hash seqHash, const char *path,
+                                 int with_drug_col);
+static unsigned long count_seeded_kmers(BIO_hash seqHash);
 
 int main(int argc, char *argv[])
 {
 	BIO_hash seqHash;
-//	BIO_sequences seqs;
-//	int genome_length = 0;
-	char *A_file = NULL; // file with a list of genome file names to count scrubbing from
-	char *B_file = NULL; // file with a list of metagenome file names to count scrubbing from
-	char *C_file = NULL; // file with a list of genome file names of the drug genomes
-	char *r_file = NULL; // reference genome file
-	char *p_file = NULL; // optional progress file
-	const int seed = 31; // using the same number that Varun used for consistency
+	char *A_file = NULL;
+	char *B_file = NULL;
+	char *C_file = NULL;
+	char *r_file = NULL;
+	char *p_file = NULL;
+	char *out_dir = NULL;
+	char *basename_arg = NULL;
+	char *o_prefix = NULL;
+	const int seed = 31;
 	const int default_hash_val = 1;
 	const int default_hash_increment = 1;
-	//const int size_of_hash_vec = 3; // place for original count, pangenome count, metagenome count
-	const int size_of_hash_vec = 4; // place for original count, pangenome count, metagenome count, drug count
-	int hash_index = 0; // to switch from original count, pangenome count, metagenome count
-//	const int seed = 64;
-//	const int seed = 96;
-	int num_threads = 4; // default thread count
+	int num_threads = 4;
+	double cov_threshold = DEFAULT_COVERAGE_THRESHOLD;
+	long presence_max = 0;
+	int  presence_given = 0;   /* presence file only with -P */
 	int c;
-	FILE *fout;
 	FILE *progress = NULL;
-	int write_dist = 0;
 
-        while ((c = getopt(argc, argv, "A:B:C:r:p:t:Hhud")) != EOF)
-                switch (c)
-                {
-              //          case 'a': a_file    = strdup(optarg); break;
-                        case 'A': A_file    = strdup(optarg); break;
-                        case 'B': B_file    = strdup(optarg); break;
-                        case 'C': C_file    = strdup(optarg); break;
-                        case 'r': r_file    = strdup(optarg); break;
-                        case 'p': p_file    = strdup(optarg); break;
-                        case 't': num_threads = atoi(optarg); break;
-               //         case 'b': b_file    = strdup(optarg); break;
-                //        case 'B': B_file    = strdup(optarg); break;
-                        case 'd': write_dist = 1; break;
-                        case 'u': usage(); break;
-                        case 'h': usage(); break;
-                        default: usage(); break;
-                }
+	while ((c = getopt(argc, argv, "A:B:C:r:p:O:n:o:t:T:P:Hhud")) != EOF)
+		switch (c) {
+			case 'A': A_file = strdup(optarg); break;
+			case 'B': B_file = strdup(optarg); break;
+			case 'C': C_file = strdup(optarg); break;
+			case 'r': r_file = strdup(optarg); break;
+			case 'p': p_file = strdup(optarg); break;
+			case 'O': out_dir = strdup(optarg); break;
+			case 'n': basename_arg = strdup(optarg); break;
+			case 'o': o_prefix = strdup(optarg); break;
+			case 't': num_threads = atoi(optarg); break;
+			case 'T': cov_threshold = atof(optarg); break;
+			case 'P': presence_max = atol(optarg); presence_given = 1; break;
+			case 'u':
+			case 'h': usage(0); break;
+			default:  usage(1); break;
+		}
 
-
-
-//	if ((!a_file && !A_file) || (!b_file && !B_file)) {
-	if (!r_file || !A_file || !B_file) {
-		usage();
-		return 1;
+	if (!r_file || (!A_file && !B_file && !C_file))
+		usage(1);
+	{
+		size_t rl = strlen(r_file);
+		if ((rl > 5 && strcmp(r_file + rl - 5, ".kmdb") == 0) ||
+		    (rl > 8 && strcmp(r_file + rl - 8, ".parquet") == 0)) {
+			fprintf(stderr, "error: -r %s is a k-mer database; -r must be a "
+			        "genome (FASTA). Pass metagenome databases with -B.\n",
+			        r_file);
+			exit(EXIT_FAILURE);
+		}
 	}
-
+	if (!basename_arg && !o_prefix) {
+		basename_arg = cli_derive_basename(r_file);
+		if (!basename_arg) {
+			fprintf(stderr, "error: could not derive an output basename "
+			        "from -r %s; pass -n explicitly\n", r_file);
+			exit(EXIT_FAILURE);
+		}
+		fprintf(stderr, "no -n given: using basename \"%s\" "
+		        "(derived from -r %s)\n", basename_arg, r_file);
+	}
+	if (num_threads < 1) num_threads = 1;
+	if (cov_threshold < 0.0) {
+		fprintf(stderr, "error: -T must be >= 0 (got %g)\n", cov_threshold);
+		exit(EXIT_FAILURE);
+	}
+	if (presence_max < 0 || presence_max > (long)UINT32_MAX) {
+		fprintf(stderr,
+		        "error: -P must be between 0 and %u (got %ld)\n",
+		        UINT32_MAX, presence_max);
+		exit(EXIT_FAILURE);
+	}
+	/* <O>/<n> or the -o prefix; validates -n and creates the directory */
+	char *out_prefix = cli_resolve_output("kmer_scrub_count", out_dir,
+	                                      basename_arg, o_prefix, "");
+	size_t pl = strlen(out_prefix) + 32;
+	char *global_path   = malloc(pl);
+	char *summary_path  = malloc(pl);
+	char *presence_path = presence_given ? malloc(pl) : NULL;
+	if (!global_path || !summary_path || (presence_given && !presence_path)) {
+		perror("malloc output paths"); exit(EXIT_FAILURE);
+	}
+	snprintf(global_path,  pl, "%s.global_counts.tsv.zst", out_prefix);
+	snprintf(summary_path, pl, "%s.summary.tsv", out_prefix);
+	if (presence_path)
+		snprintf(presence_path, pl, "%s.presence.tsv.zst", out_prefix);
 
 	if (p_file != NULL) {
 		progress = fopen(p_file, "w");
@@ -86,73 +167,239 @@ int main(int argc, char *argv[])
 		fprintf(progress, "adding kmer counts for:\n");
 	}
 
-        seqHash = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
+	const int size_of_hash_vec = N_GLOBAL_COLS + num_threads;
 
-	GEN_hash_sequences_set_count_vec(r_file, seed, seqHash, default_hash_val, default_hash_increment, 0, size_of_hash_vec);
-	GEN_all_kmer_counts(A_file, seed, seqHash, 1, progress, num_threads); // store this pangenome result in the second column
-	GEN_all_kmer_counts(B_file, seed, seqHash, 2, progress, num_threads); // store this metagenome result in the third column
+	seqHash = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
 
+	GEN_hash_sequences_set_count_vec(r_file, seed, seqHash,
+	                                 default_hash_val, default_hash_increment,
+	                                 0, size_of_hash_vec);
+
+	unsigned long total_ref_kmers = count_seeded_kmers(seqHash);
+	fprintf(stderr, "total reference k-mers: %lu\n", total_ref_kmers);
+	fprintf(stderr, "coverage threshold for global accumulation: %g%s\n",
+	        cov_threshold,
+	        cov_threshold >= 1.0 ? " (disabled — all samples included)" : "");
+	if (presence_given)
+		fprintf(stderr, "presence cap for inverted index: %ld%s\n",
+		        presence_max,
+		        presence_max == 0
+		            ? " (no cap — all hit k-mers written)"
+		            : " (k-mers seen in more samples are dropped)");
+	else
+		fprintf(stderr, "presence index: off (no -P given, no presence file)\n");
+	fprintf(stderr, "output prefix: %s\n", out_prefix);
+
+	/* No -P: w stays NULL. The workers then write summary rows inline
+	   (sequential scrub_ids) and collect no per-sample bucket indices. */
+	presence_writer *w = NULL;
+	if (presence_given) {
+		w = presence_writer_open(presence_path, /*queue_capacity*/ 0,
+		                         (uint32_t)presence_max);
+		if (!w) {
+			fprintf(stderr, "could not open presence writer %s\n",
+			        presence_path);
+			exit(EXIT_FAILURE);
+		}
+	}
+
+	summary_writer *summary = summary_writer_open(summary_path,
+	                                              total_ref_kmers);
+	if (!summary) {
+		fprintf(stderr, "could not open summary output %s\n", summary_path);
+		exit(EXIT_FAILURE);
+	}
+
+	seen_registry *seen = seen_registry_new();
+	if (!seen) {
+		fprintf(stderr, "could not allocate seen_registry\n");
+		exit(EXIT_FAILURE);
+	}
+
+	/* -A → pangenome (col 1) + ge rows */
+	if (A_file)
+		GEN_per_sample_kmer_counts_dual(A_file, "ge", 1, seed, seqHash,
+		                                num_threads, w, summary, seen,
+		                                cov_threshold, total_ref_kmers,
+		                                progress, NULL);
+
+	/* -B → metagenome (col 2) + me rows */
+	if (B_file)
+		GEN_per_sample_kmer_counts_dual(B_file, "me", 2, seed, seqHash,
+		                                num_threads, w, summary, seen,
+		                                cov_threshold, total_ref_kmers,
+		                                progress, NULL);
+
+	/* -C → drug (col 3) + dr rows; reference-skip preserved */
 	if (C_file)
-		GEN_all_kmer_counts_skip_file(C_file, r_file, seed, seqHash, 3, progress, num_threads); // skip the hashing of the reference file
+		GEN_per_sample_kmer_counts_dual(C_file, "dr", 3, seed, seqHash,
+		                                num_threads, w, summary, seen,
+		                                cov_threshold, total_ref_kmers,
+		                                progress, r_file);
 
+	/* Drain + join the writer thread, then materialize presence file. */
+	if (w) {
+		presence_writer_close(w);              /* joins writer thread */
+		presence_writer_flush(w, seqHash);     /* serial zstd dump */
+		presence_writer_print_diagnostics(w);
+		presence_writer_destroy(w);
+	}
 
+	summary_writer_close(summary);
+	seen_registry_free(seen);
 
-	print_hash_counts(seqHash, C_file);
+	write_global_counts(seqHash, global_path, C_file != NULL);
 
-	
-
-//	if (b_file) // only one vs one
-//	printf("checked %" PRIu64 " seeds\n", metagenome_seed_count);
-/*
-	else if (B_file) // one vs many (can keep same hash)
-		all_coverage(a_file, B_file, seed, seqHash);
-*/
-	
-	
-
-	// clean up
 	BIO_destroyHashD(seqHash);
-//	free(a_file);
-//	free(b_file);
 	free(A_file);
 	free(B_file);
 	free(C_file);
 	free(r_file);
 	free(p_file);
-	if (progress != NULL)
-		fclose(progress);
-//	free(B_file);
+	free(out_dir);
+	free(basename_arg);
+	free(o_prefix);
+	free(out_prefix);
+	free(global_path);
+	free(summary_path);
+	free(presence_path);
+	if (progress != NULL) fclose(progress);
 	return 0;
 }
 
-void usage() {
-	fprintf(stderr, "Usage: kmer_scrub_count -r <reference genome>  -A <file with multiple genome filenames> -B <file with multiple metagenome filenames> -C <(optional) file with multiple genome filenames of drug strains> -p [progress output file, optional] -t [number of threads, default 4]\n");
-//	fprintf(stderr, "                         -r [reference genome; if not provided writes pangenome for all genomes in -A]\n");
-//	fprintf(stderr, "                         -d [print all hash counts (e.g., to plot distribution across entire pangenome]\n");
-//	fprintf(stderr, "(alternative)         -a <in1.fasta> -B <file with multiple filenames>\n");
+static void usage(int status)
+{
+	fprintf(stderr,
+	    "Usage: kmer_scrub_count\n"
+	    "                        -r <reference genome>\n"
+	    "                       [-A <file listing genome filenames, or one genome>]\n"
+	    "                       [-n <output basename, default: -r filename\n"
+	    "                            with directory and extension stripped>]\n"
+	    "                       [-O <output directory, default .>]\n"
+	    "                       [-o <output path prefix; overrides -O/-n>]\n"
+	    "                       [-B <file listing metagenomes, or one metagenome>]\n"
+	    "                       [-C <file listing drug-strain genome filenames>]\n"
+	    "                       [-T <coverage threshold, default 1.0>]\n"
+	    "                       [-P <presence cap; writes the presence file>]\n"
+	    "                       [-p <progress log file>]\n"
+	    "                       [-t <num threads, default 4>]\n"
+	    "\n"
+	    "  Writes into <-O>, all sharing the <-n> basename, or to <-o><suffix>\n"
+	    "  (the directory is created if it does not exist); the presence\n"
+	    "  file only with -P:\n"
+	    "\n"
+	    "    <base>.global_counts.tsv.zst\n"
+	    "        zstd TSV. #kmer, reference_count, pangenome_count,\n"
+	    "        metagenome_count[, drug_count when -C is given].\n"
+	    "    <base>.summary.tsv\n"
+	    "        plain TSV. scrub_id, sample_type, sample_id,\n"
+	    "        n_unique_kmers, coverage_pct, is_in_global.\n"
+	    "        scrub_id is sequential u32 starting at 0, assigned in\n"
+	    "        sample-completion order, and keys into the presence file.\n"
+	    "    <base>.presence.tsv.zst   (only with -P)\n"
+	    "        zstd TSV INVERTED presence index. #kmer<TAB>list_scrub_id\n"
+	    "        (comma-separated u32). Only kmers with at least one\n"
+	    "        sample hit are emitted. Load with polars:\n"
+	    "          pl.scan_csv('...presence.tsv.zst', separator='\\t')\n"
+	    "            .with_columns(pl.col('list_scrub_id').str.split(','))\n"
+	    "\n"
+	    "  -A/-B/-C take a list file (one path per line) or a single\n"
+	    "  sample file. At least one of them is required.\n"
+	    "  -B entries may be reads (.fastq[.gz]/.fq[.gz], every occurrence\n"
+	    "  counts) or .kmdb databases from kmer_metagenome_db (the stored\n"
+	    "  count is added; a .kmdb's blocks are split over the threads, so\n"
+	    "  a single metagenome uses all -t threads).\n"
+	    "\n"
+	    "  -T:     coverage threshold. If coverage_pct > T, the sample's\n"
+	    "          counts are NOT added to the global column (is_in_global\n"
+	    "          becomes False), but scrub_id is still allocated and\n"
+	    "          presence/summary rows still emitted. Default 1.0 disables.\n"
+	    "  -P:     build and write the inverted presence index, with cap P.\n"
+	    "          Without -P no presence file is written and no per-sample\n"
+	    "          k-mer indices are kept (less memory, no writer thread).\n"
+	    "          A k-mer hit by more than P samples is dropped: its id-list\n"
+	    "          is freed and it is never written nor allowed to grow\n"
+	    "          further. Keeps k-mers with presence <= P; P=0 keeps all\n"
+	    "          (no cap). Does NOT affect the global counts or the\n"
+	    "          summary — only the presence file. (Previous default: 10.)\n"
+	    "  Each input file is read exactly once. Memory bounded by\n"
+	    "  O(n_kmers x (4 + threads)) for the hash, plus with -P\n"
+	    "  O(kept_kmer_appends x 4) for the inverted index. Duplicate (sample_type, sample_id) pairs\n"
+	    "  are skipped with a warning.\n"
+	    "\n"
+	    "  With -P, diagnostic counters (queue waits etc.) are printed at end\n"
+	    "  of run to stderr. If 'worker queue waits' is large, the writer is the\n"
+	    "  bottleneck. If 'writer queue waits' is large, the workers are.\n");
+	exit(status);
 }
 
-
-void print_hash_counts(BIO_hash seqHash, const char *C_file) {
-	char **allKeys = BIO_getHashKeys(seqHash);
+static unsigned long count_seeded_kmers(BIO_hash seqHash)
+{
+	unsigned long n = 0;
 	int hash_size = BIO_getHashSize(seqHash);
-	unsigned int i;
-        unsigned int *counts = NULL;
+	char **allKeys = BIO_getHashKeys(seqHash);
+	for (unsigned int i = 0; i < (unsigned int)hash_size; i++) {
+		unsigned int *counts = (unsigned int *)BIO_searchHash(seqHash, allKeys[i]);
+		if (counts && counts[0] > 0) n++;
+	}
+	BIO_destroyHashKeys(allKeys);
+	return n;
+}
 
-//	printf("have %d keys\n", hash_size);
-	//printf("#kmer\treference_count\tpangenome_count\tmetagenome_count\n");
-	printf("#kmer\treference_count\tpangenome_count\tmetagenome_count\tdrug_count\n");
-	for (i=0; i<hash_size; i++) {
-		counts = (unsigned int*)BIO_searchHash(seqHash,allKeys[i]);
-		
-		if (C_file) {
-			printf("%s\t%d\t%d\t%d\t%d\n", allKeys[i], counts[0], counts[1], counts[2], counts[3]);
-		}
-		else {
-			printf("%s\t%d\t%d\t%d\n", allKeys[i], counts[0], counts[1], counts[2]);
-		}
+static void write_global_counts(BIO_hash seqHash, const char *path,
+                                int with_drug_col)
+{
+	zstd_out_t *z = zstd_out_open(path, GLOBAL_COUNTS_ZSTD_LEVEL);
+	if (!z) {
+		fprintf(stderr, "write_global_counts: cannot open %s: %s\n",
+		        path, strerror(errno));
+		exit(EXIT_FAILURE);
 	}
 
+	const char *header = with_drug_col
+		? "#kmer\treference_count\tpangenome_count\tmetagenome_count\tdrug_count\n"
+		: "#kmer\treference_count\tpangenome_count\tmetagenome_count\n";
+	zstd_out_write(z, header, strlen(header));
 
+	char **allKeys = BIO_getHashKeys(seqHash);
+	int hash_size = BIO_getHashSize(seqHash);
+
+	size_t row_cap = 4096;
+	char  *rowbuf  = malloc(row_cap);
+	if (!rowbuf) { perror("malloc rowbuf"); exit(EXIT_FAILURE); }
+
+	uint64_t emitted = 0;
+	for (unsigned int i = 0; i < (unsigned int)hash_size; i++) {
+		unsigned int *counts =
+			(unsigned int *)BIO_searchHash(seqHash, allKeys[i]);
+		if (!counts) continue;
+
+		size_t need = strlen(allKeys[i]) + 4 * 12 + 8;
+		if (need > row_cap) {
+			while (row_cap < need) row_cap *= 2;
+			char *nbuf = realloc(rowbuf, row_cap);
+			if (!nbuf) { perror("realloc rowbuf"); exit(EXIT_FAILURE); }
+			rowbuf = nbuf;
+		}
+
+		int n;
+		if (with_drug_col)
+			n = snprintf(rowbuf, row_cap, "%s\t%u\t%u\t%u\t%u\n",
+			             allKeys[i], counts[0], counts[1], counts[2],
+			             counts[3]);
+		else
+			n = snprintf(rowbuf, row_cap, "%s\t%u\t%u\t%u\n",
+			             allKeys[i], counts[0], counts[1], counts[2]);
+
+		zstd_out_write(z, rowbuf, (size_t)n);
+		emitted++;
+	}
+
+	free(rowbuf);
 	BIO_destroyHashKeys(allKeys);
+	if (zstd_out_close(z) != 0)
+		fprintf(stderr, "write_global_counts: error closing %s\n", path);
+
+	fprintf(stderr, "write_global_counts: emitted %" PRIu64 " kmer rows to %s\n",
+	        emitted, path);
 }

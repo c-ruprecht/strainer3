@@ -1,0 +1,17 @@
+D6331_genomes/D6331_Akkermansia_muciniphila.fasta.gz
+D6331_genomes/D6331_Bacteroides_fragilis.fasta.gz
+D6331_genomes/D6331_Bifidobacterium_adolescentis.fasta.gz
+D6331_genomes/D6331_Clostridioides_difficile.fasta.gz
+D6331_genomes/D6331_Clostridium_perfringens.fasta.gz
+D6331_genomes/D6331_Enterococcus_faecalis.fasta.gz
+D6331_genomes/D6331_Escherichia_coli_B1109.fasta.gz
+D6331_genomes/D6331_Escherichia_coli_B3008.fasta.gz
+D6331_genomes/D6331_Escherichia_coli_B766.fasta.gz
+D6331_genomes/D6331_Escherichia_coli_JM109.fasta.gz
+D6331_genomes/D6331_Escherichia_coli_b2207.fasta.gz
+D6331_genomes/D6331_Fusobacterium_nucleatum.fasta.gz
+D6331_genomes/D6331_Lactobacillus_fermentum.fasta.gz
+D6331_genomes/D6331_Prevotella_corporis.fasta.gz
+D6331_genomes/D6331_Roseburia_hominis.fasta.gz
+D6331_genomes/D6331_Salmonella_enterica.fasta.gz
+D6331_genomes/D6331_Veillonella_rogosae.fasta.gz

@@ -15,7 +15,7 @@
  *   output with a zeroed total_evaluated row (everything was scrubbed away).
  *
  * Targets can also be per-sample count databases (.kmdb) built with
- *   kmer_metagenome_db -T sample -i R1.fq.gz -i R2.fq.gz -n <sample>
+ *   kmer_metagenome_db -m sample -i R1.fq.gz -i R2.fq.gz -n <sample>
  * A .kmdb target is recognised by its extension (or type KMDB). Instead of
  * re-reading the sample, the query k-mers are packed to 2 bits, sorted, and
  * looked up block by block; blocks of the database that cannot contain a
@@ -51,6 +51,7 @@
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
 #include "genome_compare.h"
+#include "cli_common.h"
 #ifdef HAVE_ZSTD
 #include "kmdb.h"
 #endif
@@ -58,7 +59,7 @@
 #define NOT_PAIRED_END         0
 #define IS_PAIRED_END          1
 #define IS_PAIRED_END_INTERLEAVE 2
-#define IS_KMDB                3   /* kmer_metagenome_db -T sample output */
+#define IS_KMDB                3   /* kmer_metagenome_db -m sample output */
 #define UNKNOWN_FILE_TYPE     -1
 #define MAX_LINE           65536
 #define MAX_KMER_LEN         512
@@ -598,7 +599,7 @@ static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
     char *po = kmdb_meta_get(db, "presence_only");
     if (po && strcmp(po, "1") == 0) {
         fprintf(stderr, "error: %s is a presence-only (scrub) database; build "
-                "target databases with kmer_metagenome_db -T sample\n", path);
+                "target databases with kmer_metagenome_db -m sample\n", path);
         exit(1);
     }
     free(po);
@@ -752,7 +753,7 @@ static void ksd_pool_wait_and_destroy(ksd_pool *pool) {
 /* ── usage ─────────────────────────────────────────────────────────── */
 
 static void usage(void) {
-    fprintf(stderr, "Usage: kmer_strain_detect -k <kmers> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-G <background.txt>] [-j threads]\n\n");
+    fprintf(stderr, "Usage: kmer_strain_detect -k <kmers> -B <targets.txt> [-O <dir>] [-n <name> | -o <out.kmer_hits.tsv.gz>] [-G <background.txt>] [-t threads]\n\n");
     fprintf(stderr, "  -k  kmers (plain or gzipped): TSV with a '#kmer' header column, or a\n");
     fprintf(stderr, "      headerless list with the kmer in the first column ('#' lines skipped)\n");
     fprintf(stderr, "  -B  target metagenomes file (tab-separated: type file1 [file2]), or with a header\n");
@@ -760,10 +761,13 @@ static void usage(void) {
     fprintf(stderr, "      and optional sample_name (used as the output column name)\n");
     fprintf(stderr, "  -G  background metagenomes file (same format as -B); columns prefixed 'b_'\n");
     fprintf(stderr, "      types: PE, SE, PEI, KMDB\n");
-    fprintf(stderr, "      A file ending in .kmdb (kmer_metagenome_db -T sample) is looked up\n");
+    fprintf(stderr, "      A file ending in .kmdb (kmer_metagenome_db -m sample) is looked up\n");
     fprintf(stderr, "      instead of scanned; a targets file may simply list .kmdb paths.\n");
-    fprintf(stderr, "  -o  output file (e.g. sample.kmer_hits.tsv.gz)\n");
-    fprintf(stderr, "  -j  threads (default: 4)\n\n");
+    fprintf(stderr, "  -O  output directory (default: ., created if missing)\n");
+    fprintf(stderr, "  -n  output basename (default: -k filename without extensions);\n");
+    fprintf(stderr, "      writes <-O>/<-n>.kmer_hits.tsv.gz\n");
+    fprintf(stderr, "  -o  output file; overrides -O/-n (e.g. sample.kmer_hits.tsv.gz)\n");
+    fprintf(stderr, "  -t  threads (default: 4)   [was -j]\n\n");
     fprintf(stderr, "Output: gzipped TSV — first column is #kmer, then target columns,\n");
     fprintf(stderr, "        then b_* columns for background metagenomes.\n");
 }
@@ -775,22 +779,46 @@ int main(int argc, char *argv[]) {
     char *targets_file    = NULL;
     char *background_file = NULL;
     char *outfile         = NULL;
+    char *out_dir         = NULL;
+    char *out_name        = NULL;
     int   num_threads     = 4;
     int   c;
 
-    while ((c = getopt(argc, argv, "k:B:G:o:j:h")) != EOF) {
+    while ((c = getopt(argc, argv, "k:B:G:O:n:o:t:j:h")) != EOF) {
         switch (c) {
             case 'k': kmer_file       = strdup(optarg); break;
             case 'B': targets_file    = strdup(optarg); break;
             case 'G': background_file = strdup(optarg); break;
+            case 'O': out_dir         = strdup(optarg); break;
+            case 'n': out_name        = strdup(optarg); break;
             case 'o': outfile         = strdup(optarg); break;
-            case 'j': num_threads     = atoi(optarg);   break;
+            case 't': num_threads     = atoi(optarg);   break;
+            case 'j': cli_renamed_flag("kmer_strain_detect", 'j', "-t"); break;
             case 'h': usage(); return 0;
             default:  usage(); return 1;
         }
     }
 
-    if (!kmer_file || !targets_file || !outfile) { usage(); return 1; }
+    if (!kmer_file || !targets_file) { usage(); return 1; }
+    if (num_threads < 1) num_threads = 1;
+
+    /* output: -o verbatim, else <-O>/<-n>.kmer_hits.tsv.gz with -n derived
+       from the -k file name when not given */
+    if (!outfile && !out_name) {
+        out_name = cli_derive_basename(kmer_file);
+        if (!out_name) {
+            fprintf(stderr, "error: could not derive an output name from -k %s; "
+                    "pass -n or -o\n", kmer_file);
+            return 1;
+        }
+    }
+    {
+        char *resolved = cli_resolve_output("kmer_strain_detect", out_dir, out_name,
+                                            outfile, ".kmer_hits.tsv.gz");
+        free(outfile);
+        outfile = resolved;
+    }
+    fprintf(stderr, "output: %s\n", outfile);
 
     /* 1. parse metagenome targets */
     Metagenome *mgs;
@@ -932,6 +960,8 @@ int main(int argc, char *argv[]) {
     free(targets_file);
     free(background_file);
     free(outfile);
+    free(out_dir);
+    free(out_name);
 
     return 0;
 }

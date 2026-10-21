@@ -5,7 +5,7 @@ LDLIBS    = -lz -lm -lpthread
 # ---------------------------------------------------------------------------
 # libzstd detection
 #
-# Only kmer_scrub_count_individual and kmer_metagenome_db actually need zstd
+# Only kmer_scrub_count and kmer_metagenome_db actually need zstd
 # (they write .kmdb / compressed presence indexes), kmer_strain_detect uses it
 # only to read .kmdb targets, and genome_compare_presence uses it only when
 # you ask for a .zst output. The old Makefile put -lzstd in the global
@@ -38,7 +38,7 @@ endif
 
 ifeq ($(HAVE_ZSTD),1)
   ZSTD_DEF     := -DHAVE_ZSTD $(ZSTD_CFLAGS)
-  ZSTD_TARGETS := kmer_scrub_count_individual kmer_metagenome_db
+  ZSTD_TARGETS := kmer_scrub_count kmer_metagenome_db
   KMDB_OBJ     := kmdb.o
 else
   ZSTD_DEF     :=
@@ -49,7 +49,7 @@ endif
 
 shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
-BASE_TARGETS = genome_compare genome_compare_presence kmer_scrub_count \
+BASE_TARGETS = genome_compare genome_compare_presence \
                kmer_strain_detect kmer_strain_detect_genome
 
 all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
@@ -57,7 +57,7 @@ all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 zstd-note:
 ifneq ($(HAVE_ZSTD),1)
 	@echo ""
-	@echo "  NOTE: libzstd was not found, so kmer_scrub_count_individual and"
+	@echo "  NOTE: libzstd was not found, so kmer_scrub_count and"
 	@echo "        kmer_metagenome_db were NOT built, kmer_strain_detect was built"
 	@echo "        without .kmdb target support, and genome_compare_presence was"
 	@echo "        built without .zst output (-z falls back to .gz). Everything"
@@ -79,10 +79,7 @@ genome_compare: main.o $(shared_obj)
 genome_compare_presence: genome_compare_presence.o
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
-kmer_scrub_count: kmer_scrub_count.o $(shared_obj)
-	$(CC) -o $@ $^ $(LDLIBS)
-
-kmer_scrub_count_individual: kmer_scrub_count_individual.o kmer_scrub_streaming.o kmdb.o $(shared_obj)
+kmer_scrub_count: kmer_scrub_count.o kmer_scrub_streaming.o kmdb.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
 kmer_metagenome_db: kmer_metagenome_db.o kmdb.o
@@ -103,7 +100,7 @@ test: genome_compare_presence
 
 .PHONY: clean
 clean:
-	$(RM) *.o $(BASE_TARGETS) kmer_scrub_count_individual kmer_metagenome_db
+	$(RM) *.o $(BASE_TARGETS) kmer_scrub_count kmer_metagenome_db
 	$(RM) -r test/out
 
 .PHONY: all zstd-note

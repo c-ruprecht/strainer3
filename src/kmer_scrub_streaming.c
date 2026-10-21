@@ -1156,7 +1156,9 @@ static void *worker_main(void *arg)
 		   any k-mer's presence list. That last part matters — an excluded
 		   sample that hits everything otherwise burns one of the -P slots
 		   on every k-mer and saturates lists that hold real signal. */
-		unsigned long n_collect = is_in_global ? n_unique : 0;
+		/* No writer (no -P): nothing would ever read the indices, so
+		   collect none — same path as an excluded sample. */
+		unsigned long n_collect = (is_in_global && p->writer) ? n_unique : 0;
 		uint32_t *idxs = use_sweep
 		    ? collect_zero_and_maybe_merge(p->h, scratch_col, p->global_col,
 		                                   is_in_global, n_collect)

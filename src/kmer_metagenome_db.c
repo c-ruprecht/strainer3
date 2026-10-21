@@ -3,7 +3,7 @@
 
 	Two modes, chosen with -T:
 
-	-T scrub  (default; unchanged behaviour)
+	-m scrub  (default; unchanged behaviour)
 	  A PRESENCE database that supplements the genome scrub database.
 	  Keeps exactly the metagenome k-mers with
 
@@ -14,7 +14,7 @@
 	Counts exist only transiently, as an 8-bit saturating counter used to
 	apply -c (so -c must be <= 255). The database is a sorted k-mer list.
 
-	Scrubbing a reference with `kmer_scrub_count_individual -B x.kmdb`
+	Scrubbing a reference with `kmer_scrub_count -B x.kmdb`
 	then attributes each reference k-mer to the genomes OR to the
 	metagenome, never both.
 
@@ -31,7 +31,7 @@
 	             the metagenome alone.
 	  4) write   sort partitions in parallel, k-way merge, write zstd blocks.
 
-	-T sample
+	-m sample
 	  A COUNT database of one sample: every canonical k-mer of the reads
 	  with its exact occurrence count (32-bit), no genome subtraction.
 	  Step 1 counts as above, steps 2-3 are skipped, step 4 writes
@@ -84,6 +84,7 @@
 #endif
 #include "kseq.h"
 #include "kmdb.h"
+#include "cli_common.h"
 
 KSEQ_INIT(gzFile, gzread)
 
@@ -1072,10 +1073,10 @@ static int merge_runs(char **paths, uint32_t n, int counts, kmdb_writer *w)
 
 /* ── main ─────────────────────────────────────────────────────────── */
 
-static void usage(void)
+static void usage(int status)
 {
 	fprintf(stderr,
-	"Usage: kmer_metagenome_db [-T scrub|sample] [options] <reads.fastq.gz> [<reads_2.fastq.gz> ...]\n"
+	"Usage: kmer_metagenome_db [-m scrub|sample] [options] <reads.fastq.gz> [<reads_2.fastq.gz> ...]\n"
 	"       read files: as trailing arguments, and/or -i <file>[,<file>...] (repeatable),\n"
 	"                   and/or -I <file listing read files, one per line>\n"
 	"                          [-A <genome list | single genome FASTA>]\n"
@@ -1087,7 +1088,7 @@ static void usage(void)
 	"                          [-z <zstd level, default 3>]\n"
 	"                          [-M <passes> | -R <RAM GB>] [-E] [-W <temp dir>]\n"
 	"\n"
-	"  -T scrub (default)\n"
+	"  -m scrub (default)   [mode flag was -T]\n"
 	"  Writes <-O>/<-n>.kmdb: a presence-only k-mer list holding the\n"
 	"  metagenome k-mers with\n"
 	"    count in the reads >= -c   and   absent from every -A genome.\n"
@@ -1096,13 +1097,13 @@ static void usage(void)
 	"  read in that order; no need to cat them together. -n defaults to the\n"
 	"  first read file's name without its extension.\n"
 	"  -A is the genome scrub DB list (the same list you pass to\n"
-	"  kmer_scrub_count_individual -A). Without -A nothing is subtracted.\n"
+	"  kmer_scrub_count -A). Without -A nothing is subtracted.\n"
 	"  -c 1 keeps every k-mer seen at least once.\n"
 	"  Memory: ~13-26 bytes per distinct k-mer in the reads (all k-mers,\n"
 	"  including errors, before -c), briefly up to ~39 while a table grows,\n"
 	"  plus ~70 MB of read buffers.\n"
 	"\n"
-	"  -T sample\n"
+	"  -m sample\n"
 	"  Writes <-O>/<-n>.kmdb holding every canonical k-mer of the reads with\n"
 	"  its exact count (32-bit). No genome subtraction (-A is rejected).\n"
 	"  -c drops k-mers seen fewer than -c times (default 1 = keep all, which\n"
@@ -1130,7 +1131,7 @@ static void usage(void)
 	"\n"
 	"  The database is written to <out>.tmp and renamed when complete.\n",
 	MAX_PASSES, RAM_SAFETY * 100);
-	exit(1);
+	exit(status);
 }
 
 int main(int argc, char *argv[])
@@ -1146,14 +1147,15 @@ int main(int argc, char *argv[])
 	int mode = MODE_SCRUB;
 	int c;
 
-	while ((c = getopt(argc, argv, "T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h")) != -1) {
+	while ((c = getopt(argc, argv, "m:T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h")) != -1) {
 		switch (c) {
 		case 'i': add_read_paths(&reads, &n_reads, &cap_reads, optarg); break;
-		case 'T':
+		case 'T': cli_renamed_flag("kmer_metagenome_db", 'T', "-m"); break;
+		case 'm':
 			if      (!strcasecmp(optarg, "scrub"))  mode = MODE_SCRUB;
 			else if (!strcasecmp(optarg, "sample")) mode = MODE_SAMPLE;
 			else {
-				fprintf(stderr, "error: -T must be scrub or sample (got %s)\n", optarg);
+				fprintf(stderr, "error: -m must be scrub or sample (got %s)\n", optarg);
 				return 1;
 			}
 			break;
@@ -1171,7 +1173,8 @@ int main(int argc, char *argv[])
 		case 'R': ram_gb      = atof(optarg); break;
 		case 'E': estimate_only = 1; break;
 		case 'W': tmp_dir     = strdup(optarg); break;
-		default:  usage();
+		case 'h': usage(0); break;
+		default:  usage(1);
 		}
 	}
 	/* any non-option arguments are read files too: ... -o out.kmdb {input} */
@@ -1188,7 +1191,7 @@ int main(int argc, char *argv[])
 		}
 		free(more);
 	}
-	if (n_reads == 0) usage();
+	if (n_reads == 0) usage(1);
 	if (k < 1 || k > KMDB_MAX_K) {
 		fprintf(stderr, "error: -k must be 1..%d (got %ld)\n", KMDB_MAX_K, k);
 		return 1;
@@ -1206,8 +1209,8 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	if (mode == MODE_SAMPLE && genome_list) {
-		fprintf(stderr, "error: -A is not used with -T sample (no scrubbing is "
-		        "performed); drop -A or use -T scrub\n");
+		fprintf(stderr, "error: -A is not used with -m sample (no scrubbing is "
+		        "performed); drop -A or use -m scrub\n");
 		return 1;
 	}
 	if (passes && ram_gb > 0) {

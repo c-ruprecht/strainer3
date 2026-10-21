@@ -6,6 +6,7 @@ import gzip
 import re
 import io
 import subprocess
+import os
 
 
 def open_counts(path):
@@ -42,6 +43,9 @@ kmers to keep (so don't scrub everything); default 0.04; range (0.0-1.0)", requi
 
 parser.add_argument("--independent", "-i", help = "Independently  \
 scrub metagenome and pangenome (without this flag, it scrubs them together so there is definitely -m min_fraction left)", action='store_true')
+
+parser.add_argument("--output_dir", "-O", help = "Output directory for scrubbed kmer file", required= True)
+parser.add_argument("--basename", '-n', help= "Rename filename")
 
 args = parser.parse_args()
 
@@ -163,7 +167,8 @@ def main():
         sys.stderr.write("error: one of scrub_count_file or scrub_count_list must be provided.")
     if args.scrub_count_file and args.scrub_count_list:
         sys.stderr.write("error: can provide only one of either scrub_count_file or scrub_count_list.")
-
+    
+    
     scrub_count_files = []
     if args.scrub_count_file:
         scrub_count_files.append(args.scrub_count_file)
@@ -245,9 +250,17 @@ def main():
 
     print("#post scrub kmers " + str(len(strain_hash_scrubbed)) + " out of " + str(all_kmers))
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    out_name = f"{args.basename}.scrubbed_kmers.gz" if args.basename else "scrubbed_kmers.gz"
+    out = open(os.path.join(args.output_dir, out_name), 'wt')
+    out.write("#kmer\n")
     # print scrubbbed kmers that can be redirected to file
     for key in strain_hash_scrubbed:
-        print(key)
+        print(key, file = out)
+    
+    out.close()
+
 
 if __name__ == "__main__":
         main()

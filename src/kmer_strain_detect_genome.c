@@ -14,6 +14,7 @@
  */
 
 #include "zlib.h"
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
 #include "genome_compare.h"
+#include "cli_common.h"
 
 #define NOT_PAIRED_END         0
 #define MAX_LINE           65536
@@ -344,13 +346,16 @@ static void ksd_pool_wait_and_destroy(ksd_pool *pool) {
 /* ── usage ─────────────────────────────────────────────────────────── */
 
 static void usage(void) {
-    fprintf(stderr, "Usage: kmer_strain_detect -k <kmer_tsv> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-G <background.txt>] [-j threads]\n\n");
+    fprintf(stderr, "Usage: kmer_strain_detect_genome -k <kmer_tsv> -B <targets.txt> [-O <dir>] [-n <name> | -o <out.kmer_hits.tsv.gz>] [-G <background.txt>] [-t threads]\n\n");
     fprintf(stderr, "  -k  kmer TSV with a '#kmer' column (plain or gzipped)\n");
     fprintf(stderr, "  -B  target genomes file (one genome path per line)\n");
     fprintf(stderr, "  -G  background metagenomes file (same format as -B); columns prefixed 'backmeta_'\n");
     fprintf(stderr, "      types: PE, SE, PEI\n");
-    fprintf(stderr, "  -o  output file (e.g. sample.kmer_hits.tsv.gz)\n");
-    fprintf(stderr, "  -j  threads (default: 4)\n\n");
+    fprintf(stderr, "  -O  output directory (default: ., created if missing)\n");
+    fprintf(stderr, "  -n  output basename (default: -k filename without extensions);\n");
+    fprintf(stderr, "      writes <-O>/<-n>.kmer_hits.tsv.gz\n");
+    fprintf(stderr, "  -o  output file; overrides -O/-n (e.g. sample.kmer_hits.tsv.gz)\n");
+    fprintf(stderr, "  -t  threads (default: 4)   [was -j]\n\n");
     fprintf(stderr, "Output: gzipped TSV — first column is #kmer, then target columns,\n");
     fprintf(stderr, "        then backmeta_* columns for background metagenomes.\n");
 }
@@ -362,22 +367,46 @@ int main(int argc, char *argv[]) {
     char *targets_file    = NULL;
     char *background_file = NULL;
     char *outfile         = NULL;
+    char *out_dir         = NULL;
+    char *out_name        = NULL;
     int   num_threads     = 4;
     int   c;
 
-    while ((c = getopt(argc, argv, "k:B:G:o:j:h")) != EOF) {
+    while ((c = getopt(argc, argv, "k:B:G:O:n:o:t:j:h")) != EOF) {
         switch (c) {
             case 'k': kmer_file       = strdup(optarg); break;
             case 'B': targets_file    = strdup(optarg); break;
             case 'G': background_file = strdup(optarg); break;
+            case 'O': out_dir         = strdup(optarg); break;
+            case 'n': out_name        = strdup(optarg); break;
             case 'o': outfile         = strdup(optarg); break;
-            case 'j': num_threads     = atoi(optarg);   break;
+            case 't': num_threads     = atoi(optarg);   break;
+            case 'j': cli_renamed_flag("kmer_strain_detect_genome", 'j', "-t"); break;
             case 'h': usage(); return 0;
             default:  usage(); return 1;
         }
     }
 
-    if (!kmer_file || !targets_file || !outfile) { usage(); return 1; }
+    if (!kmer_file || !targets_file) { usage(); return 1; }
+    if (num_threads < 1) num_threads = 1;
+
+    /* output: -o verbatim, else <-O>/<-n>.kmer_hits.tsv.gz with -n derived
+       from the -k file name when not given */
+    if (!outfile && !out_name) {
+        out_name = cli_derive_basename(kmer_file);
+        if (!out_name) {
+            fprintf(stderr, "error: could not derive an output name from -k %s; "
+                    "pass -n or -o\n", kmer_file);
+            return 1;
+        }
+    }
+    {
+        char *resolved = cli_resolve_output("kmer_strain_detect_genome", out_dir, out_name,
+                                            outfile, ".kmer_hits.tsv.gz");
+        free(outfile);
+        outfile = resolved;
+    }
+    fprintf(stderr, "output: %s\n", outfile);
 
     /* 1. parse metagenome targets */
     Metagenome *mgs;
@@ -476,6 +505,8 @@ int main(int argc, char *argv[]) {
     free(targets_file);
     free(background_file);
     free(outfile);
+    free(out_dir);
+    free(out_name);
 
     return 0;
 }

@@ -1,12 +1,13 @@
 /test/invitro_mixes/output
+/test/strainer2_original
+/test/strainer2_parallel
 /test/strainer2_parallel/output
-/test/strainer2_filter
+/test/output
 /src/*.o
 /src/kmer_scrub_count
 /src/strain_detect
 /src/genome_compare
 .snakemake/
-/scripts/dev
-/test
+/scripts/dev/
 **/__pycache__/
 *.pyc

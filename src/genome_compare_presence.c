@@ -1,7 +1,7 @@
 /* genome_compare_presence -- serial inverted k-mer presence index over a set
  * of genomes, plus the pairwise k-mer identity matrix that falls out of it.
  *
- *   genome_compare_presence -B <list|dir> [-k 31] [-o prefix]
+ *   genome_compare_presence -A <list|dir> [-k 31] [-O dir] [-n name | -o prefix]
  *
  * WHAT IT DOES
  * ------------
@@ -19,7 +19,7 @@
  * ascending and de-duplication is a single comparison against the last element
  * -- no per-genome scratch set, no sorting of the lists at the end.
  *
- * OUTPUTS (<prefix> from -o, default "presence")
+ * OUTPUTS (<prefix> = <-O>/<-n>, default ./presence, or -o verbatim)
  *   <prefix>.presence.tsv[.gz|.zst]  inverted index, one row per k-mer
  *   <prefix>.manifest.tsv            strain_id -> file, with per-genome stats
  *   <prefix>.identity.tsv            square N x N Jaccard matrix
@@ -90,6 +90,7 @@
 #endif
 
 #include "kseq.h"
+#include "cli_common.h"
 KSEQ_INIT(gzFile, gzread)
 
 #define DEFAULT_K              31
@@ -294,6 +295,9 @@ static int has_suffix(const char *s, const char *suf)
 	return ls >= lf && strcmp(s + ls - lf, suf) == 0;
 }
 
+/* compression level for .zst / .gz outputs, set from -z */
+static int g_zlevel = 3;
+
 static ow *ow_open(const char *path)
 {
 	ow *w = (ow *)xcalloc(1, sizeof *w);
@@ -308,7 +312,7 @@ static ow *ow_open(const char *path)
 		if (!w->fp) die("cannot open output", path);
 		w->cctx = ZSTD_createCCtx();
 		if (!w->cctx) die("ZSTD_createCCtx failed", path);
-		ZSTD_CCtx_setParameter(w->cctx, ZSTD_c_compressionLevel, 3);
+		ZSTD_CCtx_setParameter(w->cctx, ZSTD_c_compressionLevel, g_zlevel);
 		w->zcap = ZSTD_CStreamOutSize();
 		w->zbuf = (char *)xmalloc(w->zcap);
 #else
@@ -317,7 +321,10 @@ static ow *ow_open(const char *path)
 #endif
 	} else if (has_suffix(path, ".gz")) {
 		w->kind = OW_GZ;
-		w->gz = gzopen(path, "wb");
+		char gzmode[8];
+		snprintf(gzmode, sizeof gzmode, "wb%d",
+		         g_zlevel < 1 ? 1 : g_zlevel > 9 ? 9 : g_zlevel);
+		w->gz = gzopen(path, gzmode);
 		if (!w->gz) die("cannot open output", path);
 	} else {
 		w->kind = OW_PLAIN;
@@ -481,7 +488,7 @@ static void add_directory(pathvec *v, const char *dir)
 		fprintf(stderr, "warning: no FASTA files found in %s\n", dir);
 }
 
-/* -B accepts either a directory of genomes or a text file listing genome
+/* -A accepts either a directory of genomes or a text file listing genome
  * paths, where each listed path may itself be a file or a directory. */
 static pathvec collect_inputs(const char *arg)
 {
@@ -620,24 +627,26 @@ static int cmp_entry_ptr(const void *a, const void *b)
 
 /* ------------------------------------------------------------------- main */
 
-static void usage(void)
+static void usage(int status)
 {
 	fprintf(stderr,
-"Usage: genome_compare_presence -B <genome list or directory> [options]\n"
+"Usage: genome_compare_presence -A <genome list or directory> [options]\n"
 "\n"
-"  -B <path>   REQUIRED. Either a directory holding .fna.gz files, or a text\n"
+"  -A <path>   REQUIRED. Either a directory holding .fna.gz files, or a text\n"
 "              file listing one genome path per line; a listed path may itself\n"
 "              be a directory (expanded, sorted). Blank lines and #comments are\n"
 "              ignored. Accepts .fna/.fa/.fasta/.ffn, plain or gzipped.\n"
 "  -k <int>    k-mer length, 1..%d (default %d; 51 works).\n"
-"  -o <prefix> output prefix (default \"%s\").\n"
-"  -z          compress the presence file (.zst if built with libzstd,\n"
-"              otherwise .gz).\n"
+"  -O <dir>    output directory (default ., created if missing).\n"
+"  -n <name>   output basename (default \"%s\").\n"
+"  -o <prefix> output path prefix; overrides -O/-n.\n"
+"  -z <level>  compress the presence file at this level (.zst 1..22 if built\n"
+"              with libzstd, otherwise .gz 1..9). Default 0 = plain TSV.\n"
 "  -F          forward strand only; do not fold k-mers to their canonical\n"
 "              (lexicographically larger) orientation.\n"
 "  -m <int>    write only k-mers present in at least this many strains\n"
 "              (default 1). Filters the presence FILE only.\n"
-"  -M <int>    write only k-mers present in at most this many strains\n"
+"  -P <int>    write only k-mers present in at most this many strains\n"
 "              (default 0 = no cap). Filters the presence FILE only; the\n"
 "              identity matrix always uses every k-mer.\n"
 "  -U          do not sort the presence file by k-mer (faster, hash order).\n"
@@ -645,6 +654,7 @@ static void usage(void)
 "              the intersection sweep (default auto = N/8). Tuning only; both\n"
 "              paths give identical numbers. -x 0 forces all-bitset.\n"
 "  -h          this message.\n"
+"  (renamed: -B -> -A, -M -> -P, -z now takes a level; -s = -k)\n"
 "\n"
 "Outputs:\n"
 "  <prefix>.presence.tsv[.gz|.zst]  #kmer, n_strains, list_strain_ids\n"
@@ -660,36 +670,54 @@ static void usage(void)
 "  pl.scan_csv('presence.tsv', separator='\\t')\n"
 "    .with_columns(pl.col('list_strain_ids').str.split(','))\n",
 	MAX_K, DEFAULT_K, DEFAULT_PREFIX);
-	exit(EXIT_FAILURE);
+	exit(status);
 }
 
 int main(int argc, char *argv[])
 {
 	const char *b_arg = NULL;
-	const char *prefix = DEFAULT_PREFIX;
+	const char *out_dir = NULL, *name = DEFAULT_PREFIX, *o_arg = NULL;
 	int k = DEFAULT_K;
 	int canonical = 1, compress = 0, sorted = 1;
 	long min_strains = 1, max_strains = 0, crossover = -1;
 	int c;
 
-	while ((c = getopt(argc, argv, "B:k:s:o:m:M:x:zFUh")) != -1) {
+	while ((c = getopt(argc, argv, "A:k:s:O:n:o:m:P:x:z:FUhBM")) != -1) {
 		switch (c) {
-		case 'B': b_arg = optarg; break;
+		case 'A': b_arg = optarg; break;
 		case 'k':
 		case 's': k = atoi(optarg); break;      /* -s: same letter the other tools use */
-		case 'o': prefix = optarg; break;
+		case 'O': out_dir = optarg; break;
+		case 'n': name = optarg; break;
+		case 'o': o_arg = optarg; break;
 		case 'm': min_strains = atol(optarg); break;
-		case 'M': max_strains = atol(optarg); break;
+		case 'P': max_strains = atol(optarg); break;
 		case 'x': crossover = atol(optarg); break;
-		case 'z': compress = 1; break;
+		case 'z': {
+			long lvl = cli_parse_nonneg("genome_compare_presence", 'z', optarg);
+			compress = lvl > 0;
+			if (lvl > 0) g_zlevel = (int)lvl;
+			break;
+		}
 		case 'F': canonical = 0; break;
 		case 'U': sorted = 0; break;
-		case 'h':
-		default: usage();
+		case 'B': cli_renamed_flag("genome_compare_presence", 'B', "-A"); break;
+		case 'M': cli_renamed_flag("genome_compare_presence", 'M', "-P"); break;
+		case 'h': usage(0); break;
+		default:  usage(1);
 		}
 	}
 
-	if (!b_arg) usage();
+	if (!b_arg) usage(1);
+	if (max_strains < 0) die("-P must be >= 0", NULL);
+#ifdef HAVE_ZSTD
+	if (compress && g_zlevel > 22) die("-z must be 0..22 for .zst output", NULL);
+#else
+	if (compress && g_zlevel > 9)  die("-z must be 0..9 for .gz output", NULL);
+#endif
+	/* <O>/<n>, or -o verbatim; creates the directory */
+	char *prefix = cli_resolve_output("genome_compare_presence", out_dir,
+	                                  name, o_arg, "");
 	if (k < 1 || k > MAX_K)
 		die("-k must be between 1 and 64", NULL);
 	if (min_strains < 1) min_strains = 1;
@@ -698,7 +726,7 @@ int main(int argc, char *argv[])
 	double t0 = now_s();
 
 	pathvec files = collect_inputs(b_arg);
-	if (files.n == 0) die("no genome files found for -B", b_arg);
+	if (files.n == 0) die("no genome files found for -A", b_arg);
 	if (files.n > UINT32_MAX) die("too many genomes", NULL);
 	const uint32_t N = (uint32_t)files.n;
 
@@ -909,5 +937,6 @@ int main(int argc, char *argv[])
 	free(ent);
 	free(gs);
 	table_free(&table);
+	free(prefix);
 	return 0;
 }

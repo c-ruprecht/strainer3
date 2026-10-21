@@ -253,7 +253,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     out_name = f"{args.basename}.scrubbed_kmers.gz" if args.basename else "scrubbed_kmers.gz"
-    out = open(os.path.join(args.output_dir, out_name), 'wt')
+    out = gzip.open(os.path.join(args.output_dir, out_name), 'wt')
     out.write("#kmer\n")
     # print scrubbbed kmers that can be redirected to file
     for key in strain_hash_scrubbed:

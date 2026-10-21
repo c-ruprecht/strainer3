@@ -3,6 +3,7 @@
 /test/strainer2_parallel
 /test/strainer2_parallel/output
 /test/output
+/test/output-snake
 /src/*.o
 /src/kmer_scrub_count
 /src/strain_detect

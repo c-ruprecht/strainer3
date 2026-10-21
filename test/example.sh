@@ -1,3 +1,4 @@
+
 echo 'Example strainer run for D6331_Faecalibacterium_prausnitzii'
 echo 'STEP 0: Removing old test data if present'
 rm -rf output
@@ -7,9 +8,9 @@ printf '%*s' 20 '' | tr ' ' '='; printf ' STEP1 '; printf '%*s\n' 20 '' | tr ' '
 echo 'STEP1: kmer_scrub_count (counting the frequency of target genome kmers in unrelated genomes and metagenomes to learn their frequency'
 ../src/kmer_scrub_count \
 -r D6331_genomes/D6331_Faecalibacterium_prausnitzii.fasta.gz \
--A genomes_to_scrub.txt \
--B metagenomes_to_scrub.txt \
--C drug_scrub.txt \
+-A lists/genomes_to_scrub.txt \
+-B lists/metagenomes_to_scrub.txt \
+-C lists/drug_scrub.txt \
 -t 4 \
 -T 0.995 \
 -O output/scrub 
@@ -70,7 +71,16 @@ conda run -n strainer3_env python ../scripts/coverage_depth.py \
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP6 '; printf '%*s\n' 20 '' | tr ' ' '='
 echo 'STEP6: Call hits'
 conda run -n strainer3_env python ../scripts/hit_call.py \
---coverage /metrica/codebase/strainer3/test/output/coverage/coverage_depth.tsv \
+--coverage_dir output \
 --output_dir output 
 
+printf '%*s' 20 '' | tr ' ' '='; printf ' FINISHED '; printf '%*s\n' 20 '' | tr ' ' '='
 
+cat <<'EOF'
+     _             _                     _____
+ ___| |_ _ __ __ _(_)_ __   ___ _ __    |___ /
+/ __| __| '__/ _` | | '_ \ / _ \ '__|     |_ \
+\__ \ |_| | | (_| | | | | |  __/ |       ___) |
+|___/\__|_|  \__,_|_|_| |_|\___|_|      |____/
+EOF
+printf '%*s' 20 '' | tr ' ' '='; printf ' ENJOY '; printf '%*s\n' 20 '' | tr ' ' '='

@@ -9,6 +9,7 @@ D6331_genomes/D6331_Escherichia_coli_B3008.fasta.gz
 D6331_genomes/D6331_Escherichia_coli_B766.fasta.gz
 D6331_genomes/D6331_Escherichia_coli_JM109.fasta.gz
 D6331_genomes/D6331_Escherichia_coli_b2207.fasta.gz
+D6331_genomes/D6331_Faecalibacterium_prausnitzii.fasta.gz
 D6331_genomes/D6331_Fusobacterium_nucleatum.fasta.gz
 D6331_genomes/D6331_Lactobacillus_fermentum.fasta.gz
 D6331_genomes/D6331_Prevotella_corporis.fasta.gz

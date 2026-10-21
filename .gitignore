@@ -1,14 +1,22 @@
+# test / pipeline outputs
 /test/invitro_mixes/output
 /test/strainer2_original
 /test/strainer2_parallel
-/test/strainer2_parallel/output
 /test/output
 /test/output-snake
-/src/*.o
-/src/kmer_scrub_count
-/src/strain_detect
-/src/genome_compare
+/test/out
 .snakemake/
+
+# C build artifacts (src/Makefile)
+/src/*.o
+/src/genome_compare
+/src/genome_compare_presence
+/src/kmer_scrub_count
+/src/kmer_metagenome_db
+/src/kmer_strain_detect
+/src/kmer_strain_detect_genome
+
+# python / dev
 /scripts/dev/
 **/__pycache__/
 *.pyc

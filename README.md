@@ -7,9 +7,11 @@
 
 # Set up
 ## intallation
+'''bash
 git clone https://github.com/c-ruprecht/strainer3.git
 cd strainer3/src 
 make
+'''
 
 cd ../
 conda env create -f strainer3_env.yml

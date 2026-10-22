@@ -3,29 +3,27 @@
 scrubdb_hf.py - package, upload and restore the scrub database via a Hugging Face dataset repo.
 
 Subcommands
-  pack     Stage the DB into sharded archives + manifests (this folder IS the repo layout)
-  upload   Create the (private) dataset repo if needed and upload the staging folder (resumable)
+  pack     Stage everything into sharded archives + a manifest (this folder IS the repo layout)
+  upload   Create the dataset repo if needed and upload the staging folder (resumable)
   pull     Download from HF, then run `restore`
-  restore  Verify checksums, unpack, rebuild t96/t94 symlinks, rewrite genome paths, verify
+  restore  Verify checksums and unpack into --dest
 
 Repo / staging layout
-  MANIFEST.json                    machine-readable description used by `restore` (no local paths)
-  README.md                        dataset card (written once, edit freely)
-  manifest/genomes_t98.tsv         name, size, shard
-  manifest/checksums.sha256        sha256sum-compatible, paths relative to repo root
-  summaries/*.tsv, *.list          top-level summary files, local paths stripped (relative paths only)
-  lineage/<name>.parquet           final lineage database (copied unchanged)
-  genomes_t98/genomes_t98.NNN.tar  (plain tar: genomes are already .fna.gz)
-  rocksdb/<name>.rocksdb.tar.zst.part-NNN
+  MANIFEST.json                               layout used by `restore`
+  README.md                                   dataset card (written once, edit freely)
+  manifest/checksums.sha256                   sha256sum-compatible, paths relative to repo root
+  manifest/<section>.tsv                      name, size, shard (genomes, metagenomes)
+  genomes/genomes.NNN.tar                     all files of one genome folder, sharded
+  metagenomes/metagenomes.NNN.tar.zst         all *.kmdb entries of one folder, sharded
+  rocksdb/<name>.tar.zst.part-NNN             sourmash RocksDB, compressed and split
 
-Only genomes_t98 is uploaded. On restore:
-  * genomes_t96/ and genomes_t94/ are rebuilt from representatives_t96.tsv / _t94.tsv as relative
-    links (genomes_t96/X -> ../genomes_t98/X); rows are matched on basename(genome_path), then genome.
-  * the genome_path column of representatives_t{98,96,94}.tsv is rewritten to the restored location,
-    and representatives_t*.list are regenerated from it (one path per line).
-  * the lineage parquet is copied into --dest unchanged.
-`pack` checks that each representatives_<tier>.tsv reproduces genomes_<tier>/ exactly and lies within t98,
-removes every local (absolute) path from the files it stages, and fails if any local path is left over.
+Restored layout (--dest)
+  genomes/  metagenomes/  <rocksdb name>/
+  genomes_to_scrub_full.txt    absolute path of every entry in genomes/, one per line
+  metagenomes_to_scrub.txt     absolute path of every entry in metagenomes/, one per line
+
+The RocksDB is archived by its contents (not its directory name), so --rocksdb-name only decides
+the directory name it gets on restore.
 """
 import argparse
 import datetime
@@ -39,13 +37,11 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-FORMAT_VERSION = 3
-TIERS = ("t98", "t96", "t94")
-LINKED_TIERS = ("t96", "t94")
-SUMMARY_SUFFIXES = (".tsv", ".list")
+FORMAT_VERSION = 4
+SECTIONS = ("genomes", "metagenomes")
+LIST_FILES = {"genomes": "genomes_to_scrub_full.txt", "metagenomes": "metagenomes_to_scrub.txt"}
 ROCKSDB_EXCLUDES = ("LOCK", "LOG", "LOG.old.*")
-GENOME_EXTS = (".gz", ".bz2", ".xz", ".zst", ".fna", ".fa", ".fasta", ".fas", ".ffn", ".fsa")
-LINEAGE_DIR = "lineage"
+COMPRESSED_EXTS = (".gz", ".bz2", ".xz", ".zst")
 
 CODECS = {
     "none": {"ext": ".tar", "comp": "cat", "decomp": "cat", "level": 0},
@@ -81,30 +77,20 @@ def sha256(path, bufsize=16 << 20):
     return h.hexdigest()
 
 
-def tool_of(codec_name):
-    return CODECS[codec_name]["comp"].split()[0]
-
-
 def pick_codec(requested, fallback_order=("zstd", "pigz", "gzip")):
     order = [requested] if requested else list(fallback_order)
     for name in order:
-        if shutil.which(tool_of(name)):
+        if shutil.which(CODECS[name]["comp"].split()[0]):
             return name
     die(f"no compressor found (tried {order}); `conda install -c conda-forge zstd`")
 
 
-def scan(d):
-    """name -> path for all non-directory entries (files and symlinks) in d."""
-    d = Path(d)
-    if not d.is_dir():
-        die(f"missing directory: {d}")
-    out = {}
-    for e in os.scandir(d):
-        if e.is_dir(follow_symlinks=True):
-            log(f"  skipping subdirectory {e.path}")
-            continue
-        out[e.name] = Path(e.path)
-    return out
+def entry_size(p):
+    """Size of a file, or total size of all files under a directory (symlinks followed)."""
+    p = Path(p)
+    if p.is_dir():
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    return p.stat().st_size
 
 
 def write_tsv(path, header, rows):
@@ -114,60 +100,15 @@ def write_tsv(path, header, rows):
             f.write("\t".join(str(x) for x in r) + "\n")
 
 
-def read_table(path):
+def read_tsv(path):
     with open(path) as f:
-        header = f.readline().rstrip("\n").split("\t")
-        rows = [line.rstrip("\n").split("\t") for line in f if line.strip()]
-    return header, rows
+        f.readline()
+        return [line.rstrip("\n").split("\t") for line in f if line.strip()]
 
 
-def stem(name):
-    changed = True
-    while changed:
-        changed = False
-        for e in GENOME_EXTS:
-            if name.endswith(e):
-                name, changed = name[: -len(e)], True
-    return name
-
-
-def resolve_reps(tsv, t98_names, name_col, path_col):
-    """Match each row of a representatives table to a genomes_t98 file name.
-    Returns (header, rows, path_idx, hits, unresolved) where hits[i] is a t98 name or None."""
-    header, rows = read_table(tsv)
-    ip = header.index(path_col) if path_col in header else None
-    iname = header.index(name_col) if name_col in header else None
-    if ip is None and iname is None:
-        die(f"{tsv}: neither '{path_col}' nor '{name_col}' column found")
-    names = set(t98_names)
-    by_stem = {}
-    for n in t98_names:
-        by_stem.setdefault(stem(n), []).append(n)
-    hits, unresolved = [], []
-    for r in rows:
-        cands = []
-        if ip is not None and ip < len(r) and r[ip]:
-            cands.append(os.path.basename(r[ip]))
-        if iname is not None and iname < len(r) and r[iname]:
-            cands.append(r[iname])
-        hit = None
-        for c in cands:
-            if c in names:
-                hit = c
-                break
-            s = by_stem.get(stem(c), [])
-            if len(s) == 1:
-                hit = s[0]
-                break
-        hits.append(hit)
-        if hit is None:
-            unresolved.append(cands[0] if cands else "<empty row>")
-    return header, rows, ip, hits, unresolved
-
-
-def make_shards(names, sizes, target_bytes):
+def make_shards(sizes, target_bytes):
     shards, cur, cur_size = [], [], 0
-    for n in sorted(names):
+    for n in sorted(sizes):
         if cur and cur_size + sizes[n] > target_bytes:
             shards.append(cur)
             cur, cur_size = [], 0
@@ -178,53 +119,45 @@ def make_shards(names, sizes, target_bytes):
     return shards
 
 
-# ----------------------------------------------------------------------------- local path scrubbing
-
-def relativize(cell, roots):
-    """Strip known local roots from a cell; any absolute path that remains is reduced to its basename."""
-    for r in roots:
-        cell = cell.replace(str(r).rstrip("/") + "/", "")
-    if cell.startswith("/"):
-        cell = os.path.basename(cell.rstrip("/"))
-    return cell
-
-
-def sanitize_text_table(src, dst, roots):
-    """Copy a .tsv/.list file, removing local paths from every cell. Returns number of cells changed."""
-    changed = 0
-    tab = src.suffix == ".tsv"
-    with open(src) as fi, open(dst, "w") as fo:
-        for line in fi:
-            line = line.rstrip("\n")
-            cells = line.split("\t") if tab else [line]
-            new = [relativize(c, roots) for c in cells]
-            changed += sum(a != b for a, b in zip(cells, new))
-            fo.write("\t".join(new) + "\n")
-    return changed
-
-
-def find_leaks(staging, leak_tokens):
-    """Return [(file, token)] for staged text files that still contain a local path."""
-    files = [staging / "MANIFEST.json", staging / "README.md"]
-    files += sorted((staging / "manifest").glob("*")) + sorted((staging / "summaries").glob("*"))
-    leaks = []
-    for p in files:
-        if not p.is_file():
-            continue
-        text = p.read_text(errors="replace")
-        for tok in leak_tokens:
-            if tok in text:
-                leaks.append((p.relative_to(staging), tok))
-    return leaks
-
-
 # ----------------------------------------------------------------------------- pack
 
-def pack_shard(src_dir, names, out, staging, codec, threads, level):
+def list_genomes(d):
+    """All files (incl. symlinks to files) directly in d; subdirectories are skipped."""
+    d = Path(d)
+    if not d.is_dir():
+        die(f"missing directory: {d}")
+    names = []
+    for e in os.scandir(d):
+        if e.is_dir(follow_symlinks=True):
+            log(f"  skipping subdirectory {e.path}")
+            continue
+        if not os.path.exists(e.path):
+            die(f"broken symlink: {e.path}")
+        names.append(e.name)
+    if not names:
+        die(f"no files in {d}")
+    return names
+
+
+def list_metagenomes(d, pattern):
+    """All entries in d matching pattern (files or directories)."""
+    d = Path(d)
+    if not d.is_dir():
+        die(f"missing directory: {d}")
+    names = sorted(p.name for p in d.glob(pattern))
+    if not names:
+        die(f"no '{pattern}' entries in {d}")
+    broken = [n for n in names if not (d / n).exists()]
+    if broken:
+        die(f"{len(broken)} broken symlinks in {d}, e.g. {broken[:3]}")
+    return names
+
+
+def pack_shard(src_dir, names, out, staging, codec, threads):
     """tar (dereferencing symlinks) + optional compression of one shard. Resumable via a state file."""
     rel = out.relative_to(staging)
     state = staging / ".state" / (str(rel) + ".json")
-    list_hash = hashlib.sha256("\0".join(names).encode()).hexdigest()
+    list_hash = hashlib.sha256(("\0".join(names) + "\0" + str(src_dir)).encode()).hexdigest()
     if out.exists() and state.exists():
         st = json.loads(state.read_text())
         if st.get("list_hash") == list_hash:
@@ -234,7 +167,7 @@ def pack_shard(src_dir, names, out, staging, codec, threads, level):
     filelist = Path(str(out) + ".filelist")
     tmp = Path(str(out) + ".tmp")
     filelist.write_bytes(b"\0".join(n.encode() for n in names) + b"\0")
-    comp = codec["comp"].format(threads=threads, level=level)
+    comp = codec["comp"].format(threads=threads, level=codec["level"])
     run(f"tar -c -h -f - -C {q(str(src_dir))} --null -T {q(str(filelist))} | {comp} > {q(str(tmp))}")
     tmp.rename(out)
     filelist.unlink()
@@ -243,159 +176,123 @@ def pack_shard(src_dir, names, out, staging, codec, threads, level):
     return str(rel), digest, "built"
 
 
-def pack_rocksdb(rdb, staging, codec_name, threads, part_bytes):
+def pack_section(section, src_dir, names, staging, codec_name, shard_bytes, threads, jobs):
+    codec = CODECS[codec_name]
+    sizes = {n: entry_size(src_dir / n) for n in names}
+    shards = make_shards(sizes, shard_bytes)
+    log(f"  {section}: {len(names)} entries, {sum(sizes.values()) / 1024 ** 3:.1f} GiB, "
+        f"{len(shards)} shard(s), codec={codec_name}")
+
+    outdir = staging / section
+    outdir.mkdir(parents=True, exist_ok=True)
+    paths = [outdir / f"{section}.{i:03d}{codec['ext']}" for i in range(len(shards))]
+    for old in outdir.iterdir():          # drop shards left over from an earlier, different layout
+        if old not in paths:
+            old.unlink()
+
+    threads_per_job = max(1, threads // jobs)
+    checksums = {}
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        futs = [ex.submit(pack_shard, src_dir, n, o, staging, codec, threads_per_job)
+                for n, o in zip(shards, paths)]
+        for k, f in enumerate(as_completed(futs), 1):
+            rel, digest, status = f.result()
+            checksums[rel] = digest
+            log(f"    [{k}/{len(paths)}] {rel} ({status})")
+
+    rows = [(n, sizes[n], paths[i].name) for i, ns in enumerate(shards) for n in ns]
+    write_tsv(staging / "manifest" / f"{section}.tsv", ["name", "size", "shard"], rows)
+    info = {"codec": codec_name, "count": len(names),
+            "shards": [str(p.relative_to(staging)) for p in paths]}
+    return info, checksums
+
+
+def pack_rocksdb(rdb, name, staging, codec_name, threads, part_bytes):
+    """Archive the *contents* of the RocksDB dir, so the restored dir name is free to choose."""
     codec = CODECS[codec_name]
     outdir = staging / "rocksdb"
     outdir.mkdir(parents=True, exist_ok=True)
-    prefix = outdir / f"{rdb.name}{codec['ext']}.part-"
+    prefix = outdir / f"{name}{codec['ext']}.part-"
     state = staging / ".state" / "rocksdb.json"
     if state.exists():
         st = json.loads(state.read_text())
-        if (st.get("source") == str(rdb) and st.get("codec") == codec_name
+        if (st.get("source") == str(rdb) and st.get("name") == name and st.get("codec") == codec_name
                 and all((staging / p).exists() for p in st["parts"])):
             log("  rocksdb: reusing existing parts")
             return st
-    for old in outdir.glob(f"{rdb.name}*.part-*"):
+    for old in outdir.iterdir():
         old.unlink()
     excl = " ".join(f"--exclude={q(x)}" for x in ROCKSDB_EXCLUDES)
     comp = codec["comp"].format(threads=threads, level=codec["level"])
-    run(f"tar -c -f - -C {q(str(rdb.parent))} {excl} {q(rdb.name)} | {comp} "
+    run(f"tar -c -f - -C {q(str(rdb))} {excl} . | {comp} "
         f"| split -a 3 -d -b {part_bytes} - {q(str(prefix))}")
-    parts = sorted(outdir.glob(f"{rdb.name}{codec['ext']}.part-*"))
+    parts = sorted(outdir.glob(f"{name}{codec['ext']}.part-*"))
     st = {
         "source": str(rdb),     # kept in the local .state/ folder only (never uploaded)
-        "name": rdb.name,
+        "name": name,
         "codec": codec_name,
         "parts": [str(p.relative_to(staging)) for p in parts],
         "sha256": {str(p.relative_to(staging)): sha256(p) for p in parts},
     }
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(json.dumps(st))
+    log(f"  rocksdb: {len(parts)} part(s), restored as '{name}/'")
     return st
 
 
 def cmd_pack(a):
-    db = Path(a.db_dir).resolve()
-    reps = db / "representatives"
     staging = Path(a.staging).resolve()
     shard_bytes = int(a.shard_gb * 1024 ** 3)
+    srcs = {
+        "genomes": Path(a.genomes_dir).resolve() if a.genomes_dir else None,
+        "metagenomes": Path(a.metagenomes_dir).resolve() if a.metagenomes_dir else None,
+    }
     rdb = Path(a.rocksdb).resolve() if a.rocksdb else None
-    lineage = Path(a.lineage_parquet).resolve() if a.lineage_parquet else None
-    for src in filter(None, [db, rdb]):
+    if not any([*srcs.values(), rdb]):
+        die("nothing to pack: give at least one of --genomes-dir, --metagenomes-dir, --rocksdb")
+    for src in filter(None, [*srcs.values(), rdb]):
         if staging == src or src in staging.parents or staging in src.parents:
             die(f"--staging {staging} overlaps the source {src}; use a separate folder (e.g. scratch)")
-    if lineage:
-        if not lineage.is_file():
-            die(f"--lineage-parquet {lineage} not found")
-        if lineage.suffix != ".parquet":
-            die(f"--lineage-parquet {lineage} does not end in .parquet")
-
-    # roots stripped from paths, longest/most specific first; tokens that must not survive anywhere
-    roots = [reps, db]
-    leak_tokens = {str(p) for p in (db, rdb, staging, lineage.parent if lineage else None, Path.home())
-                   if p and len(str(p)) > 3}
-
-    # --- inventory t98 (symlinks inside t98 are dereferenced)
-    log(f"Scanning {reps / 'genomes_t98'}")
-    t98 = scan(reps / "genomes_t98")
-    broken = [n for n, p in t98.items() if not p.exists()]
-    if broken:
-        die(f"{len(broken)} broken entries in genomes_t98, e.g. {broken[:3]}")
-    sizes = {n: p.stat().st_size for n, p in t98.items()}
-    log(f"  genomes_t98: {len(t98)} files, {sum(sizes.values()) / 1024 ** 3:.1f} GiB")
-
-    # genomes are normally already gzipped -> plain tar, no recompression
-    if a.codec:
-        codec_name = pick_codec(a.codec)
-    else:
-        n_comp = sum(n.endswith((".gz", ".bz2", ".xz", ".zst")) for n in t98)
-        codec_name = "none" if n_comp > len(t98) / 2 else pick_codec(None)
-    codec = CODECS[codec_name]
-    level = a.level if a.level is not None else codec["level"]
-
-    summaries = sorted(p for p in db.iterdir() if p.is_file() and p.suffix in SUMMARY_SUFFIXES)
-
-    # --- every tier must be reproducible from its representatives_<tier>.tsv
-    problems = 0
-    for tier in TIERS:
-        tsv = db / f"representatives_{tier}.tsv"
-        if not tsv.exists():
-            die(f"{tsv} not found")
-        _, rows, _, hits, unresolved = resolve_reps(tsv, list(t98), a.name_col, a.path_col)
-        resolved = {h for h in hits if h}
-        on_disk = set(scan(reps / f"genomes_{tier}"))
-        not_listed = on_disk - resolved
-        dups = len([h for h in hits if h]) - len(resolved)
-        log(f"  {tsv.name}: {len(rows)} rows, {len(resolved)} resolve into t98, {len(unresolved)} do not, "
-            f"{dups} duplicate rows; {len(not_listed)} files in genomes_{tier}/ not in table")
-        for tok in unresolved[:5]:
-            log(f"    not in t98: {tok}")
-        for n in sorted(not_listed)[:5]:
-            log(f"    in genomes_{tier}/ but not in table: {n}")
-        problems += len(unresolved) + len(not_listed)
-    if problems and not a.allow_link_mismatch:
-        die("genome dirs cannot be rebuilt exactly from the representatives tables (see above); "
-            "fix them or rerun with --allow-link-mismatch")
-
-    t98_shards = make_shards(t98, sizes, shard_bytes)
-    log(f"  plan: {len(t98_shards)} shard(s) of ~{a.shard_gb} GiB, genome codec={codec_name}")
-
-    done_markers = sorted(p.name for p in reps.glob("*.done"))
     if rdb and not (rdb / "CURRENT").exists():
         die(f"{rdb} does not look like a RocksDB directory (no CURRENT file)")
+    rdb_name = a.rocksdb_name or (rdb.name if rdb else None)
+
+    names = {}
+    if srcs["genomes"]:
+        names["genomes"] = list_genomes(srcs["genomes"])
+    if srcs["metagenomes"]:
+        names["metagenomes"] = list_metagenomes(srcs["metagenomes"], a.metagenome_pattern)
+
+    codecs = {}
+    if "genomes" in names:     # genomes are normally already gzipped -> plain tar
+        g = names["genomes"]
+        n_comp = sum(n.endswith(COMPRESSED_EXTS) for n in g)
+        codecs["genomes"] = pick_codec(a.genome_codec) if a.genome_codec else (
+            "none" if n_comp > len(g) / 2 else pick_codec(None))
+    if "metagenomes" in names:
+        codecs["metagenomes"] = pick_codec(a.metagenome_codec)
     rdb_codec = pick_codec(a.rocksdb_codec) if rdb else None
 
     if a.dry_run:
-        log(f"  summaries: {[p.name for p in summaries]}")
-        log(f"  done markers: {done_markers}")
-        log(f"  rocksdb: {rdb} (codec {rdb_codec})")
-        log(f"  lineage parquet: {lineage}")
+        for s, ns in names.items():
+            log(f"  {s}: {len(ns)} entries from {srcs[s]}, codec {codecs[s]}, e.g. {ns[:3]}")
+        if rdb:
+            log(f"  rocksdb: {rdb} -> '{rdb_name}' (codec {rdb_codec})")
         log("Dry run - nothing written.")
         return
 
-    for sub in ("manifest", "summaries", "genomes_t98"):
-        (staging / sub).mkdir(parents=True, exist_ok=True)
-
-    def shard_path(i):
-        return staging / "genomes_t98" / f"genomes_t98.{i:03d}{codec['ext']}"
-
-    rows = [(n, sizes[n], shard_path(i).name) for i, names in enumerate(t98_shards) for n in names]
-    write_tsv(staging / "manifest" / "genomes_t98.tsv", ["name", "size", "shard"], rows)
-
-    # summaries: copy with every local path removed
-    n_cells = 0
-    for p in summaries:
-        n_cells += sanitize_text_table(p, staging / "summaries" / p.name, roots)
-    log(f"  copied {len(summaries)} summary files ({n_cells} local path(s) made relative)")
-
-    threads_per_job = max(1, a.threads // a.jobs)
-    checksums = {}
-    jobs = [(names, shard_path(i)) for i, names in enumerate(t98_shards)]
-    with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        futs = [ex.submit(pack_shard, reps / "genomes_t98", n, o, staging, codec, threads_per_job, level)
-                for n, o in jobs]
-        for k, f in enumerate(as_completed(futs), 1):
-            rel, digest, status = f.result()
-            checksums[rel] = digest
-            log(f"  [{k}/{len(jobs)}] {rel} ({status})")
-
-    lineage_info = None
-    if lineage:
-        log(f"Staging lineage database {lineage.name}")
-        out = staging / LINEAGE_DIR / lineage.name
-        out.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(lineage, out)   # copied as is, not modified
-        rel = str(out.relative_to(staging))
-        checksums[rel] = sha256(out)
-        lineage_info = {"name": lineage.name, "file": rel}
+    (staging / "manifest").mkdir(parents=True, exist_ok=True)
+    checksums, sections = {}, {}
+    for s, ns in names.items():
+        sections[s], cs = pack_section(s, srcs[s], ns, staging, codecs[s], shard_bytes, a.threads, a.jobs)
+        checksums.update(cs)
 
     rdb_info = None
     if rdb:
         log(f"Packing RocksDB {rdb} with {rdb_codec} (make sure nothing is writing to it)")
-        st = pack_rocksdb(rdb, staging, rdb_codec, a.threads, int(a.part_gb * 1024 ** 3))
+        st = pack_rocksdb(rdb, rdb_name, staging, rdb_codec, a.threads, int(a.part_gb * 1024 ** 3))
         checksums.update(st["sha256"])
         rdb_info = {"name": st["name"], "codec": st["codec"], "parts": st["parts"]}
-        log(f"  rocksdb: {len(st['parts'])} part(s)")
 
     with open(staging / "manifest" / "checksums.sha256", "w") as f:
         for rel in sorted(checksums):
@@ -404,54 +301,27 @@ def cmd_pack(a):
     manifest = {
         "format_version": FORMAT_VERSION,
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
-        "db_name": db.name,
-        "codec": codec_name,
-        "counts": {"t98": len(t98)},
-        "shards": {"genomes_t98": [str(shard_path(i).relative_to(staging)) for i in range(len(t98_shards))]},
-        "reps_tables": {t: f"summaries/representatives_{t}.tsv" for t in TIERS},
-        "linked_tiers": list(LINKED_TIERS),
-        "name_col": a.name_col,
-        "path_col": a.path_col,
+        "sections": sections,
         "rocksdb": rdb_info,
-        "lineage": lineage_info,
-        "summaries": [p.name for p in summaries],
-        "done_markers": done_markers,
     }
     (staging / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
 
     readme = staging / "README.md"
     if not readme.exists():
-        readme.write_text(README_TEMPLATE.format(db_name=db.name, t98=len(t98)))
-
-    # --- nothing local may leave the machine
-    leaks = find_leaks(staging, leak_tokens)
-    if leaks:
-        for p, tok in leaks[:10]:
-            log(f"  local path '{tok}' found in {p}")
-        if not a.allow_local_paths:
-            die("staged files still contain local paths (see above); fix them or use --allow-local-paths")
-    else:
-        log("  leak check: no local paths in staged text files")
+        readme.write_text(README_TEMPLATE)
     log(f"Staging complete: {staging}")
 
 
 README_TEMPLATE = """---
 license: other
-pretty_name: {db_name}
 tags: [metagenomics, bacterial-genomes, strain-detection]
 ---
 
-# {db_name}
+# Scrub database
 
-Scrub / reference genome database (dereplicated high-quality bacterial genomes).
-
-- genomes_t98: {t98} genomes (sharded tar archives of .fna.gz files)
-- genomes_t96 / genomes_t94 are recreated on restore as symlinks into genomes_t98,
-  from `summaries/representatives_t96.tsv` and `representatives_t94.tsv`
-- sourmash RocksDB index (split archive)
-- `lineage/*.parquet`: final lineage database
-- summary tables in `summaries/` (paths are relative; `restore` rewrites the genome_path column of the
-  representatives tables to the restored location)
+- `genomes/`: reference genomes (sharded tar archives of .fna.gz files)
+- `metagenomes/`: k-mer databases (*.kmdb), sharded archives
+- `rocksdb/`: sourmash RocksDB index (split archive)
 
 Restore with `python scrubdb_hf.py pull --repo <user>/<repo> --download-dir <dl> --dest <dir>`.
 See `MANIFEST.json` for the machine-readable layout.
@@ -485,16 +355,20 @@ def cmd_upload(a):
 
 # ----------------------------------------------------------------------------- pull / restore
 
+def wanted(a):
+    """Which parts the user asked for."""
+    return {
+        "genomes": not a.no_genomes,
+        "metagenomes": not a.no_metagenomes,
+        "rocksdb": not a.no_rocksdb,
+    }
+
+
 def cmd_pull(a):
     from huggingface_hub import snapshot_download
 
-    allow = ["MANIFEST.json", "README.md", "manifest/*", "summaries/*"]
-    if not a.no_genomes:
-        allow += ["genomes_t98/*"]
-    if not a.no_rocksdb:
-        allow += ["rocksdb/*"]
-    if not a.no_lineage:
-        allow += [f"{LINEAGE_DIR}/*"]
+    w = wanted(a)
+    allow = ["MANIFEST.json", "README.md", "manifest/*"] + [f"{k}/*" for k, v in w.items() if v]
     log(f"Downloading {a.repo}@{a.revision or 'main'} -> {a.download_dir}")
     snapshot_download(
         repo_id=a.repo,
@@ -507,57 +381,33 @@ def cmd_pull(a):
     cmd_restore(a)
 
 
-def rewrite_reps_tables(man, dl, dest, reps, t98_names):
-    """Write representatives_<tier>.tsv with genome_path pointing at the restored files,
-    and regenerate representatives_<tier>.list from it. Returns {tier: [resolved names]}."""
-    resolved_by_tier = {}
-    for tier, rel in man["reps_tables"].items():
-        header, rows, ip, hits, unresolved = resolve_reps(dl / rel, t98_names, man["name_col"], man["path_col"])
-        new_paths = []
-        for r, h in zip(rows, hits):
-            if h and ip is not None:
-                r[ip] = str(reps / f"genomes_{tier}" / h)
-            if ip is not None and ip < len(r):
-                new_paths.append(r[ip])
-        write_tsv(dest / f"representatives_{tier}.tsv", header, rows)
-        if (dl / "summaries" / f"representatives_{tier}.list").exists():
-            (dest / f"representatives_{tier}.list").write_text("".join(p + "\n" for p in new_paths))
-        resolved_by_tier[tier] = [h for h in hits if h]
-        log(f"  representatives_{tier}: {len(resolved_by_tier[tier])} paths rewritten"
-            + (f", {len(unresolved)} rows not in t98 (left as is)" if unresolved else ""))
-    return resolved_by_tier
-
-
 def cmd_restore(a):
     dl = Path(a.download_dir).resolve()
     dest = Path(a.dest).resolve()
     man = json.loads((dl / "MANIFEST.json").read_text())
     if man["format_version"] != FORMAT_VERSION:
         die(f"unsupported format_version {man['format_version']} (script expects {FORMAT_VERSION})")
-    reps = dest / "representatives"
-    rdb_parent = Path(a.rocksdb_dest).resolve() if a.rocksdb_dest else dest
+    w = wanted(a)
+    sections = {s: info for s, info in man["sections"].items() if w[s]}
+    rdb = man["rocksdb"] if w["rocksdb"] else None
+    rdb_name = a.rocksdb_name or (rdb["name"] if rdb else None)
+
     marks = dest / ".restore_state"          # tied to the destination, not the download dir
     marks.mkdir(parents=True, exist_ok=True)
 
-    want_genomes = not a.no_genomes
-    want_rocksdb = not a.no_rocksdb and man["rocksdb"]
-    want_lineage = not a.no_lineage and man.get("lineage")
-    for cname in {man["codec"]} | ({man["rocksdb"]["codec"]} if want_rocksdb else set()):
+    def mark_of(rel):
+        return marks / (rel.replace("/", "__") + ".ok")
+
+    for cname in {i["codec"] for i in sections.values()} | ({rdb["codec"]} if rdb else set()):
         tool = CODECS[cname]["decomp"].split()[0]
         if not shutil.which(tool):
             die(f"`{tool}` is required to unpack this repo")
 
-    present = list(man["shards"]["genomes_t98"]) if want_genomes else []
-    if want_rocksdb:
-        present += man["rocksdb"]["parts"]
-    if want_lineage:
-        present.append(man["lineage"]["file"])
+    present = [p for i in sections.values() for p in i["shards"]]
+    present += rdb["parts"] if rdb else []
     missing = [p for p in present if not (dl / p).exists()]
     if missing:
-        die(f"{len(missing)} archive(s) missing from {dl}, e.g. {missing[:3]}")
-
-    def mark_of(rel):
-        return marks / (rel.replace("/", "__") + ".ok")
+        die(f"{len(missing)} file(s) missing from {dl}, e.g. {missing[:3]}")
 
     # --- checksums (skipping archives already unpacked in a previous run)
     if not a.skip_verify and present:
@@ -565,117 +415,73 @@ def cmd_restore(a):
         for line in (dl / "manifest" / "checksums.sha256").read_text().splitlines():
             h, rel = line.split(None, 1)
             sums[rel.strip()] = h
-        todo = [p for p in man["shards"]["genomes_t98"] if want_genomes and not mark_of(p).exists()]
-        if want_rocksdb and not (marks / "rocksdb.ok").exists():
-            todo += man["rocksdb"]["parts"]
-        if want_lineage:
-            todo.append(man["lineage"]["file"])
-        log(f"Verifying sha256 of {len(todo)} archive(s)")
+        todo = [p for i in sections.values() for p in i["shards"] if not mark_of(p).exists()]
+        if rdb and not (marks / "rocksdb.ok").exists():
+            todo += rdb["parts"]
+        log(f"Verifying sha256 of {len(todo)} file(s)")
         with ThreadPoolExecutor(max_workers=a.jobs) as ex:
             for rel, h in zip(todo, ex.map(lambda p: sha256(dl / p), todo)):
                 if h != sums.get(rel):
                     die(f"checksum mismatch: {rel}")
         log("  all checksums OK")
 
-    # --- genome shards
-    if want_genomes:
-        decomp = CODECS[man["codec"]]["decomp"]
-        target = reps / "genomes_t98"
+    # --- sharded sections
+    for s, info in sections.items():
+        decomp = CODECS[info["codec"]]["decomp"]
+        target = dest / s
         target.mkdir(parents=True, exist_ok=True)
 
-        def unpack(rel):
+        def unpack(rel, decomp=decomp, target=target):
             if mark_of(rel).exists():
                 return rel, "already unpacked"
             run(f"{decomp} {q(str(dl / rel))} | tar -x --no-same-owner -f - -C {q(str(target))}")
             mark_of(rel).touch()
             return rel, "unpacked"
 
-        shards = man["shards"]["genomes_t98"]
-        log(f"Unpacking {len(shards)} genome shard(s) into {target}")
+        log(f"Unpacking {len(info['shards'])} {s} shard(s) into {target}")
         with ThreadPoolExecutor(max_workers=a.jobs) as ex:
-            futs = [ex.submit(unpack, r) for r in shards]
+            futs = [ex.submit(unpack, r) for r in info["shards"]]
             for k, f in enumerate(as_completed(futs), 1):
                 rel, status = f.result()
-                log(f"  [{k}/{len(shards)}] {rel} ({status})")
+                log(f"  [{k}/{len(info['shards'])}] {rel} ({status})")
 
     # --- rocksdb
-    if want_rocksdb:
-        info = man["rocksdb"]
-        rtarget = rdb_parent
+    if rdb:
+        rtarget = (Path(a.rocksdb_dest).resolve() if a.rocksdb_dest else dest) / rdb_name
         mark = marks / "rocksdb.ok"
-        if mark.exists():
-            log("RocksDB already unpacked")
+        if mark.exists() and rtarget.exists():
+            log(f"RocksDB already unpacked at {rtarget}")
         else:
-            if (rtarget / info["name"]).exists():
+            if rtarget.exists():
                 if not a.force:
-                    die(f"{rtarget / info['name']} exists; use --force to overwrite")
-                shutil.rmtree(rtarget / info["name"])
-            rtarget.mkdir(parents=True, exist_ok=True)
-            parts = " ".join(q(str(dl / p)) for p in info["parts"])
-            log(f"Unpacking RocksDB -> {rtarget / info['name']}")
-            run(f"cat {parts} | {CODECS[info['codec']]['decomp']} | tar -x --no-same-owner -f - -C {q(str(rtarget))}")
+                    die(f"{rtarget} exists; use --force to overwrite")
+                shutil.rmtree(rtarget)
+            rtarget.mkdir(parents=True)
+            parts = " ".join(q(str(dl / p)) for p in rdb["parts"])
+            log(f"Unpacking RocksDB -> {rtarget}")
+            run(f"cat {parts} | {CODECS[rdb['codec']]['decomp']} | tar -x --no-same-owner -f - -C {q(str(rtarget))}")
             mark.touch()
 
-    # --- summaries back to the DB top level
-    dest.mkdir(parents=True, exist_ok=True)
-    n_copied = 0
-    for name in man["summaries"]:
-        if not (dl / "summaries" / name).exists():
-            log(f"  summary {name} listed in MANIFEST but not in repo - skipped")
-            continue
-        shutil.copy2(dl / "summaries" / name, dest / name)
-        n_copied += 1
-    log(f"Restored {n_copied} summary files into {dest}")
-
-    # --- lineage database
-    if want_lineage:
-        shutil.copy2(dl / man["lineage"]["file"], dest / man["lineage"]["name"])
-        log(f"Restored lineage database {man['lineage']['name']} into {dest}")
-
-    # --- representatives tables: rewrite genome_path to the restored location
-    t98_names = [r[0] for r in read_table(dl / "manifest" / "genomes_t98.tsv")[1]]
-    if a.keep_original_paths:
-        resolved_by_tier = {t: [h for h in resolve_reps(dl / rel, t98_names, man["name_col"], man["path_col"])[3] if h]
-                            for t, rel in man["reps_tables"].items()}
-    else:
-        resolved_by_tier = rewrite_reps_tables(man, dl, dest, reps, t98_names)
-
-    if not want_genomes:
-        log("Genomes skipped (--no-genomes); not creating links.")
-        return
-
-    # --- t96 / t94 symlinks (relative, so the tree is relocatable)
-    for tier in man["linked_tiers"]:
-        d = reps / f"genomes_{tier}"
-        d.mkdir(parents=True, exist_ok=True)
-        for n in resolved_by_tier[tier]:
-            link = d / n
-            if link.is_symlink() or link.exists():
-                link.unlink()
-            link.symlink_to(Path("..") / "genomes_t98" / n)
-        log(f"  genomes_{tier}: {len(set(resolved_by_tier[tier]))} symlinks")
-
-    for m in man["done_markers"]:
-        (reps / m).touch()
-
-    # --- verify
+    # --- verify sizes of unpacked entries
     errors = 0
-    for name, size, _ in read_table(dl / "manifest" / "genomes_t98.tsv")[1]:
-        p = reps / "genomes_t98" / name
-        if not p.is_file() or p.stat().st_size != int(size):
-            errors += 1
-            if errors <= 5:
-                log(f"  BAD: {p}")
-    for tier in man["linked_tiers"]:
-        for link in (reps / f"genomes_{tier}").iterdir():
-            if not link.exists():
+    for s in sections:
+        for name, size, _ in read_tsv(dl / "manifest" / f"{s}.tsv"):
+            p = dest / s / name
+            if not p.exists() or entry_size(p) != int(size):
                 errors += 1
                 if errors <= 5:
-                    log(f"  BROKEN LINK: {link}")
+                    log(f"  BAD: {p}")
     if errors:
         die(f"verification failed: {errors} problem(s)")
-    log(f"Verified: t98={len(t98_names)}, " +
-        ", ".join(f"{t}={len(set(resolved_by_tier[t]))}" for t in man["linked_tiers"]))
+    log("Verified: " + ", ".join(f"{s}={i['count']}" for s, i in sections.items())
+        + (f", rocksdb={rdb_name}" if rdb else ""))
+
+    # --- path lists for the scrub step (absolute paths of the restored entries)
+    for s in sections:
+        out = dest / LIST_FILES[s]
+        names = sorted(r[0] for r in read_tsv(dl / "manifest" / f"{s}.tsv"))
+        out.write_text("".join(f"{dest / s / n}\n" for n in names))
+        log(f"Wrote {out.name} ({len(names)} paths)")
 
     if a.cleanup:
         for p in present:
@@ -690,25 +496,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("pack", help="stage DB into archives + manifests")
-    p.add_argument("--db-dir", required=True, help="DB directory containing representatives/ and summary TSVs")
+    p = sub.add_parser("pack", help="stage everything into archives + manifest")
+    p.add_argument("--genomes-dir", help="folder whose files go into genomes/")
+    p.add_argument("--metagenomes-dir", help="folder whose *.kmdb entries go into metagenomes/")
+    p.add_argument("--metagenome-pattern", default="*.kmdb", help="glob for --metagenomes-dir (default *.kmdb)")
     p.add_argument("--rocksdb", help="sourmash RocksDB directory to include")
-    p.add_argument("--lineage-parquet", help="final lineage database (.parquet) to include")
+    p.add_argument("--rocksdb-name", help="directory name the RocksDB gets on restore (default: its current name)")
     p.add_argument("--staging", required=True, help="output folder (= repo layout)")
-    p.add_argument("--shard-gb", type=float, default=10, help="GiB per genome shard (default 10)")
+    p.add_argument("--shard-gb", type=float, default=10, help="GiB per shard (default 10)")
     p.add_argument("--part-gb", type=float, default=10, help="GiB per RocksDB archive part (default 10)")
-    p.add_argument("--codec", choices=list(CODECS),
-                   help="genome shard codec (default: none if genomes are already compressed)")
+    p.add_argument("--genome-codec", choices=list(CODECS),
+                   help="default: none if genomes are already compressed, else zstd")
+    p.add_argument("--metagenome-codec", choices=list(CODECS), help="default: zstd, else pigz, else gzip")
     p.add_argument("--rocksdb-codec", choices=list(CODECS), help="default: zstd, else pigz, else gzip")
-    p.add_argument("--level", type=int, help="compression level for genome shards")
-    p.add_argument("--name-col", default="genome", help="genome id column in representatives_*.tsv")
-    p.add_argument("--path-col", default="genome_path", help="genome path column in representatives_*.tsv")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     p.add_argument("--jobs", type=int, default=4, help="shards built in parallel")
-    p.add_argument("--allow-link-mismatch", action="store_true",
-                   help="pack even if representatives tables don't exactly reproduce the genome dirs")
-    p.add_argument("--allow-local-paths", action="store_true",
-                   help="only warn (instead of failing) if staged text files still contain local paths")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_pack)
 
@@ -716,24 +518,22 @@ def main():
     p.add_argument("--staging", required=True)
     p.add_argument("--repo", required=True, help="e.g. yourname/scrubdb-derep-hq")
     p.add_argument("--public", action="store_true", help="create repo as public (default private)")
-    p.add_argument("--tag", help="tag this upload, e.g. v2026.09")
+    p.add_argument("--tag", help="tag this upload, e.g. v2026.10")
     p.add_argument("--workers", type=int, default=8)
     p.set_defaults(func=cmd_upload)
 
     def add_restore_args(p):
         p.add_argument("--download-dir", required=True, help="where archives are / will be downloaded")
-        p.add_argument("--dest", required=True, help="DB directory to recreate")
+        p.add_argument("--dest", required=True, help="directory to restore into")
         p.add_argument("--rocksdb-dest", help="parent dir for the RocksDB (default: --dest)")
+        p.add_argument("--rocksdb-name", help="override the RocksDB directory name on restore")
         p.add_argument("--jobs", type=int, default=4)
-        p.add_argument("--skip-verify", action="store_true", help="skip sha256 of archives")
-        p.add_argument("--keep-original-paths", action="store_true",
-                       help="don't rewrite genome_path in representatives_*.tsv / regenerate .list files "
-                            "(they then keep the relative paths stored in the repo)")
+        p.add_argument("--skip-verify", action="store_true", help="skip sha256 of downloaded files")
         p.add_argument("--cleanup", action="store_true", help="delete archives after successful restore")
         p.add_argument("--force", action="store_true", help="overwrite existing RocksDB")
         p.add_argument("--no-genomes", action="store_true")
+        p.add_argument("--no-metagenomes", action="store_true")
         p.add_argument("--no-rocksdb", action="store_true")
-        p.add_argument("--no-lineage", action="store_true", help="skip the lineage parquet")
 
     p = sub.add_parser("pull", help="download from HF and restore")
     p.add_argument("--repo", required=True)

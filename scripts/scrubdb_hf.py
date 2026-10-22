@@ -121,36 +121,49 @@ def make_shards(sizes, target_bytes):
 
 # ----------------------------------------------------------------------------- pack
 
-def list_genomes(d):
-    """All files (incl. symlinks to files) directly in d; subdirectories are skipped."""
+def scan_entries(section, d, pattern, dirs_ok, workers):
+    """name -> size for the entries of d matching pattern (symlinks followed).
+    Directories are summed recursively if dirs_ok, otherwise skipped.
+    Stats run in a thread pool, which is much faster on network file systems (GPFS)."""
     d = Path(d)
     if not d.is_dir():
         die(f"missing directory: {d}")
-    names = []
-    for e in os.scandir(d):
-        if e.is_dir(follow_symlinks=True):
-            log(f"  skipping subdirectory {e.path}")
-            continue
-        if not os.path.exists(e.path):
-            die(f"broken symlink: {e.path}")
-        names.append(e.name)
-    if not names:
-        die(f"no files in {d}")
-    return names
-
-
-def list_metagenomes(d, pattern):
-    """All entries in d matching pattern (files or directories)."""
-    d = Path(d)
-    if not d.is_dir():
-        die(f"missing directory: {d}")
+    log(f"Listing {section}: {d} ({pattern})")
     names = sorted(p.name for p in d.glob(pattern))
     if not names:
         die(f"no '{pattern}' entries in {d}")
-    broken = [n for n in names if not (d / n).exists()]
+    log(f"  {len(names)} entries found, reading sizes with {workers} threads")
+
+    def size_of(n):
+        p = d / n
+        if not p.exists():
+            return n, "broken"
+        if p.is_dir():
+            if not dirs_ok:
+                return n, "dir"
+            return n, sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+        return n, p.stat().st_size
+
+    sizes, broken, skipped = {}, [], []
+    step = max(1000, len(names) // 20)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for k, (n, sz) in enumerate(ex.map(size_of, names), 1):
+            if sz == "broken":
+                broken.append(n)
+            elif sz == "dir":
+                skipped.append(n)
+            else:
+                sizes[n] = sz
+            if k % step == 0 or k == len(names):
+                log(f"  {section}: {k}/{len(names)} sized")
     if broken:
         die(f"{len(broken)} broken symlinks in {d}, e.g. {broken[:3]}")
-    return names
+    if skipped:
+        log(f"  skipped {len(skipped)} subdirectories, e.g. {skipped[:3]}")
+    if not sizes:
+        die(f"no usable entries in {d}")
+    log(f"  {section}: {len(sizes)} entries, {sum(sizes.values()) / 1024 ** 3:.1f} GiB")
+    return sizes
 
 
 def pack_shard(src_dir, names, out, staging, codec, threads):
@@ -176,12 +189,11 @@ def pack_shard(src_dir, names, out, staging, codec, threads):
     return str(rel), digest, "built"
 
 
-def pack_section(section, src_dir, names, staging, codec_name, shard_bytes, threads, jobs):
+def pack_section(section, src_dir, sizes, staging, codec_name, shard_bytes, threads, jobs):
     codec = CODECS[codec_name]
-    sizes = {n: entry_size(src_dir / n) for n in names}
     shards = make_shards(sizes, shard_bytes)
-    log(f"  {section}: {len(names)} entries, {sum(sizes.values()) / 1024 ** 3:.1f} GiB, "
-        f"{len(shards)} shard(s), codec={codec_name}")
+    log(f"Packing {section}: {len(shards)} shard(s) of ~{shard_bytes / 1024 ** 3:.0f} GiB, "
+        f"codec={codec_name}, {jobs} in parallel (first progress line appears when a shard finishes)")
 
     outdir = staging / section
     outdir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +214,7 @@ def pack_section(section, src_dir, names, staging, codec_name, shard_bytes, thre
 
     rows = [(n, sizes[n], paths[i].name) for i, ns in enumerate(shards) for n in ns]
     write_tsv(staging / "manifest" / f"{section}.tsv", ["name", "size", "shard"], rows)
-    info = {"codec": codec_name, "count": len(names),
+    info = {"codec": codec_name, "count": len(sizes),
             "shards": [str(p.relative_to(staging)) for p in paths]}
     return info, checksums
 
@@ -257,11 +269,13 @@ def cmd_pack(a):
         die(f"{rdb} does not look like a RocksDB directory (no CURRENT file)")
     rdb_name = a.rocksdb_name or (rdb.name if rdb else None)
 
-    names = {}
+    log(f"Staging into {staging}")
+    names = {}     # section -> {name: size}
     if srcs["genomes"]:
-        names["genomes"] = list_genomes(srcs["genomes"])
+        names["genomes"] = scan_entries("genomes", srcs["genomes"], "*", False, a.scan_workers)
     if srcs["metagenomes"]:
-        names["metagenomes"] = list_metagenomes(srcs["metagenomes"], a.metagenome_pattern)
+        names["metagenomes"] = scan_entries("metagenomes", srcs["metagenomes"], a.metagenome_pattern,
+                                            True, a.scan_workers)
 
     codecs = {}
     if "genomes" in names:     # genomes are normally already gzipped -> plain tar
@@ -275,7 +289,7 @@ def cmd_pack(a):
 
     if a.dry_run:
         for s, ns in names.items():
-            log(f"  {s}: {len(ns)} entries from {srcs[s]}, codec {codecs[s]}, e.g. {ns[:3]}")
+            log(f"  {s}: {len(ns)} entries from {srcs[s]}, codec {codecs[s]}, e.g. {sorted(ns)[:3]}")
         if rdb:
             log(f"  rocksdb: {rdb} -> '{rdb_name}' (codec {rdb_codec})")
         log("Dry run - nothing written.")
@@ -340,13 +354,17 @@ def cmd_upload(a):
     log(f"Logged in as: {api.whoami()['name']}")
     url = api.create_repo(a.repo, repo_type="dataset", private=not a.public, exist_ok=True)
     log(f"Repo: {url}")
-    api.upload_large_folder(
-        repo_id=a.repo,
-        folder_path=staging,
-        repo_type="dataset",
-        ignore_patterns=[".state/*", "*.tmp", "*.filelist"],
-        num_workers=a.workers,
-    )
+    ignore = [".state/*", ".state/**", ".cache/**", "*.tmp", "*.filelist"]
+    if hasattr(api, "upload_large_folder"):
+        # huggingface_hub < 2.0: dedicated resumable uploader
+        api.upload_large_folder(repo_id=a.repo, folder_path=staging, repo_type="dataset",
+                                ignore_patterns=ignore, num_workers=a.workers)
+    else:
+        # huggingface_hub >= 2.0: upload_folder is resumable (rerun the same command) and
+        # splits big folders into several commits by itself
+        api.upload_folder(repo_id=a.repo, folder_path=staging, repo_type="dataset",
+                          ignore_patterns=ignore,
+                          commit_message=f"Upload {a.tag}" if a.tag else "Upload scrub DB")
     if a.tag:
         api.create_tag(a.repo, tag=a.tag, repo_type="dataset", exist_ok=True)
         log(f"Tagged revision as {a.tag}")
@@ -511,6 +529,7 @@ def main():
     p.add_argument("--rocksdb-codec", choices=list(CODECS), help="default: zstd, else pigz, else gzip")
     p.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     p.add_argument("--jobs", type=int, default=4, help="shards built in parallel")
+    p.add_argument("--scan-workers", type=int, default=32, help="threads for reading file sizes (default 32)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_pack)
 

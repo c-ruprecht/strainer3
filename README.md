@@ -43,6 +43,14 @@ snakemake -s strainer3.smk --cores 12 --quiet rules
 ````
 
 ## Pulling scrub database
+
+The scrub database contains ~160k dereplicated genomes of high quality (checkm2 completeness >99%, contamination <0.5%) and ~500 metagenomes of individual patients. A sourmash .rocksdb was created from the genomes which can be used to subset the genome database for your target strains. 
+The metagenomes where built into kmdb files, scrubbing their kmers using the genome database. In each metagenome kmers are kept with count >= 2.
+- full size: 
+- genomes: 157296, 198.2 GiB
+- metagenomes: 511, 153.8 GiB
+- sourmash db: 1, 
+
 # Understanding results:
 ## hit calls
 - explain hit_call_pr

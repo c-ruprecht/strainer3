@@ -2,8 +2,12 @@ import pandas as pd
 import os
 import argparse
 import numpy as np
+import ahocorasick
+from Bio import SeqIO
+from Bio.Seq import Seq
+import gzip
 
-def get_sample_coverage(df_hits, df_counts):
+def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
 
     df_counts = df_counts.drop(columns=['reference_count', 'drug_count']).set_index('#kmer').sum(axis=1)
     df_counts = df_counts.reset_index(name= 'count')
@@ -19,7 +23,7 @@ def get_sample_coverage(df_hits, df_counts):
 
     df_counts_uni = df_counts.loc[df_counts['count']==0].copy()
     rare_count = '==0'
-    if len(df_counts_uni) < 1000:
+    if len(df_counts_uni) < rare_t:
         df_counts_uni = df_counts.loc[df_counts['count'] <= 1].copy()
         rare_count = '<=1'
     df_counts_uni['rare_count'] = rare_count
@@ -44,6 +48,54 @@ def get_sample_coverage(df_hits, df_counts):
 
     return df_cov_depth
 
+def load_genome(genome_path):
+    opener = gzip.open if genome_path.endswith('.gz') else open
+    records = {}
+    with opener(genome_path, 'rt') as fh:
+        for record in SeqIO.parse(fh, 'fasta'):
+            records[record.id] = record.seq
+    return records
+
+def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
+    # Build Aho-Corasick automaton with forward and reverse complement kmers
+    # Important: only pass single-count kmers; only the first hit per kmer is kept
+    kmers = list(kmers)
+    A = ahocorasick.Automaton()
+    for kmer in kmers:
+        A.add_word(kmer, (kmer, False))
+        A.add_word(str(Seq(kmer).reverse_complement()), (kmer, True))
+    A.make_automaton()
+
+    found = set()
+    rows = []
+    for record_id, seq in records.items():
+        for pos, (kmer, is_rc) in A.iter(str(seq)):
+            if kmer not in found:
+                rows.append((record_id, kmer, pos - len(kmer) + 1, is_rc))
+                found.add(kmer)
+
+    df = pd.DataFrame(rows, columns=['contig_id', '#kmer', 'kmer_position', 'reverse_complement'])
+
+    if len(df) < len(kmers):
+        print(f'WARNING: not all kmers found in genome ({len(df)} / {len(kmers)})')
+    elif len(df) > len(kmers):
+        print('WARNING: kmers found more than once')
+    else:
+        print(f'  {len(df)} kmers mapped (all unique)')
+
+    dict_len = {cid: len(seq) for cid, seq in records.items()}
+    df['contig_length'] = df['contig_id'].map(dict_len)
+    df['terminal_kmer'] = (
+        (df['kmer_position'] < terminal_dist) |
+        ((df['contig_length'] - df['kmer_position']) < terminal_dist)
+    )
+    df['label'] = df['terminal_kmer'].map({True: 'terminal', False: 'internal'})
+
+    n_terminal = int(df['terminal_kmer'].sum())
+    print(f'  Terminal kmers: {n_terminal} / {len(df)}')
+
+    return df, dict_len
+
 
 def main():
     # to do, basename + strain name addition
@@ -52,7 +104,10 @@ def main():
     parser.add_argument('--hits', help='a target_strain .kmer_hits.tsv.gz', required = True)
     parser.add_argument('--output_dir', help='directory where output is saved')
     parser.add_argument('--strain', help = 'add a name for the target strain you are tracking')
-   
+    parser.add_argument('--reference', '-r', help = 'Path to reference file of a strain. Can be used to map kmers to locations')
+    parser.add_argument('--terminal_dist', type = int, default = 300, help = 'distance from end of contig. Kmers within that range will be dropped')
+    parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     hits_path = args.hits
@@ -68,8 +123,17 @@ def main():
     df_hits = df_hits.loc[df_hits['#kmer'] !='total_evaluated'].copy()
     df_counts = pd.read_csv(counts_path, sep = '\t')
 
+    # get hit locations and strip terminal kmers
+    if args.reference:
+        df_locs, _ = build_mapped_kmers_ahocorasick(records= load_genome(args.reference),
+                                                    terminal_dist= args.terminal_dist,
+                                                    kmers = df_hits['#kmer'].to_list())
+        print(f"Removing {len(df_locs.loc[df_locs['label']=='terminal'])} terminal kmers")
+        df_internal = df_locs.loc[df_locs['label']=='internal']
+        df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
+
     # get sample coverage for all kemrs and unique/rare kmers
-    df_cov_depth = get_sample_coverage(df_hits=df_hits, df_counts= df_counts)
+    df_cov_depth = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
 
     df_cov_depth = df_cov_depth.reset_index(names = 'sample')
     

@@ -4,7 +4,9 @@
 /test/strainer2_parallel
 /test/output
 /test/output-snake
+/test/output-fullscrub
 /test/out
+example_workflows/config_strainer3_test_minerva.yaml
 .snakemake/
 
 # C build artifacts (src/Makefile)

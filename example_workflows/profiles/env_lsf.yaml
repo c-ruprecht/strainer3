@@ -1,0 +1,14 @@
+# env_lsf.yaml: cluster (Minerva / LSF)
+shell_prefix: "ml anaconda3/latest &&"
+env_run: "conda run --no-capture-output -n strainer3_env"
+
+resources:
+  target_kmdb:         {threads: 10, mem_mb: 120000, runtime: 120, lsf_queue: premium}
+  sourmash_sketch:     {threads: 1,  mem_mb: 4000,   runtime: 30,  lsf_queue: premium}
+  sourmash_search_all: {threads: 20, mem_mb: 64000,  runtime: 480, lsf_queue: premium}
+  sourmash_split_hits: {threads: 1,  mem_mb: 32000,  runtime: 60,  lsf_queue: premium}
+  kmer_scrub:          {threads: 45, mem_mb: 32000,  runtime: 720, lsf_queue: premium}
+  kmer_filter:         {threads: 1,  mem_mb: 16000,  runtime: 60,  lsf_queue: premium}
+  strain_detect:       {threads: 20, mem_mb: 32000,  runtime: 120, lsf_queue: premium}
+  coverage_depth:      {threads: 1,  mem_mb: 16000,  runtime: 60,  lsf_queue: premium}
+  hit_call:            {threads: 1,  mem_mb: 8000,   runtime: 30,  lsf_queue: premium}

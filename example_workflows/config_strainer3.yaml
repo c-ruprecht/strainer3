@@ -1,0 +1,24 @@
+# Strainer3 config file
+scrub_db_path: /path/to/scrub_db
+output_dir: /path/to/output_dir
+target_metagenomes: /path/to/sample/sheet 
+strainer_path: /path/to/strainer
+
+genome_lists:
+  - path/to/genome_listA
+  - path/to/genome_listB
+
+# locations are indexed and searched, giving a parent directory like where/to/find/genomes also works
+genome_locations:
+  - where/to/find/genomes/genome_listA
+  - where/to/find/genomes/genome_listB
+
+metagenome_locations:
+  - where/to/find/metagenomes
+
+# strainer default settings
+filter_fraction: 0.01 #1% rarest kmers are kept after scsrubbing
+terminal_dist: 500 #kmers within bp from contig ends that are removed before coverage depth calculations
+rare_kmer_count: 1000 # at least 1000 unique kmers are used. If less than 1000 are unique, include count 1 kmers
+containment: 0.0001 #subsetting genome scrubs to reduce run time. Use 'all' to scrub using whole genome database and skip sourmash
+drug_scrub: True #strains within a genome list are used as a drug scrub to remove all kmers contained from other strains, highly recommended for FMT/LBP tracking

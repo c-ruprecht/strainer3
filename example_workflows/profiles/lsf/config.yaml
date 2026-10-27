@@ -1,0 +1,16 @@
+rerun-incomplete: True
+jobs: 150
+max-jobs-per-second: 1
+max-status-checks-per-second: 0.5
+latency-wait: 240
+keep-going: True
+executor: lsf
+scheduler: greedy
+
+default-resources:
+  - mem_mb=10000
+  - disk_mb=30000
+  - runtime=720
+  - lsf_project="change_to_project"
+  - lsf_queue="express"
+  - "lsf_extra='-o /path/to/%J.out -e /path/to/%J.err -L /bin/bash'"

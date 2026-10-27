@@ -1,0 +1,3 @@
+sample_name	seq_files	
+ATCC-10-even	ATCC-10-even_S21_L001_R1_001.fastq.downsampled.gz,ATCC-10-even_S21_L001_R2_001.fastq.downsampled.gz
+D6331	D6331-231101-C4_R1_001.fastq.downsampled.gz,D6331-231101-C4_R2_001.fastq.downsampled.gz

@@ -1,0 +1,4 @@
+cores: 28
+rerun-incomplete: True
+keep-going: True
+latency-wait: 30

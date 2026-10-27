@@ -1,0 +1,15 @@
+# env_local.yaml: workstation, already inside the strainer3_env conda env
+shell_prefix: ""
+env_run: ""
+
+# start with: snakemake ... --cores 28 --resources mem_mb=32000
+resources:
+  target_kmdb:         {threads: 8,  mem_mb: 16000, runtime: 120, lsf_queue: ""}
+  sourmash_sketch:     {threads: 1,  mem_mb: 4000,  runtime: 30,  lsf_queue: ""}
+  sourmash_search_all: {threads: 14, mem_mb: 32000, runtime: 480, lsf_queue: ""}
+  sourmash_split_hits: {threads: 1,  mem_mb: 16000, runtime: 60,  lsf_queue: ""}
+  kmer_scrub:          {threads: 14, mem_mb: 16000, runtime: 720, lsf_queue: ""}
+  kmer_filter:         {threads: 1,  mem_mb: 8000,  runtime: 60,  lsf_queue: ""}
+  strain_detect:       {threads: 8,  mem_mb: 16000, runtime: 120, lsf_queue: ""}
+  coverage_depth:      {threads: 1,  mem_mb: 8000,  runtime: 60,  lsf_queue: ""}
+  hit_call:            {threads: 1,  mem_mb: 4000,  runtime: 30,  lsf_queue: ""}

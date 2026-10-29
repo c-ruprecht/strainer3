@@ -21,11 +21,12 @@ def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
                             })
 
 
-    df_counts_uni = df_counts.loc[df_counts['count']==0].copy()
-    rare_count = '==0'
-    if len(df_counts_uni) < rare_t:
-        df_counts_uni = df_counts.loc[df_counts['count'] <= 1].copy()
-        rare_count = '<=1'
+    max_count = int(df_counts['count'].max())
+    for t in range(0, max_count + 1):
+        df_counts_uni = df_counts.loc[df_counts['count'] <= t].copy()
+        rare_count = '==0' if t == 0 else f'<={t}'
+        if len(df_counts_uni) >= rare_t:
+            break
     df_counts_uni['rare_count'] = rare_count
 
     df_unique = df_hits.loc[df_hits['#kmer'].isin(df_counts_uni['#kmer'])].set_index('#kmer')

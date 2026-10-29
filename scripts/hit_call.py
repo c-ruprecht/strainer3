@@ -61,7 +61,7 @@ def main():
 
     df_cov['depth_ratio'] = df_cov['depth_rare_kmers']/df_cov['depth_nonrare_kmers']
 
-    df_hits = df_cov[[ 'strain','sample', 'hit_call_pr', 'coverage_rare_kmers', 'depth_ratio', 'rare_count']].copy()
+    df_hits = df_cov[[ 'strain','sample', 'hit_call_pr', 'coverage_rare_kmers',  'pair_cov_geo', 'depth_ratio', 'rare_count']].copy()
     print(df_hits)
     df_hits.sort_values('coverage_rare_kmers', ascending= False).to_csv(os.path.join(args.output_dir, 'hit_calls.tsv'), sep = '\t', index = None)
 

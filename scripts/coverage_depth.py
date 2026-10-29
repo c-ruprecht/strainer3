@@ -97,6 +97,64 @@ def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
 
     return df, dict_len
 
+# get kmer blocks
+def add_block_ids(df, min_block_size=30):
+    df = df.sort_values(['contig_id', 'kmer_position']).copy()
+    pos_break = df.groupby('contig_id')['kmer_position'].diff().ne(1)
+    df['block_id'] = (pos_break).cumsum()
+    df['block_size'] = df.groupby('block_id')['block_id'].transform('size')
+    df['block_id'] = pd.factorize(df['block_id'])[0] + 1
+
+    return df
+
+# get block pair coverage
+def call_blocks(df_counts, df_hits):
+    df_counts = df_counts[['#kmer','block_id']].copy()
+    samples = [c for c in df_hits.columns if c != '#kmer']
+    block_total = df_counts.groupby('block_id').size()
+
+    # inner merge: kmers without a hits row are zeros, accounted for via block_total
+    df = pd.merge(df_hits, df_counts[['#kmer', 'block_id']], on='#kmer', how='inner')
+
+    block_hit = ((df[samples] > 0).groupby(df['block_id']).sum()
+                 .reindex(block_total.index, fill_value=0))
+    block_sum = (df[samples].groupby(df['block_id']).sum()
+                 .reindex(block_total.index, fill_value=0))
+    del df
+
+    block_coverage = block_hit.div(block_total, axis=0).round(4)
+    block_depth = block_sum.div(block_total, axis=0).round(2)
+
+    df_gpd = pd.concat({'block_hit': block_hit,
+                        'block_coverage': block_coverage,
+                        'block_depth': block_depth}, axis=1)
+    df_gpd = df_gpd.stack(level=-1, future_stack=True).rename_axis(['block_id', 'sample']).reset_index()
+    df_gpd['sample'] = df_gpd['sample'].astype('category')
+    df_gpd['block_total'] = df_gpd['block_id'].map(block_total)
+
+    return df_gpd[['block_id',  'sample', 'block_hit', 'block_total', 'block_coverage', 'block_depth', ]]
+
+def get_block_pair_coverage(df_called_blocks):
+    # blocks x samples coverage matrix
+    df_cov = (df_called_blocks
+              .pivot(index='block_id', columns='sample', values='block_coverage')
+              .fillna(0))
+    df_cov.columns = df_cov.columns.astype(str)
+    C = df_cov.to_numpy(dtype=np.float64)                   # B x S
+    B = C.shape[0]
+    P = B * (B - 1) // 2                                    # all block pairs
+
+    # sum over all pairs a<b of sqrt(C[a]*C[b])
+    tot = np.sqrt(C).sum(axis=0)
+    pair_sum = (tot * tot - C.sum(axis=0)) / 2.0
+
+    return pd.DataFrame({
+        'sample':        df_cov.columns,
+        'blocks_total':  B,
+        'pairs_total':   P,
+        'pair_cov_geo':  pair_sum / P if P else 0.0,
+    })
+
 
 def main():
     # to do, basename + strain name addition
@@ -133,6 +191,8 @@ def main():
         df_internal = df_locs.loc[df_locs['label']=='internal']
         df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
         df_loc_counts = pd.merge(df_locs, df_counts, on = '#kmer', how = 'inner')
+        # add block ids don't drop anything
+        df_loc_counts = add_block_ids(df_loc_counts)
 
     # get sample coverage for all kemrs and unique/rare kmers
     df_cov_depth, df_cnt_uni = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
@@ -140,13 +200,20 @@ def main():
     if args.reference:
         df_loc_counts = pd.merge(df_loc_counts, df_cnt_uni, on = '#kmer', how = 'left')
         df_loc_counts.set_index('#kmer').to_csv(os.path.join(outpath,"kmer_locations.tsv"), sep = '\t')
+        # create block pair coverage
+        df_rare = df_loc_counts.dropna(subset = 'rare_count')
+        df_blk_call = call_blocks(df_counts=df_rare, df_hits=df_hits)
+        df_blk_call.set_index(['sample','block_id']).to_csv(os.path.join(outpath,"block_calls.tsv"), sep = '\t')
+        df_blk_cov = get_block_pair_coverage(df_blk_call)
 
     df_cov_depth = df_cov_depth.reset_index(names = 'sample')
-    
+    df_cov_depth = pd.merge(df_cov_depth, df_blk_cov, on = 'sample', how = 'left')
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
+    # get relative abundance
+
+
     if args.strain:
         df_cov_depth['strain'] = args.strain 
-
     df_cov_depth.set_index(['strain', 'sample']).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
     print(f'Saved coverage dataframe to \n {outpath}')
     print(df_cov_depth.head(5))

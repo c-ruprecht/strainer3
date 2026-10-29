@@ -46,7 +46,7 @@ def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
                             })
     df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_uni, df_cov_depth_nonuni], axis = 1)    
 
-    return df_cov_depth
+    return df_cov_depth, df_counts_uni
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -131,9 +131,14 @@ def main():
         print(f"Removing {len(df_locs.loc[df_locs['label']=='terminal'])} terminal kmers")
         df_internal = df_locs.loc[df_locs['label']=='internal']
         df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
+        df_loc_counts = pd.merge(df_locs, df_counts, on = '#kmer', how = 'inner')
 
     # get sample coverage for all kemrs and unique/rare kmers
-    df_cov_depth = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
+    df_cov_depth, df_cnt_uni = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
+    
+    if args.reference:
+        df_loc_counts = pd.merge(df_loc_counts, df_cnt_uni, on = '#kmer', how = 'left')
+        df_loc_counts.set_index('#kmer').to_csv(os.path.join(outpath,"kmer_locations.tsv"), sep = '\t')
 
     df_cov_depth = df_cov_depth.reset_index(names = 'sample')
     

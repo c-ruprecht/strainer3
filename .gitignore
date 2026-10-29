@@ -6,6 +6,7 @@
 /test/output-snake
 /test/output-fullscrub
 /test/out
+example_workflows/profiles/lsf_faith
 example_workflows/config_strainer3_test_minerva.yaml
 .snakemake/
 

@@ -66,7 +66,8 @@ conda run -n strainer3_env python ../scripts/coverage_depth.py \
 --counts output/scrub/D6331_Faecalibacterium_prausnitzii.global_counts.tsv.zst \
 --hits output/strain_detect/D6331_Faecalibacterium_prausnitzii.kmer_hits.tsv.gz \
 --strain D6331_Faecalibacterium_prausnitzii \
---output_dir output/coverage
+--output_dir output/coverage \
+--reference D6331_genomes/D6331_Faecalibacterium_prausnitzii.fasta.gz \
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP6 '; printf '%*s\n' 20 '' | tr ' ' '='
 echo 'STEP6: Call hits'

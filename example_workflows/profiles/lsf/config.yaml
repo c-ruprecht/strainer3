@@ -11,6 +11,6 @@ default-resources:
   - mem_mb=10000
   - disk_mb=30000
   - runtime=720
-  - lsf_project="change_to_project"
+  - lsf_project="account"
   - lsf_queue="express"
   - "lsf_extra='-o /path/to/%J.out -e /path/to/%J.err -L /bin/bash'"

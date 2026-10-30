@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--coverage_dir', help = "Directory in which doverage files are contained, will discover 'coverage_depth.tsv' files in subdirectories and concat them")
     parser.add_argument('--cutoffs', help = 'Cutoff file path from strainer3', default=os.path.join(SCRIPT_DIR,'..', 'data', 'cutoffs.tsv'))
     parser.add_argument('--output_dir', help='directory where output is saved')
+    parser.add_argument('--verbose',action='store_true', help = 'incluces all possible metrics from coverage_depth into hit call table')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -55,14 +56,20 @@ def main():
     df_cov = pd.merge_asof(df_cov, df_cutoffs_s,
                            left_on='coverage_rare_kmers', right_on='rare kmers',
                            direction='backward')
+    
     df_cov['hit_call_pr'] = df_cov['PR'].astype(str) + ' (' + df_cov['rare kmers'].astype(str) + ')'
     df_cov.loc[df_cov['PR'].isna(), 'hit_call_pr'] = np.nan
     df_cov = df_cov.drop(columns=['PR', 'rare kmers'])
 
     df_cov['depth_ratio'] = df_cov['depth_rare_kmers']/df_cov['depth_nonrare_kmers']
 
-    df_hits = df_cov[[ 'strain','sample', 'hit_call_pr', 'coverage_rare_kmers',  'pair_cov_geo', 'depth_ratio', 'rare_count']].copy()
+    #
+    df_hits = df_cov[[ 'strain','sample', 'hit_call_pr', 'coverage_rare_kmers', 'rare_count']].copy()
+    
     print(df_hits)
+    if args.verbose:
+        df_hits = df_cov.copy()
+        print(df_hits)
     df_hits.sort_values('coverage_rare_kmers', ascending= False).to_csv(os.path.join(args.output_dir, 'hit_calls.tsv'), sep = '\t', index = None)
 
 

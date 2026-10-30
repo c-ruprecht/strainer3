@@ -239,7 +239,61 @@ def get_block_weighted_coverage(df_called_blocks, alpha=1.0, size_weight=False):
         'pair_depth_max_cw':   np.round(ratio(max_sum, den2), 2),
         'count_weight_alpha':  alpha,
     })
- 
+
+def depth_weight(D, baseline, beta=1.0, mode='over', pseudo=1.0):
+    """
+    per block x sample weight from depth discrepancy to the rare-kmer baseline depth.
+    r = (D + pseudo) / (baseline + pseudo)
+    mode 'over': penalise only depth above baseline (shared regions inflated by relatives)
+    mode 'both': penalise both directions (careful: zero-depth blocks then drop out of coverage)
+    """
+    r = (D + pseudo) / (np.asarray(baseline, dtype=np.float64)[None, :] + pseudo)
+    dev = np.maximum(r, 1.0) if mode == 'over' else np.maximum(r, 1.0 / r)
+    return dev ** (-beta)
+
+
+def get_block_depth_weighted_coverage(df_called_blocks, baseline, beta=1.0, alpha=0.0,
+                                      mode='over', pseudo=1.0, size_weight=False):
+    """
+    Weighted pair statistics over all blocks; block weight = count weight * depth weight.
+    baseline: pd.Series sample -> baseline depth (e.g. depth_rare_kmers)
+    alpha = 0 -> depth weighting only.
+    """
+    def piv(col):
+        return df_called_blocks.pivot(index='block_id', columns='sample', values=col).fillna(0)
+
+    df_cov = piv('block_coverage')
+    df_cov.columns = df_cov.columns.astype(str)
+    C = df_cov.to_numpy(dtype=np.float64)                    # B x S coverage
+    D = piv('block_depth').reindex(df_cov.index).to_numpy(dtype=np.float64)
+    base = baseline.reindex(df_cov.columns).fillna(0).to_numpy(dtype=np.float64)
+
+    blk = (df_called_blocks.groupby('block_id', observed=True)[['block_count', 'block_total']]
+           .first().reindex(df_cov.index))
+    w = count_weight(blk['block_count'].to_numpy(), alpha)
+    if size_weight:
+        w = w * blk['block_total'].to_numpy(dtype=np.float64)
+    W = w[:, None] * depth_weight(D, base, beta=beta, mode=mode, pseudo=pseudo)   # B x S, per sample
+
+    def ratio(num, den):
+        return np.divide(num, den, out=np.zeros_like(num, dtype=np.float64), where=den > 0)
+
+    den2 = e2(W)
+    pair_sum = (W * D * (W.sum(axis=0) - W)).sum(axis=0)
+    min_sum = wmin_sum(D, W, 2)
+
+    return pd.DataFrame({
+        'sample':             df_cov.columns,
+        'depth_baseline_dw':  base,
+        'eff_blocks_dw':      np.round(ratio(W.sum(axis=0) ** 2, (W ** 2).sum(axis=0)), 1),
+        'pair_cov_geo_dw':    np.round(ratio(e2(W * np.sqrt(C)), den2), 4),
+        'pair_depth_min_dw':  np.round(ratio(min_sum, den2), 2),
+        'pair_depth_mean_dw': np.round(ratio(pair_sum / 2.0, den2), 2),
+        'pair_depth_max_dw':  np.round(ratio(pair_sum - min_sum, den2), 2),
+        'depth_weight_beta':  beta,
+        'count_weight_alpha': alpha,
+    })
+
 def main():
     # to do, basename + strain name addition
     parser = argparse.ArgumentParser(description='Calcualting coverage and depth with kmer locations')
@@ -250,8 +304,13 @@ def main():
     parser.add_argument('--reference', '-r', help = 'Path to reference file of a strain. Can be used to map kmers to locations')
     parser.add_argument('--terminal_dist', type = int, default = 300, help = 'distance from end of contig. Kmers within that range will be dropped')
     parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
-    parser.add_argument('--weight_alpha', type=float, default=1.0,help='block weight = (1 + count)^-alpha; higher favours rare blocks more')
+    parser.add_argument('--weight_alpha', type=float, default=0 ,help='block weight = (1 + count)^-alpha; higher favours rare blocks more')
     parser.add_argument('--size_weight', action='store_true', help='also multiply block weight by kmers per block')
+    parser.add_argument('--depth_beta', type=float, default= 0,
+                                        help='depth weight = max(r,1)^-beta, r = (block_depth+pseudo)/(rare_depth+pseudo)')
+    parser.add_argument('--depth_mode', choices=['over', 'both'], default='over',
+                                        help="'over' penalises only depth above the rare baseline")
+    parser.add_argument('--depth_pseudo', type=float, default=1.0, help='pseudocount for the depth ratio')
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     hits_path = args.hits
@@ -302,12 +361,19 @@ def main():
                                                        size_weight=args.size_weight)
         df_blk_cov_w_rare = get_block_weighted_coverage(df_blk_call_rare, alpha=args.weight_alpha,
                                                         size_weight=args.size_weight)
+        # depth based weights
+        baseline = df_cov_depth.set_index('sample')['depth_rare_kmers']
+        df_blk_cov_dw = get_block_depth_weighted_coverage(df_blk_call_all, baseline,
+                                                          beta=args.depth_beta, alpha=args.weight_alpha,
+                                                          mode=args.depth_mode, pseudo=args.depth_pseudo,
+                                                          size_weight=args.size_weight)
 
         df_cov_depth = (df_cov_depth
                         .merge(df_blk_cov_w_all.set_index('sample').add_prefix('all_').reset_index(),
                                on='sample', how='left')
                         .merge(df_blk_cov_w_rare.set_index('sample').add_prefix('rare_').reset_index(),
-                               on='sample', how='left'))
+                               on='sample', how='left')
+                        .merge(df_blk_cov_dw, on='sample', how='left'))
         
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')

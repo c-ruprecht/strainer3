@@ -335,7 +335,7 @@ def main():
         print(f"Removing {len(df_locs.loc[df_locs['label']=='terminal'])} terminal kmers")
         df_internal = df_locs.loc[df_locs['label']=='internal']
         df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
-        df_loc_counts = pd.merge(df_locs, df_counts, on = '#kmer', how = 'inner')
+        df_loc_counts = pd.merge(df_internal, df_counts, on='#kmer', how='inner')
         # add block ids don't drop anything
         df_loc_counts = add_block_ids(df_loc_counts)
         print(df_loc_counts)
@@ -377,7 +377,7 @@ def main():
         
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / total_evaluated['total_evaluated']) * 100,4)
+    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
 
     if args.strain:
         df_cov_depth['strain'] = args.strain 

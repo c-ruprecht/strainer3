@@ -517,12 +517,22 @@ def main():
     df_cov_depth['nb_depth'] = nb_depth(df_cov_depth['coverage_all_kmers'], r)
 
     df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+    
     # robust depth per sample: trims a high-depth kmer subset and removes an assembly zero floor
     samples = [c for c in df_hits.columns if c != '#kmer']
-    df_robust = pd.DataFrame([{'sample': s, **robust_depth(df_hits[s].to_numpy())} for s in samples])
-    df_robust = df_robust.drop(columns='lam_mean').rename(columns={'thr': 'robust_thr'}).round(4)   # lam_mean duplicates depth_all_kmers
+    df_hits_rare = df_hits.loc[df_hits['#kmer'].isin(df_cnt_uni['#kmer'])]
+    print(f'Robust depth on {len(df_hits_rare)} rare kmers ({df_cnt_uni["rare_count"].iloc[0]})')
+
+    df_robust = pd.DataFrame([{'sample': s, **robust_depth(df_hits_rare[s].to_numpy())}
+                              for s in samples])
+    df_robust = (df_robust.drop(columns='lam_mean')          # duplicates depth_rare_kmers
+                          .rename(columns={'depth_robust': 'depth_robust_rare',
+                                           'cov_kept':     'cov_kept_rare',
+                                           'frac_trimmed': 'frac_trimmed_rare',
+                                           'thr':          'robust_thr_rare'})
+                          .round(4))
     df_cov_depth = df_cov_depth.merge(df_robust, on='sample', how='left')
-    
+
     if args.strain:
         df_cov_depth['strain'] = args.strain 
     df_cov_depth.set_index(['strain', 'sample']).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')

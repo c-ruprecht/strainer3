@@ -6,6 +6,139 @@ import ahocorasick
 from Bio import SeqIO
 from Bio.Seq import Seq
 import gzip
+#plotting
+import plotly.express as px
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from pycirclize import Circos
+from scipy.stats import poisson
+
+
+def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
+    """Depth estimate robust to a high-depth k-mer subset and an assembly zero floor.
+    Returns lam, coverage on kept k-mers, fraction of k-mers trimmed as high-depth, threshold."""
+    x = np.asarray(x)
+    n = len(x)
+    n1, n2 = (x == 1).sum(), (x == 2).sum()
+    lam = 2 * n2 / n1 if n1 > 0 else np.median(x)      # low-count start: ignores zeros + tail
+    lam = max(lam, 1e-6)
+
+    for _ in range(n_iter):
+        thr = poisson.ppf(q, lam)
+        keep = x <= thr
+        p0 = (x[keep] == 0).mean() if keep.any() else 1.0
+        p0_adj = np.clip((p0 - f_bad) / (1 - f_bad), 1 / n, 1)   # remove assembly floor
+        lam_new = -np.log(p0_adj)
+        if abs(lam_new - lam) < 1e-6 * max(lam, 1):
+            lam = lam_new
+            break
+        lam = max(lam_new, 1e-6)
+
+    thr = poisson.ppf(q, lam)
+    keep = x <= thr
+    return dict(depth_robust=lam,
+                cov_kept=(x[keep] > 0).mean() if keep.any() else 0.0,
+                frac_trimmed=1 - keep.mean(),
+                thr=thr,
+                lam_mean=x.mean())
+
+### plots
+def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
+    df_loc = df_loc.copy()
+    df_loc['count'] = (df_loc[['pangenome_count', 'metagenome_count', 'drug_count']]
+                       .fillna(0).sum(axis=1).astype(int))
+    df_loc['rare_count'] = df_loc['rare_count'].fillna('not_rare')
+
+    # ---------- shared layout: one sector, contigs concatenated ----------
+    contigs = (df_loc.drop_duplicates('contig_id')[['contig_id', 'contig_length']]
+                     .sort_values('contig_length', ascending=False))
+    contigs['offset'] = contigs['contig_length'].cumsum() - contigs['contig_length']
+    genome_len = int(contigs['contig_length'].sum())
+
+    df = df_loc.merge(contigs[['contig_id', 'offset']], on='contig_id')
+    df['gpos'] = df['kmer_position'] + df['offset']
+    df = df.sort_values('gpos')
+
+    ymax = max(ymax_min, int(df['count'].max()))
+
+    def base_circos():
+        circos = Circos({'genome': genome_len}, start=0, end=360)
+        sector = circos.sectors[0]
+        track_ctg = sector.add_track((78, 82))
+        for i, (st, ln) in enumerate(zip(contigs['offset'], contigs['contig_length'])):
+            track_ctg.rect(st, st + ln, fc='grey' if i % 2 else 'lightgrey', ec='none')
+        track_cnt = sector.add_track((55, 75), r_pad_ratio=0.1)
+        track_cnt.axis()
+        return circos, track_cnt
+
+    def draw_groups(track, groups, colors):
+        for key in groups:                       # later groups are drawn on top
+            d = df[df['_group'] == key]
+            if len(d):
+                track.scatter(d['gpos'].to_numpy(), d['count'].to_numpy(),
+                              vmin=0, vmax=ymax, s=s, color=colors[key])
+
+    def save(circos, handles, title, name):
+        fig = circos.plotfig()
+        circos.ax.set_title(prefix, fontsize=11, pad=12)
+        circos.ax.legend(handles=handles, title=title, loc='center left',
+                         bbox_to_anchor=(1.02, 0.5), frameon=False, fontsize=8)
+        base = os.path.join(outdir, f"{prefix}.{name}")
+        if quality == 'svg':
+            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
+            print(f"saved {base}.svg")
+        if quality == 'png':
+            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
+            print(f"saved {base}.png")
+        if quality == 'both':
+            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
+            print(f"saved {base}.svg")
+            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
+            print(f"saved {base}.png")
+            
+        plt.close(fig)
+        
+
+    # ---------- 1) one distinct colour per count ----------
+    palette = px.colors.qualitative.Dark24
+    count_colors = {c: palette[c % len(palette)] for c in range(ymax + 1)}
+    present = sorted(int(c) for c in df['count'].unique())
+
+    df['_group'] = df['count'].astype(int)
+    circos, track = base_circos()
+    draw_groups(track, present, count_colors)
+    save(circos, [Patch(facecolor=count_colors[c], label=str(c)) for c in present],
+         'k-mer count', 'by_count')
+
+    # ---------- 2) rare vs not_rare ----------
+    colors2 = {'rare': 'blue', 'not_rare': 'red'}
+    df['_group'] = np.where(df['rare_count'] == 'not_rare', 'not_rare', 'rare')
+    circos, track = base_circos()
+    draw_groups(track, ['rare', 'not_rare'], colors2)
+    save(circos, [Patch(facecolor=colors2[k], label=k.replace('_', ' '))
+                  for k in ['not_rare', 'rare']],
+         'k-mer class', 'rare')
+
+    # ---------- 3) rare vs not_rare vs not_rare terminal ----------
+    colors3 = {'rare': 'blue', 'not_rare': 'red', 'not_rare_terminal': 'orange'}
+    df['_group'] = np.select(
+        [(df['rare_count'] == 'not_rare') & (df['terminal_kmer'] == True),
+         df['rare_count'] == 'not_rare'],
+        ['not_rare_terminal', 'not_rare'],
+        default='rare',
+    )
+    circos, track = base_circos()
+    draw_groups(track, ['rare', 'not_rare', 'not_rare_terminal'], colors3)
+    save(circos, [Patch(facecolor=colors3[k], label=k.replace('_', ' '))
+                  for k in ['not_rare_terminal', 'not_rare', 'rare']],
+         'k-mer class', 'rare_terminal')
+
+    return df.drop(columns='_group')
+
+### coverages
+def nb_depth(cov, r = 2):
+    cov = cov.where(cov < 1)
+    return r * ((1 - cov) ** (-1.0 / r) - 1)
 
 def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
 
@@ -311,6 +444,8 @@ def main():
     parser.add_argument('--depth_mode', choices=['over', 'both'], default='over',
                                         help="'over' penalises only depth above the rare baseline")
     parser.add_argument('--depth_pseudo', type=float, default=1.0, help='pseudocount for the depth ratio')
+    parser.add_argument('--figures', choices=['png','svg', 'both','none'], default='none', help = 'Change to svg, png or both if you want figures to be saved.')
+    
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     hits_path = args.hits
@@ -377,14 +512,32 @@ def main():
         
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
 
+    r = 1.1        # dispersion; calibrate on samples where you know the truth, see below
+    df_cov_depth['nb_depth'] = nb_depth(df_cov_depth['coverage_all_kmers'], r)
+
+    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+    # robust depth per sample: trims a high-depth kmer subset and removes an assembly zero floor
+    samples = [c for c in df_hits.columns if c != '#kmer']
+    df_robust = pd.DataFrame([{'sample': s, **robust_depth(df_hits[s].to_numpy())} for s in samples])
+    df_robust = df_robust.drop(columns='lam_mean').rename(columns={'thr': 'robust_thr'}).round(4)   # lam_mean duplicates depth_all_kmers
+    df_cov_depth = df_cov_depth.merge(df_robust, on='sample', how='left')
+    
     if args.strain:
         df_cov_depth['strain'] = args.strain 
     df_cov_depth.set_index(['strain', 'sample']).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
     print(f'Saved coverage dataframe to \n {outpath}')
     print(df_cov_depth.head(5))
 
+    if args.figures != 'none':
+        #save a figure
+        basename = 'contig_map'
+        if args.strain:
+            basename = args.strain
+        plot_map(df_loc_counts, args.output_dir, basename, quality = args.figures)
+
+
+        
 
 
 if __name__ == '__main__':

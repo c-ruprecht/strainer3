@@ -39,8 +39,40 @@
 	  keep -c 1 if the database must reproduce read scanning exactly.
 	  kmer_strain_detect accepts these files as targets in place of
 	  FASTQs; it then looks k-mers up instead of re-reading the sample.
-	  The metadata key kmer_positions equals kmer_strain_detect's
-	  total_evaluated for the same reads.
+	  The metadata key total_evaluated equals kmer_strain_detect's
+	  total_evaluated for the same reads and the same pair-dedup setting.
+
+	  Pair dedup (--pair-dedup, default ON in sample mode)
+	  Mates are given as one comma-separated value, -i R1.fq.gz,R2.fq.gz
+	  (repeat -i for more lanes of the same sample), or as one interleaved
+	  file with --interleaved. Within one fragment (a read pair) every
+	  distinct canonical k-mer is counted at most once, whether it occurs
+	  in R1, R2 or both, and however often it repeats inside the pair
+	  (sylph's rule). Overlapping mates therefore no longer double count.
+	  Single-end inputs (one file per -i, positional arguments) are counted
+	  exactly as before, internal repeats included.
+	  Mates must be in sync: same number of records, and names equal after
+	  dropping a trailing /1 /2 .1 .2 _1 _2 (kseq already drops the
+	  "1:N:0:..." comment). A mismatch is an error.
+	  --no-pair-dedup restores the old counts: every file is then read as
+	  single-end, in the given order, as before.
+	  Implementation: each worker keeps a small per-thread set of the k-mers
+	  of its own partition seen in the current fragment (generation-stamped,
+	  so it is never cleared). The hash tables are unchanged, so -R/-M
+	  memory predictions still hold.
+
+	  total_evaluated (metadata key; kmer_strain_detect's total_evaluated
+	  row for this target) = the sum of the counts of ALL k-mers of the
+	  sample, i.e. the number of increments actually made: valid (ACGT-only)
+	  k-mer windows minus the increments skipped by pair dedup. It is taken
+	  before -c and before 32-bit saturation, so it is the denominator for
+	  relative abundance whatever -c was. Without dedup it equals
+	  valid_kmer_positions.
+	  kmer_positions is unchanged: every window, sum over reads with
+	  length >= k of (length - k + 1), non-ACGT windows included. Before
+	  this change kmer_strain_detect used it as total_evaluated.
+	  pair_dedup (metadata) records 1/0. The skipped increments are also
+	  reported on stderr (and --stats).
 
 	Low-memory mode (-M <passes> or -R <GB>)
 	  The k-mer space is split into M hash slices by a second hash,
@@ -72,6 +104,7 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stddef.h>
@@ -104,6 +137,17 @@ KSEQ_INIT(gzFile, gzread)
 #define FIXED_OVERHEAD   100e6           /* read buffers, writer, slack (bytes) */
 
 enum { MODE_SCRUB = 0, MODE_SAMPLE = 1 };
+
+/* per-read flags in a batch */
+#define FL_LAST          1u              /* last read of its fragment */
+#define FL_PAIRED        2u              /* fragment is a read pair (set on the last read) */
+
+/* One -i value (or positional / -I line): a single-end file, a PE pair
+   (f2 != NULL) or, with --interleaved, an interleaved PE file. */
+typedef struct {
+	char *f1, *f2;
+	int   interleaved;
+} input_t;
 
 /* ── small utils ───────────────────────────────────────────────────── */
 
@@ -225,20 +269,35 @@ static int read_path_list(const char *file, char ***out)
 	return n;
 }
 
-/* Append one -i value (or positional argument) to the read list. A value
-   may hold several comma-separated paths: -i R1.fq.gz,R2.fq.gz */
-static void add_read_paths(char ***reads, int *n, int *cap, const char *arg)
+/* Append one -i value (or positional argument, or -I line) as one input.
+   One path = single-end; two comma-separated paths = mates of one PE pair:
+   -i R1.fq.gz,R2.fq.gz. More than two is an error (repeat -i instead). */
+static void add_read_group(input_t **in, int *n, int *cap, const char *arg)
 {
 	char *dup = strdup(arg), *save = NULL;
-	for (char *tok = strtok_r(dup, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-		while (*tok == ' ' || *tok == '\t') tok++;
-		if (!*tok) continue;
-		if (*n == *cap) {
-			*cap = *cap ? *cap * 2 : 4;
-			*reads = xrealloc(*reads, sizeof(char *) * *cap);
+	char *tok[3] = { NULL, NULL, NULL };
+	int nt = 0;
+	for (char *t = strtok_r(dup, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
+		while (*t == ' ' || *t == '\t') t++;
+		size_t l = strlen(t);
+		while (l > 0 && (t[l-1] == ' ' || t[l-1] == '\t')) t[--l] = '\0';
+		if (!*t) continue;
+		if (nt == 2) {
+			fprintf(stderr, "error: %s: a comma joins the two mates of one pair "
+			        "(R1,R2); give each pair or lane with its own -i\n", arg);
+			exit(EXIT_FAILURE);
 		}
-		(*reads)[(*n)++] = strdup(tok);
+		tok[nt++] = t;
 	}
+	if (nt == 0) { free(dup); return; }
+	if (*n == *cap) {
+		*cap = *cap ? *cap * 2 : 4;
+		*in = xrealloc(*in, sizeof(input_t) * *cap);
+	}
+	(*in)[*n].f1 = strdup(tok[0]);
+	(*in)[*n].f2 = nt == 2 ? strdup(tok[1]) : NULL;
+	(*in)[*n].interleaved = 0;
+	(*n)++;
 	free(dup);
 }
 
@@ -366,6 +425,7 @@ typedef struct {
 	char     *seq;
 	size_t    seq_len, seq_cap;
 	uint32_t *lens;
+	uint8_t  *fl;      /* FL_LAST / FL_PAIRED per read */
 	size_t    n, n_cap;
 	uint64_t  seqno;
 	int       ready;
@@ -385,8 +445,12 @@ typedef struct {
 	uint8_t   *hll;            /* P * HLL_M registers, estimate pass only */
 
 	/* reads pipeline */
-	char     **read_files;
-	int        n_read_files;
+	input_t   *inputs;
+	int        n_inputs;
+	int        pair_dedup;     /* count each k-mer once per read pair */
+	uint64_t   n_pairs;        /* fragments read as pairs (reader) */
+	uint64_t  *dd_paired;      /* per thread: hits in paired fragments */
+	uint64_t  *dd_skipped;     /* per thread: increments skipped by dedup */
 	batch_t    slots[N_SLOTS];
 	uint64_t   n_published;
 	int        eof;
@@ -430,57 +494,207 @@ static batch_t *acquire_slot(ctx_t *c, uint64_t seqno)
 	return b;
 }
 
+/* Copy one read into the batch. 0 if it is shorter than k (not stored). */
+static int batch_add(ctx_t *c, batch_t *b, const kseq_t *seq)
+{
+	c->n_reads++;
+	size_t len = seq->seq.l;
+	if (len < (size_t)c->k) return 0;
+	c->n_positions += len - (size_t)c->k + 1;
+	if (b->seq_len + len > b->seq_cap) {
+		b->seq_cap = b->seq_len + len > BATCH_BASES
+		           ? (b->seq_len + len) * 2 : BATCH_BASES * 2;
+		b->seq = xrealloc(b->seq, b->seq_cap);
+	}
+	if (b->n == b->n_cap) {
+		b->n_cap = b->n_cap ? b->n_cap * 2 : 65536;
+		b->lens = xrealloc(b->lens, b->n_cap * sizeof(uint32_t));
+		b->fl   = xrealloc(b->fl,   b->n_cap * sizeof(uint8_t));
+	}
+	memcpy(b->seq + b->seq_len, seq->seq.s, len);
+	b->seq_len += len;
+	b->fl[b->n] = 0;
+	b->lens[b->n++] = (uint32_t)len;
+	return 1;
+}
+
+/* Close a fragment of `added` stored reads, then publish the batch if full.
+   Batches only ever end on a fragment boundary, so mates are never split. */
+static void frag_end(ctx_t *c, batch_t **b, uint64_t *next, int added,
+                     uint8_t paired)
+{
+	if (added) (*b)->fl[(*b)->n - 1] = (uint8_t)(FL_LAST | paired);
+	if ((*b)->seq_len >= BATCH_BASES) {
+		publish(c, *b);
+		*b = acquire_slot(c, ++*next);
+	}
+}
+
+/* Mate names, ignoring a trailing /1 /2 .1 .2 _1 _2 */
+static size_t mate_stem(const kseq_t *s)
+{
+	size_t l = s->name.l;
+	const char *n = s->name.s;
+	if (l >= 2 && (n[l-1] == '1' || n[l-1] == '2') &&
+	    (n[l-2] == '/' || n[l-2] == '.' || n[l-2] == '_'))
+		l -= 2;
+	return l;
+}
+
+static int mates_match(const kseq_t *a, const kseq_t *b)
+{
+	size_t la = mate_stem(a), lb = mate_stem(b);
+	return la == lb && memcmp(a->name.s, b->name.s, la) == 0;
+}
+
+static gzFile open_reads(ctx_t *c, const char *path)
+{
+	gzFile fp = gzopen(path, "r");
+	if (!fp) {
+		fprintf(stderr, "error: cannot open reads %s: %s\n", path, strerror(errno));
+		c->read_error = 1;
+		return NULL;
+	}
+	gzbuffer(fp, 1 << 20);
+	return fp;
+}
+
+static void malformed(ctx_t *c, const char *path, int l)
+{
+	fprintf(stderr, "error: %s is truncated or malformed (kseq %d)\n", path, l);
+	c->read_error = 1;
+}
+
+/* single-end: every read is its own fragment (the original behaviour) */
+static void read_se(ctx_t *c, const char *path, batch_t **b, uint64_t *next)
+{
+	gzFile fp = open_reads(c, path);
+	if (!fp) return;
+	kseq_t *seq = kseq_init(fp);
+	int l;
+	while ((l = kseq_read(seq)) >= 0)
+		frag_end(c, b, next, batch_add(c, *b, seq), 0);
+	if (l < -1) malformed(c, path, l);
+	kseq_destroy(seq);
+	gzclose(fp);
+	fprintf(stderr, "  read %s (%.1fs)\n", path, now_s() - c->t_start);
+}
+
+/* one pair of mates -> one fragment. -1 = error already reported. */
+static int add_pair(ctx_t *c, const kseq_t *s1, const kseq_t *s2,
+                    const char *what, batch_t **b, uint64_t *next)
+{
+	if (!mates_match(s1, s2)) {
+		fprintf(stderr, "error: %s: mates out of sync at pair %" PRIu64
+		        " (%.*s vs %.*s); use --no-pair-dedup to count them "
+		        "as single-end reads\n", what, c->n_pairs + 1,
+		        (int)s1->name.l, s1->name.s, (int)s2->name.l, s2->name.s);
+		c->read_error = 1;
+		return -1;
+	}
+	c->n_pairs++;
+	int added = batch_add(c, *b, s1);
+	added += batch_add(c, *b, s2);
+	frag_end(c, b, next, added, FL_PAIRED);
+	return 0;
+}
+
+/* PE: two files read in lockstep */
+static void read_pe(ctx_t *c, const input_t *in, batch_t **b, uint64_t *next)
+{
+	gzFile f1 = open_reads(c, in->f1);
+	if (!f1) return;
+	gzFile f2 = open_reads(c, in->f2);
+	if (!f2) { gzclose(f1); return; }
+	kseq_t *s1 = kseq_init(f1), *s2 = kseq_init(f2);
+	for (;;) {
+		int l1 = kseq_read(s1), l2 = kseq_read(s2);
+		if (l1 < -1) { malformed(c, in->f1, l1); break; }
+		if (l2 < -1) { malformed(c, in->f2, l2); break; }
+		if (l1 < 0 && l2 < 0) break;
+		if (l1 < 0 || l2 < 0) {
+			fprintf(stderr, "error: %s and %s hold different numbers of reads "
+			        "(%s ends after %" PRIu64 " pairs)\n", in->f1, in->f2,
+			        l1 < 0 ? in->f1 : in->f2, c->n_pairs);
+			c->read_error = 1;
+			break;
+		}
+		if (add_pair(c, s1, s2, in->f1, b, next) != 0) break;
+	}
+	kseq_destroy(s1); kseq_destroy(s2);
+	gzclose(f1); gzclose(f2);
+	fprintf(stderr, "  read pair %s + %s (%.1fs)\n", in->f1, in->f2,
+	        now_s() - c->t_start);
+}
+
+static void kstr_copy(kstring_t *dst, const kstring_t *src)
+{
+	if (dst->m < src->l + 1) {
+		dst->m = src->l + 1;
+		dst->s = xrealloc(dst->s, dst->m);
+	}
+	memcpy(dst->s, src->s, src->l);
+	dst->s[src->l] = '\0';
+	dst->l = src->l;
+}
+
+/* PEI: consecutive records of one file are mates */
+static void read_pei(ctx_t *c, const char *path, batch_t **b, uint64_t *next)
+{
+	gzFile fp = open_reads(c, path);
+	if (!fp) return;
+	kseq_t *s1 = kseq_init(fp);
+	/* mate 1 is copied into s2 (never read from a stream) before kseq_read
+	   overwrites s1 with mate 2 */
+	kseq_t *s2 = calloc(1, sizeof *s2);
+	for (;;) {
+		int l = kseq_read(s1);
+		if (l < -1) { malformed(c, path, l); break; }
+		if (l < 0) break;
+		kstr_copy(&s2->name, &s1->name);
+		kstr_copy(&s2->seq,  &s1->seq);
+		l = kseq_read(s1);
+		if (l < -1) { malformed(c, path, l); break; }
+		if (l < 0) {
+			fprintf(stderr, "error: %s (--interleaved) has an odd number of "
+			        "records; the last read has no mate\n", path);
+			c->read_error = 1;
+			break;
+		}
+		if (add_pair(c, s2, s1, path, b, next) != 0) break;
+	}
+	free(s2->name.s); free(s2->seq.s); free(s2);
+	kseq_destroy(s1);
+	gzclose(fp);
+	fprintf(stderr, "  read interleaved pairs %s (%.1fs)\n", path,
+	        now_s() - c->t_start);
+}
+
 static void *reader_main(void *arg)
 {
 	ctx_t *c = arg;
 	uint64_t next = 0;
 	batch_t *b = acquire_slot(c, next);
+	c->n_pairs = 0;
 
-	for (int f = 0; f < c->n_read_files; f++) {
-		gzFile fp = gzopen(c->read_files[f], "r");
-		if (!fp) {
-			fprintf(stderr, "error: cannot open reads %s: %s\n",
-			        c->read_files[f], strerror(errno));
-			c->read_error = 1;
-			break;
+	for (int f = 0; f < c->n_inputs && !c->read_error; f++) {
+		const input_t *in = &c->inputs[f];
+		if (!c->pair_dedup) {
+			/* old behaviour: every file single-end, in the given order */
+			read_se(c, in->f1, &b, &next);
+			if (in->f2 && !c->read_error) read_se(c, in->f2, &b, &next);
+		} else if (in->f2) {
+			read_pe(c, in, &b, &next);
+		} else if (in->interleaved) {
+			read_pei(c, in->f1, &b, &next);
+		} else {
+			read_se(c, in->f1, &b, &next);
 		}
-		gzbuffer(fp, 1 << 20);
-		kseq_t *seq = kseq_init(fp);
-		int l;
-		while ((l = kseq_read(seq)) >= 0) {
-			c->n_reads++;
-			size_t len = seq->seq.l;
-			if (len < (size_t)c->k) continue;
-			c->n_positions += len - (size_t)c->k + 1;
-			if (b->seq_len + len > b->seq_cap) {
-				b->seq_cap = b->seq_len + len > BATCH_BASES
-				           ? (b->seq_len + len) * 2 : BATCH_BASES * 2;
-				b->seq = xrealloc(b->seq, b->seq_cap);
-			}
-			if (b->n == b->n_cap) {
-				b->n_cap = b->n_cap ? b->n_cap * 2 : 65536;
-				b->lens = xrealloc(b->lens, b->n_cap * sizeof(uint32_t));
-			}
-			memcpy(b->seq + b->seq_len, seq->seq.s, len);
-			b->seq_len += len;
-			b->lens[b->n++] = (uint32_t)len;
-			if (b->seq_len >= BATCH_BASES) {
-				publish(c, b);
-				b = acquire_slot(c, ++next);
-			}
-		}
-		if (l < -1) {
-			fprintf(stderr, "error: %s is truncated or malformed (kseq %d)\n",
-			        c->read_files[f], l);
-			c->read_error = 1;
-		}
-		kseq_destroy(seq);
-		gzclose(fp);
-		fprintf(stderr, "  read %s (%.1fs)\n", c->read_files[f],
-		        now_s() - c->t_start);
-		if (c->read_error) break;
 	}
-	if (b->n > 0) publish(c, b);
+	if (b->n > 0) {
+		b->fl[b->n - 1] |= FL_LAST;   /* an error may have cut a pair */
+		publish(c, b);
+	}
 
 	pthread_mutex_lock(&c->mtx);
 	c->eof = 1;
@@ -511,6 +725,50 @@ static void release_batch(ctx_t *c, batch_t *b)
 	pthread_mutex_unlock(&c->mtx);
 }
 
+/* Per-thread set of the k-mers counted in the current fragment (pair dedup).
+   A slot is occupied only if its stamp equals the current fragment's
+   generation, so starting a new fragment is ++gen: no clearing. It holds
+   only this thread's partition (and pass) of the fragment's k-mers, at
+   most 2 x (L - k + 1) for a pair, so it stays in L1 cache. */
+typedef struct {
+	uint64_t *keys;
+	uint32_t *gen;
+	size_t    cap;    /* power of two, >= 2 x windows of the fragment */
+	uint32_t  cur;
+} fset_t;
+
+static void fset_begin(fset_t *s, size_t n_windows)
+{
+	size_t need = pow2_at_least(n_windows * 2);
+	if (need > s->cap) {
+		free(s->keys); free(s->gen);
+		s->cap  = need;
+		s->keys = xmalloc(need * sizeof(uint64_t));
+		s->gen  = calloc(need, sizeof(uint32_t));
+		if (!s->gen) { fprintf(stderr, "out of memory\n"); exit(EXIT_FAILURE); }
+		s->cur  = 0;
+	}
+	if (++s->cur == 0) {                  /* wrapped after 2^32 fragments */
+		memset(s->gen, 0, s->cap * sizeof(uint32_t));
+		s->cur = 1;
+	}
+}
+
+/* 1 = first time in this fragment (count it), 0 = already counted */
+static inline int fset_add(fset_t *s, uint64_t key, uint64_t h)
+{
+	size_t m = s->cap - 1, i = (size_t)(h >> 16) & m;  /* bits apart from part_of() */
+	for (;;) {
+		if (s->gen[i] != s->cur) {
+			s->gen[i]  = s->cur;
+			s->keys[i] = key;
+			return 1;
+		}
+		if (s->keys[i] == key) return 0;
+		i = (i + 1) & m;
+	}
+}
+
 static void *count_main(void *arg)
 {
 	targ_t *a = arg;
@@ -521,35 +779,55 @@ static void *count_main(void *arg)
 	const uint64_t mask = (k == 32) ? UINT64_MAX : ((1ull << (2 * k)) - 1);
 	tab_t *t = &c->tabs[tid];
 	const int wide = c->mode == MODE_SAMPLE;   /* loop-invariant */
-	uint64_t valid = 0;
+	const int dedup = c->pair_dedup;
+	uint64_t valid = 0, paired_hits = 0, skipped = 0;
+	fset_t fs = { NULL, NULL, 0, 0 };
 	batch_t *b;
 
 	for (uint64_t s = 0; (b = wait_batch(c, s)) != NULL; s++) {
 		const char *p = b->seq;
-		for (size_t r = 0; r < b->n; r++) {
-			const char *end = p + b->lens[r];
-			uint64_t fwd = 0, rev = 0;
-			int l = 0;
-			for (; p < end; p++) {
-				uint8_t x = KMDB_NT2BIT[(unsigned char)*p];
-				if (x > 3) { l = 0; fwd = rev = 0; continue; }
-				fwd = ((fwd << 2) | x) & mask;
-				rev = (rev >> 2) | ((uint64_t)(3 - x) << shift);
-				if (++l >= k) {
-					uint64_t can = fwd > rev ? fwd : rev;
-					uint64_t h = mix64(can);
-					if (part_of(h, P) == tid &&
-					    (M == 1 || pass_of(h, M) == pass)) {
-						if (wide) tab_inc32(t, can, h);
-						else      tab_inc(t, can, h);
+		for (size_t r = 0; r < b->n; ) {
+			/* fragment = reads r..e; FL_PAIRED sits on its last read */
+			size_t e = r;
+			while (e + 1 < b->n && !(b->fl[e] & FL_LAST)) e++;
+			const int dd = dedup && (b->fl[e] & FL_PAIRED);
+			if (dd) {
+				size_t nw = 0;
+				for (size_t q = r; q <= e; q++) nw += b->lens[q] - (size_t)k + 1;
+				fset_begin(&fs, nw);
+			}
+			for (; r <= e; r++) {
+				const char *end = p + b->lens[r];
+				uint64_t fwd = 0, rev = 0;
+				int l = 0;
+				for (; p < end; p++) {
+					uint8_t x = KMDB_NT2BIT[(unsigned char)*p];
+					if (x > 3) { l = 0; fwd = rev = 0; continue; }
+					fwd = ((fwd << 2) | x) & mask;
+					rev = (rev >> 2) | ((uint64_t)(3 - x) << shift);
+					if (++l >= k) {
+						uint64_t can = fwd > rev ? fwd : rev;
+						uint64_t h = mix64(can);
+						valid++;
+						if (part_of(h, P) == tid &&
+						    (M == 1 || pass_of(h, M) == pass)) {
+							if (dd) {
+								paired_hits++;
+								if (!fset_add(&fs, can, h)) { skipped++; continue; }
+							}
+							if (wide) tab_inc32(t, can, h);
+							else      tab_inc(t, can, h);
+						}
 					}
-					valid++;
 				}
 			}
 		}
 		release_batch(c, b);
 	}
+	free(fs.keys); free(fs.gen);
 	if (tid == 0) c->n_valid = valid;   /* every worker sees every window */
+	c->dd_paired[tid]  = paired_hits;
+	c->dd_skipped[tid] = skipped;
 	return NULL;
 }
 
@@ -1077,8 +1355,10 @@ static void usage(int status)
 {
 	fprintf(stderr,
 	"Usage: kmer_metagenome_db [-m scrub|sample] [options] <reads.fastq.gz> [<reads_2.fastq.gz> ...]\n"
-	"       read files: as trailing arguments, and/or -i <file>[,<file>...] (repeatable),\n"
-	"                   and/or -I <file listing read files, one per line>\n"
+	"       read files: as trailing arguments, and/or -i <file>[,<mate file>] (repeatable),\n"
+	"                   and/or -I <file listing read files or R1,R2 pairs, one per line>\n"
+	"                          [--pair-dedup | --no-pair-dedup] [--interleaved]\n"
+	"                          [--stats <file>]\n"
 	"                          [-A <genome list | single genome FASTA>]\n"
 	"                          [-n <sample id>] [-O <output dir, default .>]\n"
 	"                          [-o <output path, overrides -O/-n naming>]\n"
@@ -1108,6 +1388,17 @@ static void usage(int status)
 	"  its exact count (32-bit). No genome subtraction (-A is rejected).\n"
 	"  -c drops k-mers seen fewer than -c times (default 1 = keep all, which\n"
 	"  reproduces read scanning exactly). Use as a kmer_strain_detect target.\n"
+	"  --pair-dedup (default) / --no-pair-dedup\n"
+	"               count each k-mer at most once per read pair (sylph's rule):\n"
+	"               a k-mer in both mates, or repeated within the pair, adds 1.\n"
+	"               Mates are one comma-separated value, -i R1.fq.gz,R2.fq.gz\n"
+	"               (repeat -i for more lanes), or one file with --interleaved.\n"
+	"               Single-end inputs are counted as before. --no-pair-dedup\n"
+	"               gives the old counts (each mate counted on its own).\n"
+	"               total_evaluated (metadata) = sum of all counts, so it\n"
+	"               follows the dedup setting; kmer_positions does not.\n"
+	"  --interleaved  every single-file input holds mates as consecutive records\n"
+	"  --stats <file> also write the build statistics (incl. pair dedup) as TSV\n"
 	"  Memory: ~17-34 bytes per distinct k-mer in the reads (12-byte slots),\n"
 	"  briefly up to ~51 while a table grows; -c only shrinks the output file.\n"
 	"\n"
@@ -1136,7 +1427,11 @@ static void usage(int status)
 
 int main(int argc, char *argv[])
 {
-	char **reads = NULL; int n_reads = 0, cap_reads = 0;
+	input_t *inputs = NULL; int n_inputs = 0, cap_inputs = 0;
+	char **reads = NULL; int n_reads = 0;   /* flat list of every read file */
+	int pair_dedup = -1;       /* -1 = mode default */
+	int interleaved = 0;
+	char *stats_path = NULL;
 	char *reads_list = NULL, *genome_list = NULL;
 	char *name = NULL, *out_dir = NULL, *out_path = NULL, *tmp_dir = NULL;
 	long long min_count = 0;
@@ -1147,9 +1442,23 @@ int main(int argc, char *argv[])
 	int mode = MODE_SCRUB;
 	int c;
 
-	while ((c = getopt(argc, argv, "m:T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h")) != -1) {
+	enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP, OPT_INTERLEAVED, OPT_STATS };
+	static const struct option longopts[] = {
+		{ "pair-dedup",    no_argument,       NULL, OPT_PAIR_DEDUP },
+		{ "no-pair-dedup", no_argument,       NULL, OPT_NO_PAIR_DEDUP },
+		{ "interleaved",   no_argument,       NULL, OPT_INTERLEAVED },
+		{ "stats",         required_argument, NULL, OPT_STATS },
+		{ "help",          no_argument,       NULL, 'h' },
+		{ NULL, 0, NULL, 0 }
+	};
+	while ((c = getopt_long(argc, argv, "m:T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h",
+	                        longopts, NULL)) != -1) {
 		switch (c) {
-		case 'i': add_read_paths(&reads, &n_reads, &cap_reads, optarg); break;
+		case OPT_PAIR_DEDUP:    pair_dedup = 1; break;
+		case OPT_NO_PAIR_DEDUP: pair_dedup = 0; break;
+		case OPT_INTERLEAVED:   interleaved = 1; break;
+		case OPT_STATS:         stats_path = strdup(optarg); break;
+		case 'i': add_read_group(&inputs, &n_inputs, &cap_inputs, optarg); break;
 		case 'T': cli_renamed_flag("kmer_metagenome_db", 'T', "-m"); break;
 		case 'm':
 			if      (!strcasecmp(optarg, "scrub"))  mode = MODE_SCRUB;
@@ -1179,19 +1488,44 @@ int main(int argc, char *argv[])
 	}
 	/* any non-option arguments are read files too: ... -o out.kmdb {input} */
 	for (int i = optind; i < argc; i++)
-		add_read_paths(&reads, &n_reads, &cap_reads, argv[i]);
+		add_read_group(&inputs, &n_inputs, &cap_inputs, argv[i]);
 	if (reads_list) {
 		char **more; int m = read_path_list(reads_list, &more);
 		for (int i = 0; i < m; i++) {
-			if (n_reads == cap_reads) {
-				cap_reads = cap_reads ? cap_reads * 2 : 4;
-				reads = xrealloc(reads, sizeof(char *) * cap_reads);
-			}
-			reads[n_reads++] = more[i];
+			add_read_group(&inputs, &n_inputs, &cap_inputs, more[i]);
+			free(more[i]);
 		}
 		free(more);
 	}
-	if (n_reads == 0) usage(1);
+	if (n_inputs == 0) usage(1);
+
+	/* pair dedup: sample-mode only, on by default there */
+	if (mode == MODE_SCRUB && pair_dedup == 1) {
+		fprintf(stderr, "error: --pair-dedup is only for -m sample: a scrub "
+		        "database stores presence, not counts, so there is nothing to "
+		        "deduplicate. Drop --pair-dedup or use -m sample.\n");
+		return 1;
+	}
+	if (pair_dedup < 0) pair_dedup = mode == MODE_SAMPLE;
+	int n_pe = 0, n_pei = 0, n_se = 0;
+	for (int i = 0; i < n_inputs; i++) {
+		if (inputs[i].f2) {
+			if (interleaved) {
+				fprintf(stderr, "error: --interleaved takes one file per pair, but "
+				        "%s,%s names two\n", inputs[i].f1, inputs[i].f2);
+				return 1;
+			}
+			n_pe++;
+		} else if (interleaved) {
+			inputs[i].interleaved = 1;
+			n_pei++;
+		} else n_se++;
+	}
+	reads = xmalloc(sizeof(char *) * (size_t)n_inputs * 2);
+	for (int i = 0; i < n_inputs; i++) {
+		reads[n_reads++] = inputs[i].f1;
+		if (inputs[i].f2) reads[n_reads++] = inputs[i].f2;
+	}
 	if (k < 1 || k > KMDB_MAX_K) {
 		fprintf(stderr, "error: -k must be 1..%d (got %ld)\n", KMDB_MAX_K, k);
 		return 1;
@@ -1268,8 +1602,11 @@ int main(int argc, char *argv[])
 	C.P            = (uint32_t)threads;
 	C.min_count    = (uint32_t)min_count;
 	C.M            = passes > 0 ? (uint32_t)passes : 1;
-	C.read_files   = reads;
-	C.n_read_files = n_reads;
+	C.inputs       = inputs;
+	C.n_inputs     = n_inputs;
+	C.pair_dedup   = pair_dedup;
+	C.dd_paired    = calloc((size_t)threads, sizeof(uint64_t));
+	C.dd_skipped   = calloc((size_t)threads, sizeof(uint64_t));
 	C.t_start      = now_s();
 	pthread_mutex_init(&C.mtx, NULL);
 	pthread_cond_init(&C.cv, NULL);
@@ -1355,6 +1692,20 @@ int main(int argc, char *argv[])
 		        "min count %u, %u threads, %d read file(s)",
 		        name, C.k, C.min_count, C.P, n_reads);
 	fprintf(stderr, lowmem ? ", low-memory: %u pass(es)\n" : "\n", C.M);
+	if (mode == MODE_SAMPLE) {
+		if (pair_dedup)
+			fprintf(stderr, "pair dedup: ON (each k-mer counted at most once per "
+			        "read pair): %d PE pair input(s), %d interleaved, %d single-end\n",
+			        n_pe, n_pei, n_se);
+		else
+			fprintf(stderr, "pair dedup: OFF (--no-pair-dedup): every file counted "
+			        "as single-end, as before\n");
+		if (pair_dedup && n_pe + n_pei == 0 && n_se >= 2)
+			fprintf(stderr, "WARNING: pair dedup is on but no read pairs were given: "
+			        "%d files are read as single-end, so nothing is deduplicated. "
+			        "Give the mates as one comma-separated value, -i R1.fq.gz,R2.fq.gz "
+			        "(or use --interleaved).\n", n_se);
+	}
 
 	/* run files for M > 1 */
 	char **runs = NULL;
@@ -1383,7 +1734,8 @@ int main(int argc, char *argv[])
 
 	uint64_t distinct_all = 0, distinct_min = 0, final_n = 0, removed_total = 0;
 	uint64_t count_sum = 0, count_max = 0, n_saturated = 0;
-	uint64_t st_reads = 0, st_positions = 0, st_valid = 0;
+	uint64_t st_reads = 0, st_positions = 0, st_valid = 0, st_pairs = 0;
+	uint64_t dd_paired_total = 0, dd_skipped_total = 0;
 	size_t prev_max_part = 0;   /* largest partition of the previous pass */
 	int werr = 0;
 
@@ -1406,8 +1758,14 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "error: reading failed, no database written\n");
 			return 1;
 		}
+		/* every hit belongs to exactly one partition and one pass */
+		for (uint32_t i = 0; i < C.P; i++) {
+			dd_paired_total  += C.dd_paired[i];
+			dd_skipped_total += C.dd_skipped[i];
+		}
 		if (pass == 0) {
 			st_reads = C.n_reads; st_positions = C.n_positions; st_valid = C.n_valid;
+			st_pairs = C.n_pairs;
 			if (st_valid == 0) {
 				fprintf(stderr, "error: no valid k-mer windows in the reads, no "
 				        "database written\n");
@@ -1557,6 +1915,9 @@ int main(int argc, char *argv[])
 	kmdb_writer_meta_u64(w, "n_kmers", final_n);
 	kmdb_writer_meta_u64(w, "passes", C.M);
 	if (mode == MODE_SAMPLE) {
+		/* sum of all counts = increments made (see header comment) */
+		kmdb_writer_meta_u64(w, "total_evaluated", st_valid - dd_skipped_total);
+		kmdb_writer_meta_u64(w, "pair_dedup", (uint64_t)pair_dedup);
 		kmdb_writer_meta_u64(w, "count_sum", count_sum);
 		kmdb_writer_meta_u64(w, "count_max", count_max);
 		kmdb_writer_meta_u64(w, "count_saturated", n_saturated);
@@ -1584,12 +1945,50 @@ int main(int argc, char *argv[])
 	        final_n, st.st_size / 1e6,
 	        final_n ? (double)st.st_size / final_n : 0.0, now_s() - C.t_start);
 
+	/* pair dedup statistics. Without dedup every valid k-mer window is one
+	   increment, so st_valid is the "hits" denominator. */
+	double frac_all    = st_valid ? (double)dd_skipped_total / st_valid : 0.0;
+	double frac_paired = dd_paired_total ? (double)dd_skipped_total / dd_paired_total : 0.0;
+	if (mode == MODE_SAMPLE)
+		fprintf(stderr, "pair dedup %s: sample %s, %" PRIu64 " read pairs, %" PRIu64
+		        " k-mer hits (%" PRIu64 " in pairs), %" PRIu64 " increments skipped "
+		        "= %.4f%% of all hits, %.4f%% of hits in pairs; total_evaluated "
+		        "(sum of all counts) %" PRIu64 "\n",
+		        pair_dedup ? "ON" : "OFF", name, st_pairs, st_valid,
+		        dd_paired_total, dd_skipped_total, 100.0 * frac_all,
+		        100.0 * frac_paired, st_valid - dd_skipped_total);
+	if (stats_path) {
+		FILE *sf = fopen(stats_path, "w");
+		if (!sf) {
+			fprintf(stderr, "error: cannot write --stats %s: %s\n", stats_path,
+			        strerror(errno));
+			return 1;
+		}
+		fprintf(sf, "sample_id\tmode\tpair_dedup\tn_reads\tn_pairs\tkmer_positions"
+		        "\tvalid_kmer_positions\tpaired_hits\tdedup_skipped\tdedup_frac_all"
+		        "\tdedup_frac_paired\tdistinct_kmers\tn_kmers\tcount_sum\ttotal_evaluated\n");
+		fprintf(sf, "%s\t%s\t%d\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+		        "\t%" PRIu64 "\t%" PRIu64 "\t%.6f\t%.6f\t%" PRIu64 "\t%" PRIu64
+		        "\t%" PRIu64 "\t%" PRIu64 "\n", name,
+		        mode == MODE_SAMPLE ? "sample" : "scrub",
+		        pair_dedup, st_reads, st_pairs, st_positions, st_valid,
+		        dd_paired_total, dd_skipped_total, frac_all, frac_paired,
+		        distinct_all, final_n, count_sum, st_valid - dd_skipped_total);
+		if (fclose(sf) != 0) {
+			fprintf(stderr, "error: writing --stats %s failed\n", stats_path);
+			return 1;
+		}
+	}
+
 	free(C.tabs); free(tmp_path);
+	free(C.dd_paired); free(C.dd_skipped); free(stats_path);
 	for (int i = 0; i < n_reads; i++) free(reads[i]);
 	for (int i = 0; i < C.n_genomes; i++) free(C.genomes[i]);
-	free(reads); free(C.genomes); free(runs);
+	free(reads); free(inputs); free(C.genomes); free(runs);
 	free(reads_list); free(genome_list); free(name); free(out_dir); free(out_path);
 	free(tmp_dir);
-	for (int i = 0; i < N_SLOTS; i++) { free(C.slots[i].seq); free(C.slots[i].lens); }
+	for (int i = 0; i < N_SLOTS; i++) {
+		free(C.slots[i].seq); free(C.slots[i].lens); free(C.slots[i].fl);
+	}
 	return 0;
 }

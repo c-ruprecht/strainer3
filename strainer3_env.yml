@@ -28,6 +28,7 @@ dependencies:
   - sourmash
   - sourmash_plugin_branchwater
   - skani
+  - sylph
   - ncbi-datasets-cli
   - huggingface_hub
   - hf-xet

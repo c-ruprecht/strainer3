@@ -42,98 +42,7 @@ def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
                 thr=thr,
                 lam_mean=x.mean())
 
-### plots
-def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
-    df_loc = df_loc.copy()
-    df_loc['count'] = (df_loc[['pangenome_count', 'metagenome_count', 'drug_count']]
-                       .fillna(0).sum(axis=1).astype(int))
-    df_loc['rare_count'] = df_loc['rare_count'].fillna('not_rare')
 
-    # ---------- shared layout: one sector, contigs concatenated ----------
-    contigs = (df_loc.drop_duplicates('contig_id')[['contig_id', 'contig_length']]
-                     .sort_values('contig_length', ascending=False))
-    contigs['offset'] = contigs['contig_length'].cumsum() - contigs['contig_length']
-    genome_len = int(contigs['contig_length'].sum())
-
-    df = df_loc.merge(contigs[['contig_id', 'offset']], on='contig_id')
-    df['gpos'] = df['kmer_position'] + df['offset']
-    df = df.sort_values('gpos')
-
-    ymax = max(ymax_min, int(df['count'].max()))
-
-    def base_circos():
-        circos = Circos({'genome': genome_len}, start=0, end=360)
-        sector = circos.sectors[0]
-        track_ctg = sector.add_track((78, 82))
-        for i, (st, ln) in enumerate(zip(contigs['offset'], contigs['contig_length'])):
-            track_ctg.rect(st, st + ln, fc='grey' if i % 2 else 'lightgrey', ec='none')
-        track_cnt = sector.add_track((55, 75), r_pad_ratio=0.1)
-        track_cnt.axis()
-        return circos, track_cnt
-
-    def draw_groups(track, groups, colors):
-        for key in groups:                       # later groups are drawn on top
-            d = df[df['_group'] == key]
-            if len(d):
-                track.scatter(d['gpos'].to_numpy(), d['count'].to_numpy(),
-                              vmin=0, vmax=ymax, s=s, color=colors[key])
-
-    def save(circos, handles, title, name):
-        fig = circos.plotfig()
-        circos.ax.set_title(prefix, fontsize=11, pad=12)
-        circos.ax.legend(handles=handles, title=title, loc='center left',
-                         bbox_to_anchor=(1.02, 0.5), frameon=False, fontsize=8)
-        base = os.path.join(outdir, f"{prefix}.{name}")
-        if quality == 'svg':
-            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
-            print(f"saved {base}.svg")
-        if quality == 'png':
-            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
-            print(f"saved {base}.png")
-        if quality == 'both':
-            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
-            print(f"saved {base}.svg")
-            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
-            print(f"saved {base}.png")
-            
-        plt.close(fig)
-        
-
-    # ---------- 1) one distinct colour per count ----------
-    palette = px.colors.qualitative.Dark24
-    count_colors = {c: palette[c % len(palette)] for c in range(ymax + 1)}
-    present = sorted(int(c) for c in df['count'].unique())
-
-    df['_group'] = df['count'].astype(int)
-    circos, track = base_circos()
-    draw_groups(track, present, count_colors)
-    save(circos, [Patch(facecolor=count_colors[c], label=str(c)) for c in present],
-         'k-mer count', 'by_count')
-
-    # ---------- 2) rare vs not_rare ----------
-    colors2 = {'rare': 'blue', 'not_rare': 'red'}
-    df['_group'] = np.where(df['rare_count'] == 'not_rare', 'not_rare', 'rare')
-    circos, track = base_circos()
-    draw_groups(track, ['rare', 'not_rare'], colors2)
-    save(circos, [Patch(facecolor=colors2[k], label=k.replace('_', ' '))
-                  for k in ['not_rare', 'rare']],
-         'k-mer class', 'rare')
-
-    # ---------- 3) rare vs not_rare vs not_rare terminal ----------
-    colors3 = {'rare': 'blue', 'not_rare': 'red', 'not_rare_terminal': 'orange'}
-    df['_group'] = np.select(
-        [(df['rare_count'] == 'not_rare') & (df['terminal_kmer'] == True),
-         df['rare_count'] == 'not_rare'],
-        ['not_rare_terminal', 'not_rare'],
-        default='rare',
-    )
-    circos, track = base_circos()
-    draw_groups(track, ['rare', 'not_rare', 'not_rare_terminal'], colors3)
-    save(circos, [Patch(facecolor=colors3[k], label=k.replace('_', ' '))
-                  for k in ['not_rare_terminal', 'not_rare', 'rare']],
-         'k-mer class', 'rare_terminal')
-
-    return df.drop(columns='_group')
 
 ### coverages
 def nb_depth(cov, r = 2):
@@ -427,6 +336,100 @@ def get_block_depth_weighted_coverage(df_called_blocks, baseline, beta=1.0, alph
         'count_weight_alpha': alpha,
     })
 
+### plots
+def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
+    df_loc = df_loc.copy()
+    df_loc['count'] = (df_loc[['pangenome_count', 'metagenome_count', 'drug_count']]
+                       .fillna(0).sum(axis=1).astype(int))
+    df_loc['rare_count'] = df_loc['rare_count'].fillna('not_rare')
+
+    # ---------- shared layout: one sector, contigs concatenated ----------
+    contigs = (df_loc.drop_duplicates('contig_id')[['contig_id', 'contig_length']]
+                     .sort_values('contig_length', ascending=False))
+    contigs['offset'] = contigs['contig_length'].cumsum() - contigs['contig_length']
+    genome_len = int(contigs['contig_length'].sum())
+
+    df = df_loc.merge(contigs[['contig_id', 'offset']], on='contig_id')
+    df['gpos'] = df['kmer_position'] + df['offset']
+    df = df.sort_values('gpos')
+
+    ymax = max(ymax_min, int(df['count'].max()))
+
+    def base_circos():
+        circos = Circos({'genome': genome_len}, start=0, end=360)
+        sector = circos.sectors[0]
+        track_ctg = sector.add_track((78, 82))
+        for i, (st, ln) in enumerate(zip(contigs['offset'], contigs['contig_length'])):
+            track_ctg.rect(st, st + ln, fc='grey' if i % 2 else 'lightgrey', ec='none')
+        track_cnt = sector.add_track((55, 75), r_pad_ratio=0.1)
+        track_cnt.axis()
+        return circos, track_cnt
+
+    def draw_groups(track, groups, colors):
+        for key in groups:                       # later groups are drawn on top
+            d = df[df['_group'] == key]
+            if len(d):
+                track.scatter(d['gpos'].to_numpy(), d['count'].to_numpy(),
+                              vmin=0, vmax=ymax, s=s, color=colors[key])
+
+    def save(circos, handles, title, name):
+        fig = circos.plotfig()
+        circos.ax.set_title(prefix, fontsize=11, pad=12)
+        circos.ax.legend(handles=handles, title=title, loc='center left',
+                         bbox_to_anchor=(1.02, 0.5), frameon=False, fontsize=8)
+        base = os.path.join(outdir, f"{prefix}.{name}")
+        if quality == 'svg':
+            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
+            print(f"saved {base}.svg")
+        if quality == 'png':
+            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
+            print(f"saved {base}.png")
+        if quality == 'both':
+            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
+            print(f"saved {base}.svg")
+            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
+            print(f"saved {base}.png")
+            
+        plt.close(fig)
+        
+
+    # ---------- 1) one distinct colour per count ----------
+    palette = px.colors.qualitative.Dark24
+    count_colors = {c: palette[c % len(palette)] for c in range(ymax + 1)}
+    present = sorted(int(c) for c in df['count'].unique())
+
+    df['_group'] = df['count'].astype(int)
+    circos, track = base_circos()
+    draw_groups(track, present, count_colors)
+    save(circos, [Patch(facecolor=count_colors[c], label=str(c)) for c in present],
+         'k-mer count', 'by_count')
+
+    # ---------- 2) rare vs not_rare ----------
+    colors2 = {'rare': 'blue', 'not_rare': 'red'}
+    df['_group'] = np.where(df['rare_count'] == 'not_rare', 'not_rare', 'rare')
+    circos, track = base_circos()
+    draw_groups(track, ['rare', 'not_rare'], colors2)
+    save(circos, [Patch(facecolor=colors2[k], label=k.replace('_', ' '))
+                  for k in ['not_rare', 'rare']],
+         'k-mer class', 'rare')
+
+    # ---------- 3) rare vs not_rare vs not_rare terminal ----------
+    colors3 = {'rare': 'blue', 'not_rare': 'red', 'not_rare_terminal': 'orange'}
+    df['_group'] = np.select(
+        [(df['rare_count'] == 'not_rare') & (df['terminal_kmer'] == True),
+         df['rare_count'] == 'not_rare'],
+        ['not_rare_terminal', 'not_rare'],
+        default='rare',
+    )
+    circos, track = base_circos()
+    draw_groups(track, ['rare', 'not_rare', 'not_rare_terminal'], colors3)
+    save(circos, [Patch(facecolor=colors3[k], label=k.replace('_', ' '))
+                  for k in ['not_rare_terminal', 'not_rare', 'rare']],
+         'k-mer class', 'rare_terminal')
+
+    return df.drop(columns='_group')
+
+
 def main():
     # to do, basename + strain name addition
     parser = argparse.ArgumentParser(description='Calcualting coverage and depth with kmer locations')
@@ -437,13 +440,13 @@ def main():
     parser.add_argument('--reference', '-r', help = 'Path to reference file of a strain. Can be used to map kmers to locations')
     parser.add_argument('--terminal_dist', type = int, default = 300, help = 'distance from end of contig. Kmers within that range will be dropped')
     parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
-    parser.add_argument('--weight_alpha', type=float, default=0 ,help='block weight = (1 + count)^-alpha; higher favours rare blocks more')
-    parser.add_argument('--size_weight', action='store_true', help='also multiply block weight by kmers per block')
-    parser.add_argument('--depth_beta', type=float, default= 0,
-                                        help='depth weight = max(r,1)^-beta, r = (block_depth+pseudo)/(rare_depth+pseudo)')
-    parser.add_argument('--depth_mode', choices=['over', 'both'], default='over',
-                                        help="'over' penalises only depth above the rare baseline")
-    parser.add_argument('--depth_pseudo', type=float, default=1.0, help='pseudocount for the depth ratio')
+    #parser.add_argument('--weight_alpha', type=float, default=0 ,help='block weight = (1 + count)^-alpha; higher favours rare blocks more')
+    #parser.add_argument('--size_weight', action='store_true', help='also multiply block weight by kmers per block')
+    #parser.add_argument('--depth_beta', type=float, default= 0,
+     #                                   help='depth weight = max(r,1)^-beta, r = (block_depth+pseudo)/(rare_depth+pseudo)')
+    #parser.add_argument('--depth_mode', choices=['over', 'both'], default='over',
+    #                                    help="'over' penalises only depth above the rare baseline")
+    #parser.add_argument('--depth_pseudo', type=float, default=1.0, help='pseudocount for the depth ratio')
     parser.add_argument('--figures', choices=['png','svg', 'both','none'], default='none', help = 'Change to svg, png or both if you want figures to be saved.')
     
     args = parser.parse_args()
@@ -485,30 +488,30 @@ def main():
         df_loc_counts.set_index('#kmer').to_csv(os.path.join(outpath, "kmer_locations.tsv"), sep='\t')
 
         ### block calls for all kmers (rare blocks are a subset: blocks never mix rare and non-rare)
-        df_blk_call_all = call_blocks(df_blocks=df_loc_counts, df_hits=df_hits)
-        rare_blocks = df_loc_counts.loc[df_loc_counts['rare_count'].notna(), 'block_id'].unique()
-        df_blk_call_all['rare_block'] = df_blk_call_all['block_id'].isin(rare_blocks)
-        df_blk_call_all.set_index(['sample', 'block_id']).to_csv(os.path.join(outpath, "block_calls.tsv"), sep='\t')
+        #df_blk_call_all = call_blocks(df_blocks=df_loc_counts, df_hits=df_hits)
+        #rare_blocks = df_loc_counts.loc[df_loc_counts['rare_count'].notna(), 'block_id'].unique()
+        #df_blk_call_all['rare_block'] = df_blk_call_all['block_id'].isin(rare_blocks)
+        #df_blk_call_all.set_index(['sample', 'block_id']).to_csv(os.path.join(outpath, "block_calls.tsv"), sep='\t')
 
-        df_blk_call_rare = df_blk_call_all.loc[df_blk_call_all['rare_block']]
+        #df_blk_call_rare = df_blk_call_all.loc[df_blk_call_all['rare_block']]
 
-        df_blk_cov_w_all = get_block_weighted_coverage(df_blk_call_all, alpha=args.weight_alpha,
-                                                       size_weight=args.size_weight)
-        df_blk_cov_w_rare = get_block_weighted_coverage(df_blk_call_rare, alpha=args.weight_alpha,
-                                                        size_weight=args.size_weight)
+        #df_blk_cov_w_all = get_block_weighted_coverage(df_blk_call_all, alpha=args.weight_alpha,
+         #                                              size_weight=args.size_weight)
+        #df_blk_cov_w_rare = get_block_weighted_coverage(df_blk_call_rare, alpha=args.weight_alpha,
+          #                                              size_weight=args.size_weight)
         # depth based weights
-        baseline = df_cov_depth.set_index('sample')['depth_rare_kmers']
-        df_blk_cov_dw = get_block_depth_weighted_coverage(df_blk_call_all, baseline,
-                                                          beta=args.depth_beta, alpha=args.weight_alpha,
-                                                          mode=args.depth_mode, pseudo=args.depth_pseudo,
-                                                          size_weight=args.size_weight)
+        #baseline = df_cov_depth.set_index('sample')['depth_rare_kmers']
+        #df_blk_cov_dw = get_block_depth_weighted_coverage(df_blk_call_all, baseline,
+        #                                                  beta=args.depth_beta, alpha=args.weight_alpha,
+        #                                                  mode=args.depth_mode, pseudo=args.depth_pseudo,
+        #                                                  size_weight=args.size_weight)
 
-        df_cov_depth = (df_cov_depth
-                        .merge(df_blk_cov_w_all.set_index('sample').add_prefix('all_').reset_index(),
-                               on='sample', how='left')
-                        .merge(df_blk_cov_w_rare.set_index('sample').add_prefix('rare_').reset_index(),
-                               on='sample', how='left')
-                        .merge(df_blk_cov_dw, on='sample', how='left'))
+        #df_cov_depth = (df_cov_depth
+                        #.merge(df_blk_cov_w_all.set_index('sample').add_prefix('all_').reset_index(),
+                        #       on='sample', how='left')
+        #                .merge(df_blk_cov_w_rare.set_index('sample').add_prefix('rare_').reset_index(),
+        #                       on='sample', how='left')
+        #                .merge(df_blk_cov_dw, on='sample', how='left'))
         
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
@@ -535,7 +538,7 @@ def main():
 
     if args.strain:
         df_cov_depth['strain'] = args.strain 
-    df_cov_depth.set_index(['strain', 'sample']).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
+    df_cov_depth.set_index(['strain', 'sample']).round(4).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
     print(f'Saved coverage dataframe to \n {outpath}')
     print(df_cov_depth.head(5))
 

@@ -3,6 +3,7 @@
 /test/strainer2_original
 /test/strainer2_parallel
 /test/output
+/test/output_dedup
 /test/output-snake
 /test/output-fullscrub
 /test/out

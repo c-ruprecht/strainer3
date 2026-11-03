@@ -25,6 +25,27 @@
  * targets can be mixed in one targets file. Needs k <= 31 and the same k as
  * the database.
  *
+ * total_evaluated row: the sum of the counts of ALL k-mers of the sample
+ * (not only the query k-mers), i.e. the number of k-mer increments made.
+ * That is the denominator for relative abundance. FASTQ targets: every
+ * ACGT-only k-mer window of every read with length >= k, minus the windows
+ * skipped by pair dedup. .kmdb targets: the database's total_evaluated
+ * metadata (same definition; databases from before that key existed fall
+ * back to valid_kmer_positions, their sum of counts). Windows holding any
+ * non-ACGT base are not counted (until now they were).
+ *
+ * Pair dedup (--pair-dedup, default; --no-pair-dedup for the old counts):
+ * for PE targets (two files, read in lockstep) and PEI targets
+ * (consecutive records are mates) every distinct canonical k-mer is counted
+ * at most once per read pair, whether it occurs in R1, R2 or both, and
+ * however often it repeats inside the pair (sylph's rule). This applies to
+ * every k-mer, so it also lowers total_evaluated. SE targets are unchanged.
+ * Mates must be in sync (same number of records; names equal after
+ * dropping a trailing /1 /2 .1 .2 _1 _2), otherwise the program stops.
+ * Same rule as kmer_metagenome_db -m sample --pair-dedup, so FASTQ and
+ * .kmdb targets built from the same reads give identical counts and
+ * total_evaluated when both use the same setting.
+ *
  * Each metagenome is processed in its own thread. Because each thread only
  * writes to its own column index in the per-kmer count array, no mutex is
  * needed for count updates. The hash is read-only during scanning.
@@ -47,6 +68,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <getopt.h>
 #include "kseq.h"
 #include "BIO_sequence.h"
 #include "BIO_hash.h"
@@ -89,6 +111,8 @@ typedef struct {
     uint64_t  *total_kmer_counts;
     const QKmer *qk;     /* sorted by key; NULL unless a .kmdb target exists */
     size_t     n_qk;
+    int        pair_dedup;   /* --pair-dedup */
+    int        have_fastq;   /* any FASTQ target (for the .kmdb mismatch warning) */
 } ksd_job;
 
 typedef struct {
@@ -117,7 +141,7 @@ static char     *pair_sample_name(const char *f1, const char *f2);
 static int       parse_targets(const char *file, Metagenome **out);
 static int       parse_kmer_tsv(const char *file, BIO_hash h, int n_mg,
                                  int *seed_out, char ***kmer_list_out);
-static void      scan_file(const char *filepath, BIO_hash h, int seed, int mg_idx, uint64_t *total_kmer_counts);
+static void      scan_target(ksd_job *job);
 static void     *ksd_worker(void *arg);
 static ksd_pool *ksd_pool_create(int nthreads, int capacity);
 static void      ksd_pool_submit(ksd_pool *pool, ksd_job *job);
@@ -508,56 +532,275 @@ static int parse_kmer_tsv(const char *file, BIO_hash h, int n_mg,
 
 /* ── read scanner ──────────────────────────────────────────────────── */
 
-static void scan_file(const char *filepath, BIO_hash h, int seed, int mg_idx, uint64_t *total_kmer_counts) {
-    gzFile fp = gzopen(filepath, "r");
-    if (!fp) {
-        fprintf(stderr, "cannot open %s: %s\n", filepath, strerror(errno));
-        return;
+/* A-0 C-1 G-2 T-3 (either case), anything else 4: same as KMDB_NT2BIT,
+   duplicated so builds without zstd/kmdb.c have it too. */
+static uint8_t NT2BIT[256];
+static void nt2bit_init(void) {
+    memset(NT2BIT, 4, sizeof NT2BIT);
+    NT2BIT['A'] = NT2BIT['a'] = 0; NT2BIT['C'] = NT2BIT['c'] = 1;
+    NT2BIT['G'] = NT2BIT['g'] = 2; NT2BIT['T'] = NT2BIT['t'] = 3;
+}
+
+static inline uint64_t mix64(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+/* Per-thread set of the canonical k-mers counted in the current read pair.
+   Generation-stamped: a new pair is ++cur, no clearing. Keys are the exact
+   2-bit canonical k-mer for k <= 31; for longer k a 64-bit hash of the
+   canonical string (a collision would merge two k-mers of one pair, at
+   ~n^2/2^65 per pair, i.e. never in practice). */
+typedef struct {
+    uint64_t *keys;
+    uint32_t *gen;
+    size_t    cap;
+    uint32_t  cur;
+} fset_t;
+
+static void fset_begin(fset_t *s, size_t n_windows) {
+    size_t need = 1024;
+    while (need < n_windows * 2) need <<= 1;
+    if (need > s->cap) {
+        free(s->keys); free(s->gen);
+        s->cap  = need;
+        s->keys = malloc(need * sizeof(uint64_t));
+        s->gen  = calloc(need, sizeof(uint32_t));
+        if (!s->keys || !s->gen) { fprintf(stderr, "out of memory\n"); exit(1); }
+        s->cur  = 0;
     }
+    if (++s->cur == 0) {
+        memset(s->gen, 0, s->cap * sizeof(uint32_t));
+        s->cur = 1;
+    }
+}
 
-    kseq_t *seq = kseq_init(fp);
-    size_t rc_cap = 0;
-    char *seedStrRevComp = NULL;   /* grown per read: no fixed 10 kb limit */
-    unsigned int i;
+/* 1 = new in this pair, 0 = already counted */
+static inline int fset_add(fset_t *s, uint64_t key) {
+    size_t m = s->cap - 1, i = (size_t)mix64(key) & m;
+    for (;;) {
+        if (s->gen[i] != s->cur) { s->gen[i] = s->cur; s->keys[i] = key; return 1; }
+        if (s->keys[i] == key) return 0;
+        i = (i + 1) & m;
+    }
+}
 
-    while (kseq_read(seq) >= 0) {
-        if ((int)seq->seq.l < seed) continue;
-        BIO_stringToUpper(seq->seq.s);
+typedef struct {
+    BIO_hash  h;
+    int       k, mg_idx;
+    uint64_t  total;            /* increments made = total_evaluated */
+    uint64_t  hits;             /* query-k-mer increments made */
+    uint64_t  skip_total;       /* windows skipped by pair dedup */
+    uint64_t  skip_hits;        /* query-k-mer increments skipped */
+    uint64_t  n_pairs;
+    char     *rc;  size_t rc_cap;
+    fset_t    fs;
+} scan_t;
 
-        if (seq->seq.l + 1 > rc_cap) {
-            rc_cap = seq->seq.l + 1;
-            seedStrRevComp = realloc(seedStrRevComp, rc_cap);
+/* Count the k-mers of one read. fs != NULL: pair dedup (skip k-mers already
+   counted in this pair). Only ACGT-only windows count, as in
+   kmer_metagenome_db. */
+static void scan_read(scan_t *S, char *s, size_t len, fset_t *fs) {
+    const int k = S->k;
+    if (len < (size_t)k) return;
+    BIO_stringToUpper(s);
+    if (len + 1 > S->rc_cap) {
+        S->rc_cap = len + 1;
+        S->rc = realloc(S->rc, S->rc_cap);
+    }
+    memcpy(S->rc, s, len + 1);
+    BIO_reverseComplement(S->rc);
+
+    const int packed = k <= 31;
+    const int shift = 2 * (k - 1);
+    const uint64_t mask = packed ? ((1ull << (2 * k)) - 1) : 0;
+    uint64_t fwd = 0, rev = 0;
+    int run = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t x = NT2BIT[(unsigned char)s[i]];
+        if (x > 3) { run = 0; fwd = rev = 0; continue; }
+        if (packed) {
+            fwd = ((fwd << 2) | x) & mask;
+            rev = (rev >> 2) | ((uint64_t)(3 - x) << shift);
         }
-        strcpy(seedStrRevComp, seq->seq.s);
-        BIO_reverseComplement(seedStrRevComp);
+        if (++run < k) continue;
 
-        char *seed_seq    = seq->seq.s;
-        char *seed_seq_rc = &seedStrRevComp[seq->seq.l - seed];
-        int   has_N       = contains_N(seed_seq);
+        size_t j = i + 1 - (size_t)k;              /* window s[j, j+k) */
+        char *w  = s + j;
+        char *wr = S->rc + (len - j - (size_t)k);  /* its reverse complement */
+        char tw = w[k], tr = wr[k];
+        w[k] = '\0'; wr[k] = '\0';
+        char *orient = strcmp(w, wr) > 0 ? w : wr; /* max == max(fwd,rev) */
+        unsigned int *count = (unsigned int *)BIO_searchHash(S->h, orient);
 
-        for (i = 0; i < seq->seq.l - (unsigned int)seed + 1; i++) {
-            total_kmer_counts[mg_idx]++;
-            char temp_nuc     = seed_seq[seed];
-            seed_seq[seed]    = '\0';
-            seed_seq_rc[seed] = '\0';
-
-            char *orientStr = (strcmp(seed_seq, seed_seq_rc) > 0)
-                              ? seed_seq : seed_seq_rc;
-
-            if (!has_N || !contains_N(orientStr)) {
-                unsigned int *count = (unsigned int *)BIO_searchHash(h, orientStr);
-                if (count) count[mg_idx]++;   /* only this thread writes column mg_idx */
+        int counted = 1;
+        if (fs) {
+            uint64_t key;
+            if (packed) key = fwd > rev ? fwd : rev;
+            else {                                 /* FNV-1a 64 */
+                key = 1469598103934665603ull;
+                for (const char *p = orient; *p; p++)
+                    key = (key ^ (unsigned char)*p) * 1099511628211ull;
             }
+            counted = fset_add(fs, key);
+        }
+        w[k] = tw; wr[k] = tr;
 
-            seed_seq[seed] = temp_nuc;
-            seed_seq++;
-            seed_seq_rc--;
+        if (counted) {
+            S->total++;
+            if (count) { count[S->mg_idx]++; S->hits++; }   /* only this thread writes this column */
+        } else {
+            S->skip_total++;
+            if (count) S->skip_hits++;
         }
     }
+}
 
-    free(seedStrRevComp);
+static size_t n_windows(size_t len, int k) {
+    return len >= (size_t)k ? len - (size_t)k + 1 : 0;
+}
+
+/* mate names, ignoring a trailing /1 /2 .1 .2 _1 _2 */
+static size_t mate_stem(const kstring_t *n) {
+    size_t l = n->l;
+    if (l >= 2 && (n->s[l-1] == '1' || n->s[l-1] == '2') &&
+        (n->s[l-2] == '/' || n->s[l-2] == '.' || n->s[l-2] == '_'))
+        l -= 2;
+    return l;
+}
+
+static void check_mates(const kstring_t *a, const kstring_t *b, const char *what,
+                        uint64_t pair_no) {
+    size_t la = mate_stem(a), lb = mate_stem(b);
+    if (la == lb && memcmp(a->s, b->s, la) == 0) return;
+    fprintf(stderr, "error: %s: mates out of sync at pair %" PRIu64 " (%.*s vs %.*s); "
+            "use --no-pair-dedup to count them as single-end reads\n",
+            what, pair_no, (int)a->l, a->s, (int)b->l, b->s);
+    exit(1);
+}
+
+static void scan_pair(scan_t *S, kstring_t *r1, kstring_t *r2) {
+    fset_begin(&S->fs, n_windows(r1->l, S->k) + n_windows(r2->l, S->k));
+    scan_read(S, r1->s, r1->l, &S->fs);
+    scan_read(S, r2->s, r2->l, &S->fs);
+    S->n_pairs++;
+}
+
+static gzFile open_or_die(const char *path) {
+    gzFile fp = gzopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "error: cannot open %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    gzbuffer(fp, 1 << 20);
+    return fp;
+}
+
+static void die_malformed(const char *path, int l) {
+    fprintf(stderr, "error: %s is truncated or malformed (kseq %d)\n", path, l);
+    exit(1);
+}
+
+/* single-end (also every file with --no-pair-dedup): no dedup */
+static void scan_se(scan_t *S, const char *path) {
+    gzFile fp = open_or_die(path);
+    kseq_t *seq = kseq_init(fp);
+    int l;
+    while ((l = kseq_read(seq)) >= 0) scan_read(S, seq->seq.s, seq->seq.l, NULL);
+    if (l < -1) die_malformed(path, l);
     kseq_destroy(seq);
     gzclose(fp);
+}
+
+static void scan_pe(scan_t *S, const char *f1, const char *f2) {
+    gzFile a = open_or_die(f1), b = open_or_die(f2);
+    kseq_t *s1 = kseq_init(a), *s2 = kseq_init(b);
+    for (;;) {
+        int l1 = kseq_read(s1), l2 = kseq_read(s2);
+        if (l1 < -1) die_malformed(f1, l1);
+        if (l2 < -1) die_malformed(f2, l2);
+        if (l1 < 0 && l2 < 0) break;
+        if (l1 < 0 || l2 < 0) {
+            fprintf(stderr, "error: %s and %s hold different numbers of reads "
+                    "(%s ends after %" PRIu64 " pairs)\n", f1, f2,
+                    l1 < 0 ? f1 : f2, S->n_pairs);
+            exit(1);
+        }
+        check_mates(&s1->name, &s2->name, f1, S->n_pairs + 1);
+        scan_pair(S, &s1->seq, &s2->seq);
+    }
+    kseq_destroy(s1); kseq_destroy(s2);
+    gzclose(a); gzclose(b);
+}
+
+static void kstr_copy(kstring_t *d, const kstring_t *s) {
+    if (d->m < s->l + 1) { d->m = s->l + 1; d->s = realloc(d->s, d->m); }
+    memcpy(d->s, s->s, s->l);
+    d->s[s->l] = '\0';
+    d->l = s->l;
+}
+
+static void scan_pei(scan_t *S, const char *path) {
+    gzFile fp = open_or_die(path);
+    kseq_t *seq = kseq_init(fp);
+    kstring_t name1 = {0, 0, NULL}, seq1 = {0, 0, NULL};
+    for (;;) {
+        int l = kseq_read(seq);
+        if (l < -1) die_malformed(path, l);
+        if (l < 0) break;
+        kstr_copy(&name1, &seq->name);
+        kstr_copy(&seq1, &seq->seq);
+        l = kseq_read(seq);
+        if (l < -1) die_malformed(path, l);
+        if (l < 0) {
+            fprintf(stderr, "error: %s (PEI) has an odd number of records; the "
+                    "last read has no mate\n", path);
+            exit(1);
+        }
+        check_mates(&name1, &seq->name, path, S->n_pairs + 1);
+        scan_pair(S, &seq1, &seq->seq);
+    }
+    free(name1.s); free(seq1.s);
+    kseq_destroy(seq);
+    gzclose(fp);
+}
+
+static void scan_target(ksd_job *job) {
+    const Metagenome *mg = job->mg;
+    scan_t S;
+    memset(&S, 0, sizeof S);
+    S.h = job->h; S.k = job->seed; S.mg_idx = job->mg_idx;
+
+    const char *how;
+    if (!job->pair_dedup) {
+        scan_se(&S, mg->file1);                         /* the old behaviour */
+        if (mg->type == IS_PAIRED_END && mg->file2) scan_se(&S, mg->file2);
+        how = "no pair dedup";
+    } else if (mg->type == IS_PAIRED_END) {
+        scan_pe(&S, mg->file1, mg->file2);
+        how = "PE, pair dedup";
+    } else if (mg->type == IS_PAIRED_END_INTERLEAVE) {
+        scan_pei(&S, mg->file1);
+        how = "PEI, pair dedup";
+    } else {
+        scan_se(&S, mg->file1);
+        how = "SE";
+    }
+    job->total_kmer_counts[job->mg_idx] += S.total;
+
+    uint64_t all = S.total + S.skip_total, qall = S.hits + S.skip_hits;
+    if (job->pair_dedup && mg->type != NOT_PAIRED_END)
+        fprintf(stderr, "  %s (%s): %" PRIu64 " pairs; skipped %" PRIu64 " of %" PRIu64
+                " k-mer windows (%.2f%%) and %" PRIu64 " of %" PRIu64 " query k-mer hits "
+                "(%.2f%%); total_evaluated %" PRIu64 "\n", mg->basename, how, S.n_pairs,
+                S.skip_total, all, all ? 100.0 * S.skip_total / all : 0.0,
+                S.skip_hits, qall, qall ? 100.0 * S.skip_hits / qall : 0.0, S.total);
+    else
+        fprintf(stderr, "  %s (%s): %" PRIu64 " query k-mer hits; total_evaluated %"
+                PRIu64 "\n", mg->basename, how, S.hits, S.total);
+    free(S.rc); free(S.fs.keys); free(S.fs.gen);
 }
 
 /* ── .kmdb target lookup ───────────────────────────────────────────────
@@ -587,7 +830,8 @@ static size_t qk_lower_bound(const QKmer *qk, size_t lo, size_t n, uint64_t key)
 }
 
 static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
-                      int mg_idx, uint64_t *total_kmer_counts) {
+                      int mg_idx, uint64_t *total_kmer_counts, int pair_dedup,
+                      int have_fastq) {
     kmdb_t *db = kmdb_open(path);
     if (!db) exit(1);
 
@@ -608,13 +852,25 @@ static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
         fprintf(stderr, "WARNING: %s was built with min_count=%s; k-mers seen "
                 "fewer times are reported as 0\n", path, mc);
     free(mc);
-    char *kp = kmdb_meta_get(db, "kmer_positions");
-    if (!kp) {
-        fprintf(stderr, "error: %s has no kmer_positions metadata\n", path);
+    /* total_evaluated = sum of all counts of the sample. Databases written
+       before that key existed were never pair-deduplicated, so their sum
+       of counts is valid_kmer_positions. */
+    char *te = kmdb_meta_get(db, "total_evaluated");
+    if (!te) te = kmdb_meta_get(db, "valid_kmer_positions");
+    if (!te) {
+        fprintf(stderr, "error: %s has neither total_evaluated nor "
+                "valid_kmer_positions metadata\n", path);
         exit(1);
     }
-    total_kmer_counts[mg_idx] += strtoull(kp, NULL, 10);
-    free(kp);
+    total_kmer_counts[mg_idx] += strtoull(te, NULL, 10);
+    free(te);
+    char *pd = kmdb_meta_get(db, "pair_dedup");
+    int db_dedup = pd && strcmp(pd, "1") == 0;
+    free(pd);
+    if (have_fastq && db_dedup != pair_dedup)
+        fprintf(stderr, "WARNING: %s was built %s pair dedup but FASTQ targets in "
+                "this run are counted %s it; their counts are not comparable\n",
+                path, db_dedup ? "with" : "without", pair_dedup ? "with" : "without");
 
     kmdb_block_buf buf;
     kmdb_block_buf_init(&buf);
@@ -692,12 +948,11 @@ static void *ksd_worker(void *arg) {
         if (job->mg->type == IS_KMDB) {
 #ifdef HAVE_ZSTD
             scan_kmdb(job->mg->file1, job->qk, job->n_qk, job->seed,
-                      job->mg_idx, job->total_kmer_counts);
+                      job->mg_idx, job->total_kmer_counts, job->pair_dedup,
+                      job->have_fastq);
 #endif
         } else {
-            scan_file(job->mg->file1, job->h, job->seed, job->mg_idx, job->total_kmer_counts);
-            if (job->mg->type == IS_PAIRED_END && job->mg->file2)
-                scan_file(job->mg->file2, job->h, job->seed, job->mg_idx, job->total_kmer_counts);
+            scan_target(job);
         }
         free(job);
 
@@ -767,9 +1022,17 @@ static void usage(void) {
     fprintf(stderr, "  -n  output basename (default: -k filename without extensions);\n");
     fprintf(stderr, "      writes <-O>/<-n>.kmer_hits.tsv.gz\n");
     fprintf(stderr, "  -o  output file; overrides -O/-n (e.g. sample.kmer_hits.tsv.gz)\n");
-    fprintf(stderr, "  -t  threads (default: 4)   [was -j]\n\n");
+    fprintf(stderr, "  -t  threads (default: 4)   [was -j]\n");
+    fprintf(stderr, "  --pair-dedup (default) / --no-pair-dedup\n");
+    fprintf(stderr, "      PE / PEI FASTQ targets: count each k-mer at most once per read pair\n");
+    fprintf(stderr, "      (in R1, R2 or both, repeats included). SE targets are unchanged.\n");
+    fprintf(stderr, "      --no-pair-dedup counts every mate on its own (the old counts).\n");
+    fprintf(stderr, "      .kmdb targets carry the setting they were built with.\n\n");
     fprintf(stderr, "Output: gzipped TSV — first column is #kmer, then target columns,\n");
-    fprintf(stderr, "        then b_* columns for background metagenomes.\n");
+    fprintf(stderr, "        then b_* columns for background metagenomes. Last row\n");
+    fprintf(stderr, "        total_evaluated = sum of the counts of all k-mers of the sample\n");
+    fprintf(stderr, "        (ACGT-only windows, after pair dedup): the relative-abundance\n");
+    fprintf(stderr, "        denominator.\n");
 }
 
 /* ── main ──────────────────────────────────────────────────────────── */
@@ -782,10 +1045,21 @@ int main(int argc, char *argv[]) {
     char *out_dir         = NULL;
     char *out_name        = NULL;
     int   num_threads     = 4;
+    int   pair_dedup      = 1;
     int   c;
 
-    while ((c = getopt(argc, argv, "k:B:G:O:n:o:t:j:h")) != EOF) {
+    enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP };
+    static const struct option longopts[] = {
+        { "pair-dedup",    no_argument, NULL, OPT_PAIR_DEDUP },
+        { "no-pair-dedup", no_argument, NULL, OPT_NO_PAIR_DEDUP },
+        { "help",          no_argument, NULL, 'h' },
+        { NULL, 0, NULL, 0 }
+    };
+    nt2bit_init();
+    while ((c = getopt_long(argc, argv, "k:B:G:O:n:o:t:j:h", longopts, NULL)) != -1) {
         switch (c) {
+            case OPT_PAIR_DEDUP:    pair_dedup = 1; break;
+            case OPT_NO_PAIR_DEDUP: pair_dedup = 0; break;
             case 'k': kmer_file       = strdup(optarg); break;
             case 'B': targets_file    = strdup(optarg); break;
             case 'G': background_file = strdup(optarg); break;
@@ -888,6 +1162,17 @@ int main(int argc, char *argv[]) {
     }
 
     /* 3. scan all metagenomes in parallel (nothing to count -> skip; seed is -1) */
+    int n_fastq = 0, n_paired = 0;
+    for (int i = 0; i < n_total; i++) {
+        if (mgs[i].type == IS_KMDB) continue;
+        n_fastq++;
+        n_paired += mgs[i].type == IS_PAIRED_END || mgs[i].type == IS_PAIRED_END_INTERLEAVE;
+    }
+    if (n_fastq > 0)
+        fprintf(stderr, "pair dedup: %s for FASTQ targets (%d of %d are PE/PEI)\n",
+                pair_dedup ? "ON (each k-mer at most once per read pair)"
+                           : "OFF (--no-pair-dedup: every mate counted on its own)",
+                n_paired, n_fastq);
     uint64_t *total_kmer_counts = calloc(n_total, sizeof(uint64_t));
     if (n_kmers > 0) {
         ksd_pool *pool = ksd_pool_create(num_threads, n_total + 1);
@@ -900,6 +1185,8 @@ int main(int argc, char *argv[]) {
             job->total_kmer_counts = total_kmer_counts;
             job->qk               = qk;
             job->n_qk             = n_qk;
+            job->pair_dedup       = pair_dedup;
+            job->have_fastq       = n_fastq > 0;
             ksd_pool_submit(pool, job);
         }
         ksd_pool_wait_and_destroy(pool);
@@ -936,7 +1223,8 @@ int main(int argc, char *argv[]) {
         free(kmer_list[i]);
     }
 
-    /* summary row — total kmer positions evaluated per metagenome */
+    /* summary row: total_evaluated = sum of the counts of ALL k-mers of the
+       sample (ACGT-only windows, after pair dedup), see the header comment */
     gzprintf(out, "total_evaluated");
     for (int i = 0; i < n_total; i++)
         gzprintf(out, "\t%" PRIu64, total_kmer_counts[i]);

@@ -1,5 +1,5 @@
 
-echo 'Example strainer run for D6331_Faecalibacterium_prausnitzii'
+echo 'Example strainer run for D6331_Faecalibacterium_prausnitzii (pair dedup)'
 echo 'STEP 0: Removing old test data if present'
 rm -rf output
 
@@ -11,7 +11,7 @@ echo 'STEP1: kmer_scrub_count (counting the frequency of target genome kmers in 
 -A lists/genomes_to_scrub.txt \
 -B lists/metagenomes_to_scrub.txt \
 -C lists/drug_scrub.txt \
--t 4 \
+-t 12 \
 -T 0.995 \
 -O output/scrub 
 
@@ -31,18 +31,18 @@ echo 'STEP2: complete'
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP3 '; printf '%*s\n' 20 '' | tr ' ' '='
 
 echo ''
-echo 'STEP3: Create kmer db of target metagenomes'
+echo 'STEP3: Create kmer db of target metagenomes (pair dedup: mates joined with a comma)'
 echo 'sample 1 atcc - negative'
 ../src/kmer_metagenome_db -m sample \
 -O output/target_samples_kmdb \
 -n ATCC-10-even \
-target_metagenomes/ATCC-10-even_S21_L001_R1_001.fastq.downsampled.gz target_metagenomes/ATCC-10-even_S21_L001_R2_001.fastq.downsampled.gz
+-i target_metagenomes/ATCC-10-even_S21_L001_R1_001.fastq.downsampled.gz,target_metagenomes/ATCC-10-even_S21_L001_R2_001.fastq.downsampled.gz
 
 echo 'sample 2 d6331 - positive'
 ../src/kmer_metagenome_db -m sample \
 -O output/target_samples_kmdb \
 -n D6331 \
-target_metagenomes/D6331-231101-C4_R1_001.fastq.downsampled.gz target_metagenomes/D6331-231101-C4_R2_001.fastq.downsampled.gz
+-i target_metagenomes/D6331-231101-C4_R1_001.fastq.downsampled.gz,target_metagenomes/D6331-231101-C4_R2_001.fastq.downsampled.gz
 
 echo 'STEP3 - DONE'
 

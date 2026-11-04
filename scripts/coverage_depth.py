@@ -12,6 +12,9 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from pycirclize import Circos
 from scipy.stats import poisson
+import re
+from matplotlib.colors import LogNorm, Normalize
+from matplotlib.cm import ScalarMappable
 
 
 def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
@@ -42,7 +45,8 @@ def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
                 thr=thr,
                 lam_mean=x.mean())
 
-
+def estimate_depth_rare_subset():
+    pass
 
 ### coverages
 def nb_depth(cov, r = 2):
@@ -337,7 +341,13 @@ def get_block_depth_weighted_coverage(df_called_blocks, baseline, beta=1.0, alph
     })
 
 ### plots
-def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
+def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=3,
+             quality='both', hit_cmap='viridis', hit_log=True, hit_q=0.995):
+    """
+    df_loc : kmer locations with counts (output of add_block_ids + rare_count merge)
+    df_hits: optional '#kmer' x samples hit table -> one extra map per sample with a hits track
+    samples: optional subset of sample columns to plot (default: all)
+    """
     df_loc = df_loc.copy()
     df_loc['count'] = (df_loc[['pangenome_count', 'metagenome_count', 'drug_count']]
                        .fillna(0).sum(axis=1).astype(int))
@@ -351,19 +361,24 @@ def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
 
     df = df_loc.merge(contigs[['contig_id', 'offset']], on='contig_id')
     df['gpos'] = df['kmer_position'] + df['offset']
-    df = df.sort_values('gpos')
+    df = df.sort_values('gpos').reset_index(drop=True)
 
     ymax = max(ymax_min, int(df['count'].max()))
 
-    def base_circos():
+    def base_circos(with_hits=False):
+        r_ctg, r_cnt, r_hit = ((88, 92), (64, 84), (36, 58)) if with_hits else ((78, 82), (55, 75), None)
         circos = Circos({'genome': genome_len}, start=0, end=360)
         sector = circos.sectors[0]
-        track_ctg = sector.add_track((78, 82))
+        track_ctg = sector.add_track(r_ctg)
         for i, (st, ln) in enumerate(zip(contigs['offset'], contigs['contig_length'])):
             track_ctg.rect(st, st + ln, fc='grey' if i % 2 else 'lightgrey', ec='none')
-        track_cnt = sector.add_track((55, 75), r_pad_ratio=0.1)
+        track_cnt = sector.add_track(r_cnt, r_pad_ratio=0.1)
         track_cnt.axis()
-        return circos, track_cnt
+        track_hit = None
+        if with_hits:
+            track_hit = sector.add_track(r_hit, r_pad_ratio=0.1)
+            track_hit.axis()
+        return circos, track_cnt, track_hit
 
     def draw_groups(track, groups, colors):
         for key in groups:                       # later groups are drawn on top
@@ -372,26 +387,27 @@ def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
                 track.scatter(d['gpos'].to_numpy(), d['count'].to_numpy(),
                               vmin=0, vmax=ymax, s=s, color=colors[key])
 
-    def save(circos, handles, title, name):
+    def save(circos, handles, title, name, cbar=None):
         fig = circos.plotfig()
-        circos.ax.set_title(prefix, fontsize=11, pad=12)
-        circos.ax.legend(handles=handles, title=title, loc='center left',
-                         bbox_to_anchor=(1.02, 0.5), frameon=False, fontsize=8)
+        circos.ax.set_title(prefix if cbar is None else f'{prefix} | {name.split(".", 1)[-1]}',
+                            fontsize=11, pad=12)
+        circos.ax.legend(handles=handles, title=title,
+                         loc='upper left' if cbar else 'center left',
+                         bbox_to_anchor=(1.02, 0.95) if cbar else (1.02, 0.5),
+                         frameon=False, fontsize=8)
+        if cbar is not None:
+            norm, cmap, label = cbar
+            cax = circos.ax.inset_axes([1.05, 0.05, 0.025, 0.35])
+            cb = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), cax=cax)
+            cb.set_label(label, fontsize=8)
+            cb.ax.tick_params(labelsize=7)
         base = os.path.join(outdir, f"{prefix}.{name}")
-        if quality == 'svg':
-            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
-            print(f"saved {base}.svg")
-        if quality == 'png':
-            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
-            print(f"saved {base}.png")
-        if quality == 'both':
-            fig.savefig(base + '.svg', format='svg', bbox_inches='tight')
-            print(f"saved {base}.svg")
-            fig.savefig(base + '.png', dpi=300, bbox_inches='tight')
-            print(f"saved {base}.png")
-            
+        fmts = ['svg', 'png'] if quality == 'both' else [quality]
+        for fmt in fmts:
+            kw = dict(format='svg') if fmt == 'svg' else dict(dpi=300)
+            fig.savefig(f'{base}.{fmt}', bbox_inches='tight', **kw)
+            print(f"saved {base}.{fmt}")
         plt.close(fig)
-        
 
     # ---------- 1) one distinct colour per count ----------
     palette = px.colors.qualitative.Dark24
@@ -399,7 +415,7 @@ def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
     present = sorted(int(c) for c in df['count'].unique())
 
     df['_group'] = df['count'].astype(int)
-    circos, track = base_circos()
+    circos, track, _ = base_circos()
     draw_groups(track, present, count_colors)
     save(circos, [Patch(facecolor=count_colors[c], label=str(c)) for c in present],
          'k-mer count', 'by_count')
@@ -407,7 +423,7 @@ def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
     # ---------- 2) rare vs not_rare ----------
     colors2 = {'rare': 'blue', 'not_rare': 'red'}
     df['_group'] = np.where(df['rare_count'] == 'not_rare', 'not_rare', 'rare')
-    circos, track = base_circos()
+    circos, track, _ = base_circos()
     draw_groups(track, ['rare', 'not_rare'], colors2)
     save(circos, [Patch(facecolor=colors2[k], label=k.replace('_', ' '))
                   for k in ['not_rare', 'rare']],
@@ -415,17 +431,61 @@ def plot_map(df_loc, outdir, prefix, ymax_min=20, s=3, quality='both'):
 
     # ---------- 3) rare vs not_rare vs not_rare terminal ----------
     colors3 = {'rare': 'blue', 'not_rare': 'red', 'not_rare_terminal': 'orange'}
+    groups3 = ['rare', 'not_rare', 'not_rare_terminal']
     df['_group'] = np.select(
         [(df['rare_count'] == 'not_rare') & (df['terminal_kmer'] == True),
          df['rare_count'] == 'not_rare'],
         ['not_rare_terminal', 'not_rare'],
         default='rare',
     )
-    circos, track = base_circos()
-    draw_groups(track, ['rare', 'not_rare', 'not_rare_terminal'], colors3)
-    save(circos, [Patch(facecolor=colors3[k], label=k.replace('_', ' '))
-                  for k in ['not_rare_terminal', 'not_rare', 'rare']],
-         'k-mer class', 'rare_terminal')
+    handles3 = [Patch(facecolor=colors3[k], label=k.replace('_', ' ')) for k in groups3[::-1]]
+    circos, track, _ = base_circos()
+    draw_groups(track, groups3, colors3)
+    save(circos, handles3, 'k-mer class', 'rare_terminal')
+
+        # ---------- 4) per sample: count track (by_count) + hits track (colour = hit count) ----------
+    if df_hits is not None:
+        hit_cols = [c for c in df_hits.columns if c != '#kmer']
+        samples = hit_cols if samples is None else [c for c in samples if c in hit_cols]
+        # kmers without a hits row are zero hits
+        dh = (df[['#kmer', 'gpos']]
+              .merge(df_hits[['#kmer'] + samples], on='#kmer', how='left')
+              .fillna({c: 0 for c in samples}))
+        pos_all = dh['gpos'].to_numpy()
+        cmap = plt.get_cmap(hit_cmap)
+
+        df['_group'] = df['count'].astype(int)               # by_count colouring for the count track
+        handles_cnt = [Patch(facecolor=count_colors[c], label=str(c)) for c in present]
+
+        for smp in samples:
+            h = dh[smp].to_numpy(dtype=np.float64)
+            nz = h > 0
+            hmax = max(2.0, float(np.quantile(h[nz], hit_q))) if nz.any() else 2.0
+            if hit_log:
+                norm = LogNorm(vmin=1, vmax=hmax)
+                yfun = lambda v: np.log10(1 + np.minimum(v, hmax))
+            else:
+                norm = Normalize(vmin=0, vmax=hmax)
+                yfun = lambda v: np.minimum(v, hmax)
+            y_max = float(yfun(np.array(hmax)))
+
+            circos, track_cnt, track_hit = base_circos(with_hits=True)
+            draw_groups(track_cnt, present, count_colors)
+
+            if (~nz).any():                                  # zero-hit kmers: grey baseline
+                track_hit.scatter(pos_all[~nz], np.zeros((~nz).sum()),
+                                  vmin=0, vmax=y_max, s=s, color='lightgrey')
+            if nz.any():
+                order = np.argsort(h[nz], kind='stable')     # high hits drawn on top
+                hv = h[nz][order]
+                track_hit.scatter(pos_all[nz][order], yfun(hv),
+                                  vmin=0, vmax=y_max, s=s,
+                                  c=np.minimum(hv, hmax), cmap=cmap, norm=norm)
+
+            safe = re.sub(r'[^\w.-]', '_', str(smp))
+            save(circos, handles_cnt + [Patch(facecolor='lightgrey', label='0 hits')],
+                 'k-mer count', f'hits.{safe}',
+                 cbar=(norm, cmap, 'hit count' + (' (log)' if hit_log else '')))
 
     return df.drop(columns='_group')
 
@@ -457,13 +517,16 @@ def main():
 
 
     df_hits = pd.read_csv(hits_path, sep = '\t')
+    df_counts = pd.read_csv(counts_path, sep = '\t')
+    
+    # get total evaluated kmers for relative abundance evaluation 
     total_evaluated = df_hits.loc[df_hits['#kmer']=='total_evaluated'].drop(columns='#kmer').T.reset_index()#.to_dict()
     total_evaluated.columns = ['sample', 'total_evaluated']
-    print(total_evaluated)
-
-    df_hits = df_hits.loc[df_hits['#kmer'] !='total_evaluated'].copy()
-    df_counts = pd.read_csv(counts_path, sep = '\t')
     total_evaluated['total_strain_kmers'] = len(df_counts)
+    print(total_evaluated)
+    df_hits = df_hits.loc[df_hits['#kmer'] !='total_evaluated'].copy()
+
+    
     
     # get hit locations and strip terminal kmers
     if args.reference:
@@ -543,11 +606,11 @@ def main():
     print(df_cov_depth.head(5))
 
     if args.figures != 'none':
-        #save a figure
-        basename = 'contig_map'
-        if args.strain:
-            basename = args.strain
-        plot_map(df_loc_counts, args.output_dir, basename, quality = args.figures)
+        if not args.reference:
+            raise SystemExit('--figures requires --reference (kmer locations)')
+        basename = args.strain if args.strain else 'contig_map'
+        plot_map(df_loc_counts, args.output_dir, basename,
+                 df_hits=df_hits, quality=args.figures)
 
 
         

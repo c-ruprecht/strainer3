@@ -163,37 +163,41 @@ def add_block_ids(df, count_cols = ['pangenome_count', 'metagenome_count', 'drug
     return df
 
 #  get per-block coverage/depth; carries the (single) count value of each block
-def call_blocks(df_blocks, df_hits):
-    df_blocks = df_blocks[['#kmer', 'block_id', 'count']].copy()
+def call_blocks(df_blocks, df_hits, counts='count'):
     samples = [c for c in df_hits.columns if c != '#kmer']
+    cols = ['#kmer', 'block_id'] + ([counts] if counts else [])
+    df_blocks = df_blocks[cols].copy()
     block_total = df_blocks.groupby('block_id').size()
- 
-    n_counts = df_blocks.groupby('block_id')['count'].nunique()
-    assert (n_counts == 1).all(), 'blocks must have exactly one count value'
-    block_count = df_blocks.groupby('block_id')['count'].first()
- 
+
+    block_count = None
+    if counts:
+        n_counts = df_blocks.groupby('block_id')[counts].nunique()
+        assert (n_counts == 1).all(), 'blocks must have exactly one count value'
+        block_count = df_blocks.groupby('block_id')[counts].first()
+
     # inner merge: kmers without a hits row are zeros, accounted for via block_total
     df = pd.merge(df_hits, df_blocks[['#kmer', 'block_id']], on='#kmer', how='inner')
- 
     block_hit = ((df[samples] > 0).groupby(df['block_id']).sum()
                  .reindex(block_total.index, fill_value=0))
     block_sum = (df[samples].groupby(df['block_id']).sum()
                  .reindex(block_total.index, fill_value=0))
     del df
- 
+
     block_coverage = block_hit.div(block_total, axis=0).round(4)
     block_depth = block_sum.div(block_total, axis=0).round(2)
- 
+
     df_gpd = pd.concat({'block_hit': block_hit,
                         'block_coverage': block_coverage,
                         'block_depth': block_depth}, axis=1)
     df_gpd = df_gpd.stack(level=-1, future_stack=True).rename_axis(['block_id', 'sample']).reset_index()
     df_gpd['sample'] = df_gpd['sample'].astype('category')
     df_gpd['block_total'] = df_gpd['block_id'].map(block_total)
-    df_gpd['block_count'] = df_gpd['block_id'].map(block_count)
- 
-    return df_gpd[['block_id', 'sample', 'block_count', 'block_hit', 'block_total',
-                   'block_coverage', 'block_depth']]
+
+    out_cols = ['block_id', 'sample', 'block_hit', 'block_total', 'block_coverage', 'block_depth']
+    if block_count is not None:
+        df_gpd['block_count'] = df_gpd['block_id'].map(block_count)
+        out_cols.insert(2, 'block_count')
+    return df_gpd[out_cols]
 
 def get_block_pair_coverage(df_called_blocks):
     # blocks x samples coverage and depth matrices
@@ -249,7 +253,11 @@ def count_weight(count, alpha=1.0):
     """count = number of other genomes carrying the kmer; rarer -> heavier. count 0 -> weight 1"""
     return (1.0 + np.asarray(count, dtype=np.float64)) ** (-alpha)
  
- 
+def get_weighted_coverage(df_hits, df_counts, alpha = 1):
+    
+    df_counts['count_weight'] = df_counts['count']
+    return df
+
 def get_block_weighted_coverage(df_called_blocks, alpha=1.0, size_weight=False):
     """
     Weighted mean over all block pairs, weight of a pair = w_a * w_b,
@@ -555,6 +563,8 @@ def zero_inflate_poisson(df_hits):
     out = out.reset_index(names=['sample'])
     return out
 
+
+
 def main():
     # to do, basename + strain name addition
     parser = argparse.ArgumentParser(description='Calcualting coverage and depth with kmer locations')
@@ -608,11 +618,17 @@ def main():
     if args.reference:
         df_loc_counts = pd.merge(df_loc_counts, df_cnt_uni[['#kmer', 'rare_count']], on='#kmer', how='left')
         df_loc_counts.set_index('#kmer').to_csv(os.path.join(outpath, "kmer_locations.tsv"), sep='\t')
+        df_blocks = call_blocks(df_hits= df_hits, df_blocks=df_loc_counts, counts = None)
+        df_blocks.to_csv(os.path.join(outpath, "blocks.tsv"), sep='\t')
 
     # get theoretical 0 counts using poisson of non 0s
     df_non0 = zero_inflate_poisson(df_hits)
-    print(df_non0)
-    df_cov_depth = df_cov_depth.merge(df_non0, on='sample', how='left')
+    df_blocks_gpd = df_blocks.groupby('sample').agg(**{'block_count': ('block_id', 'count'),
+                                                       '0_cov_blocks': ('block_coverage', lambda x: sum(x==0))})
+ 
+
+    df_cov_depth = (df_cov_depth.merge(df_non0, on='sample', how='left')
+                    .merge(df_blocks_gpd, on='sample', how='left'))
 
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')

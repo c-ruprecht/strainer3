@@ -68,7 +68,8 @@ rule kmer_filter:
         -s {input} \
         -O {params.outdir} \
         -n {wildcards.strain} \
-        -m 0.01
+        -m 0.01 \
+        --keep_equal_rare 
         """
 
 
@@ -111,7 +112,7 @@ rule strain_detect:
         STRAINDIR + '/{strain}/strain_detect/{strain}.kmer_hits.tsv.gz'
     params:
         outdir = lambda wc: f"{STRAINDIR}/{wc.strain}/strain_detect"
-    threads: 4
+    threads: 6
     shell:
         '''
         ../src/kmer_strain_detect \
@@ -126,19 +127,21 @@ rule strain_detect:
 rule coverage_depth:
     input:
         counts = STRAINDIR + '/{strain}/scrub/{strain}.global_counts.tsv.zst',
-        hits = STRAINDIR + '/{strain}/strain_detect/{strain}.kmer_hits.tsv.gz'
+        hits = STRAINDIR + '/{strain}/strain_detect/{strain}.kmer_hits.tsv.gz',
+        strain_path = lambda wc: dict_strains[wc.strain]
     output:
         STRAINDIR + '/{strain}/coverage/coverage_depth.tsv'
     params:
         outdir = lambda wc: f"{STRAINDIR}/{wc.strain}/coverage"
-    threads: 1
+    threads: 10
     shell:
         """
         conda run -n strainer3_env python ../scripts/coverage_depth.py \
         --counts {input.counts} \
         --hits {input.hits} \
         --strain {wildcards.strain} \
-        --output_dir {params.outdir}
+        --output_dir {params.outdir} \
+        --reference {input.strain_path} 
         """
 
 
@@ -155,5 +158,6 @@ rule hit_call:
         """
         conda run -n strainer3_env python ../scripts/hit_call.py \
         --coverage_dir {params.covdir} \
-        --output_dir {params.outdir}
+        --output_dir {params.outdir} \
+        --verbose
         """

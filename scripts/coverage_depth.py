@@ -538,7 +538,7 @@ def zero_inflate_poisson(df_hits):
     out = pd.DataFrame({'obs_0_cnts': total - hits ,
                         'coverage': (df > 0).sum(axis=0)/len((df > 0)),
                         'depth_pos': df[df > 0].mean(axis=0),
-                                })
+                        })
     
     out['lambda_ztp'] = out['depth_pos'].apply(ztp_lambda)
     p0 = np.exp(-out['lambda_ztp'])
@@ -550,6 +550,8 @@ def zero_inflate_poisson(df_hits):
 
     out['excess_0'] = out['obs_0_cnts'] - out['exp_0_cnts']     # structurally absent k-mers
     out['frac_absent'] = (out['excess_0'] / total).clip(lower=0) 
+    out['zi_index'] = out['excess_0'] / out['obs_0_cnts']              # share of zeros that are structural
+    out['zero_ratio'] = out['obs_0_cnts'] / out['exp_0_cnts']          # obs/exp zeros; 1 = pure Poisson
     out = out.reset_index(names=['sample'])
     return out
 
@@ -615,7 +617,8 @@ def main():
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
     df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
-    
+    df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+
 
     # Exports and figures
     if args.strain:

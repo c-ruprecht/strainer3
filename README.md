@@ -14,6 +14,12 @@ make
 cd ../
 conda env create -f strainer3_env.yml
 ````
+If you are having issues with kalaiedo try
+````bash
+conda activate strainer3_env.yml
+plotly_get_chrome -y
+````
+
 
 
 ## Run tests

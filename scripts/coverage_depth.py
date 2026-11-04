@@ -68,13 +68,12 @@ def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
                                 'depth_all_kmers': round(df.mean(axis=0),2),
                             })
 
-
-    max_count = int(df_counts['count'].max())
-    for t in range(0, max_count + 1):
+    max_t = 1
+    for t in range(0, max_t + 1):
         df_counts_uni = df_counts.loc[df_counts['count'] <= t].copy()
-        rare_count = '==0' if t == 0 else f'<={t}'
         if len(df_counts_uni) >= rare_t:
             break
+    rare_count = '==0' if t == 0 else f'<={t}'
     df_counts_uni['rare_count'] = rare_count
 
     df_unique = df_hits.loc[df_hits['#kmer'].isin(df_counts_uni['#kmer'])].set_index('#kmer')
@@ -254,7 +253,7 @@ def count_weight(count, alpha=1.0):
     return (1.0 + np.asarray(count, dtype=np.float64)) ** (-alpha)
  
 def get_weighted_coverage(df_hits, df_counts, alpha = 1):
-    
+
     df_counts['count_weight'] = df_counts['count']
     return df
 

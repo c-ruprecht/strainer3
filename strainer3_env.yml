@@ -19,7 +19,8 @@ dependencies:
   - pyahocorasick
   - pyrodigal
   - plotly
-  - python-kaleido=0.2.1
+  #- python-kaleido=0.2.1
+  - python-kaleido
   - nbformat
   - seaborn
   - pycirclize

@@ -24,8 +24,9 @@ echo 'STEP2: keeping the 1% most rare kmers in the target genome'
 conda run -n strainer3_env python ../scripts/kmer_scrub_filter.py \
 -s output/scrub/D6331_Faecalibacterium_prausnitzii.global_counts.tsv.zst \
 -O output/filter \
--n D6331_Faecalibacterium_prausnitzii
--m 0.01 
+-n D6331_Faecalibacterium_prausnitzii \
+-m 0.01 \
+--keep_equal_rare
 echo 'STEP2: complete'
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP3 '; printf '%*s\n' 20 '' | tr ' ' '='
@@ -42,7 +43,7 @@ echo 'sample 2 d6331 - positive'
 ../src/kmer_metagenome_db -m sample \
 -O output/target_samples_kmdb \
 -n D6331 \
--i target_metagenomes/D6331-231101-C4_R1_001.fastq.downsampled.gz,target_metagenomes/D6331-231101-C4_R2_001.fastq.downsampled.gz
+-i target_metagenomes/D6331-231101-C4_R1_001.fastq.downsampled.gz,target_metagenomes/D6331-231101-C4_R2_001.fastq.downsampled.gz \
 
 echo 'STEP3 - DONE'
 
@@ -67,7 +68,8 @@ conda run -n strainer3_env python ../scripts/coverage_depth.py \
 --hits output/strain_detect/D6331_Faecalibacterium_prausnitzii.kmer_hits.tsv.gz \
 --strain D6331_Faecalibacterium_prausnitzii \
 --output_dir output/coverage \
---reference D6331_genomes/D6331_Faecalibacterium_prausnitzii.fasta.gz 
+--reference D6331_genomes/D6331_Faecalibacterium_prausnitzii.fasta.gz \
+--figures 'png'
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP6 '; printf '%*s\n' 20 '' | tr ' ' '='
 echo 'STEP6: Call hits'

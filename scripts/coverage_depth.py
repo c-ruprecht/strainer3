@@ -15,6 +15,8 @@ from scipy.stats import poisson
 import re
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.cm import ScalarMappable
+from scipy.optimize import brentq
+
 
 
 def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
@@ -144,13 +146,19 @@ def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
     return df, dict_len
 
 # get kmer blocks: a new block starts at a new contig, a position gap, or a change in count
+# get kmer blocks: a new block starts at a new contig, a position gap, or (if count_cols is given) a change in count
 def add_block_ids(df, count_cols = ['pangenome_count', 'metagenome_count', 'drug_count']):
     df = df.sort_values(['contig_id', 'kmer_position']).copy()
-    df['count'] = df[count_cols].sum(axis=1)
+
     new_contig = df['contig_id'].ne(df['contig_id'].shift())
-    pos_break = df.groupby('contig_id')['kmer_position'].diff().ne(1)
-    cnt_break = df['count'].ne(df['count'].shift())
-    df['block_id'] = (new_contig | pos_break | cnt_break).cumsum()      # starts at 1
+    pos_break  = df.groupby('contig_id')['kmer_position'].diff().ne(1)
+    brk = new_contig | pos_break
+
+    if count_cols:
+        df['count'] = df[count_cols].sum(axis=1)
+        brk = brk | df['count'].ne(df['count'].shift())
+
+    df['block_id'] = brk.cumsum()                                         # starts at 1
     df['block_size'] = df.groupby('block_id')['block_id'].transform('size')
     return df
 
@@ -363,10 +371,16 @@ def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=
     df['gpos'] = df['kmer_position'] + df['offset']
     df = df.sort_values('gpos').reset_index(drop=True)
 
+    # positional blocks (no count break), as extents on the concatenated genome axis
+    blk = add_block_ids(df[['contig_id', 'kmer_position', 'gpos']], count_cols=None)
+    blocks = blk.groupby('block_id')['gpos'].agg(start='min', end='max').sort_index()
+    blocks['end'] = blocks['end'] + 1                         # a block of n kmers spans n positions
+
     ymax = max(ymax_min, int(df['count'].max()))
 
     def base_circos(with_hits=False):
-        r_ctg, r_cnt, r_hit = ((88, 92), (64, 84), (36, 58)) if with_hits else ((78, 82), (55, 75), None)
+        r_ctg, r_cnt, r_blk, r_hit = (((90, 94), (68, 86), (62, 66), (36, 58)) if with_hits
+                                      else ((78, 82), (55, 75), None, None))
         circos = Circos({'genome': genome_len}, start=0, end=360)
         sector = circos.sectors[0]
         track_ctg = sector.add_track(r_ctg)
@@ -376,6 +390,9 @@ def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=
         track_cnt.axis()
         track_hit = None
         if with_hits:
+            track_blk = sector.add_track(r_blk)
+            for i, (st, en) in enumerate(zip(blocks['start'], blocks['end'])):
+                track_blk.rect(st, en, fc='grey' if i % 2 else 'lightgrey', ec='none')
             track_hit = sector.add_track(r_hit, r_pad_ratio=0.1)
             track_hit.axis()
         return circos, track_cnt, track_hit
@@ -443,7 +460,7 @@ def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=
     draw_groups(track, groups3, colors3)
     save(circos, handles3, 'k-mer class', 'rare_terminal')
 
-        # ---------- 4) per sample: count track (by_count) + hits track (colour = hit count) ----------
+    # ---------- 4) per sample: count track (by_count) + block track + hits track (colour = hit count) ----------
     if df_hits is not None:
         hit_cols = [c for c in df_hits.columns if c != '#kmer']
         samples = hit_cols if samples is None else [c for c in samples if c in hit_cols]
@@ -489,6 +506,52 @@ def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=
 
     return df.drop(columns='_group')
 
+def plot_hit_distribution(df_hits, outdir, prefix, samples=None, quality='both'):
+    """One histogram of k-mer hit counts per sample."""
+    df = df_hits.set_index('#kmer') if '#kmer' in df_hits.columns else df_hits
+    samples = list(df.columns) if samples is None else [s for s in samples if s in df.columns]
+
+    paths = []
+    for smp in samples:
+        fig = px.histogram(df[smp], width=800, template='simple_white',
+                           title=f'{prefix} | {smp}')
+        safe = re.sub(r'[^\w.-]', '_', str(smp))
+        base = os.path.join(outdir, f'{prefix}.hit_distribution.{safe}')
+        for fmt in (['svg', 'png'] if quality == 'both' else [quality]):
+            path = f'{base}.{fmt}'
+            fig.write_image(path, scale=2 if fmt == 'png' else None)
+            print(f'saved {path}')
+            paths.append(path)
+    return paths
+
+def ztp_lambda(m_pos):
+    """MLE of λ for a zero-truncated Poisson with mean m_pos."""
+    if not np.isfinite(m_pos) or m_pos <= 1:
+        return 0.0            # all positives are 1s → λ → 0
+    return brentq(lambda l: l / (1 - np.exp(-l)) - m_pos, 1e-9, m_pos)
+
+def zero_inflate_poisson(df_hits):
+    df = df_hits.set_index('#kmer')
+    hits = (df > 0).sum(axis=0)
+    total = len(df)
+    
+    out = pd.DataFrame({'obs_0_cnts': total - hits ,
+                        'coverage': (df > 0).sum(axis=0)/len((df > 0)),
+                        'depth_pos': df[df > 0].mean(axis=0),
+                                })
+    
+    out['lambda_ztp'] = out['depth_pos'].apply(ztp_lambda)
+    p0 = np.exp(-out['lambda_ztp'])
+
+    # Zeros expected among the k-mers that are actually present
+    exp0 = (hits * p0 / (1 - p0)).replace([np.inf, -np.inf], np.nan)
+    out['exp_0_cnts'] = exp0.round().astype('Int64')    # Coverage expected if every k-mer were present
+    out['exp_coverage'] = 1 - p0
+
+    out['excess_0'] = out['obs_0_cnts'] - out['exp_0_cnts']     # structurally absent k-mers
+    out['frac_absent'] = (out['excess_0'] / total).clip(lower=0) 
+    out = out.reset_index(names=['sample'])
+    return out
 
 def main():
     # to do, basename + strain name addition
@@ -498,15 +561,8 @@ def main():
     parser.add_argument('--output_dir', help='directory where output is saved')
     parser.add_argument('--strain', help = 'add a name for the target strain you are tracking')
     parser.add_argument('--reference', '-r', help = 'Path to reference file of a strain. Can be used to map kmers to locations')
-    parser.add_argument('--terminal_dist', type = int, default = 300, help = 'distance from end of contig. Kmers within that range will be dropped')
+    parser.add_argument('--terminal_dist', type = int, default = 0, help = 'distance from end of contig. Kmers within that range will be dropped')
     parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
-    #parser.add_argument('--weight_alpha', type=float, default=0 ,help='block weight = (1 + count)^-alpha; higher favours rare blocks more')
-    #parser.add_argument('--size_weight', action='store_true', help='also multiply block weight by kmers per block')
-    #parser.add_argument('--depth_beta', type=float, default= 0,
-     #                                   help='depth weight = max(r,1)^-beta, r = (block_depth+pseudo)/(rare_depth+pseudo)')
-    #parser.add_argument('--depth_mode', choices=['over', 'both'], default='over',
-    #                                    help="'over' penalises only depth above the rare baseline")
-    #parser.add_argument('--depth_pseudo', type=float, default=1.0, help='pseudocount for the depth ratio')
     parser.add_argument('--figures', choices=['png','svg', 'both','none'], default='none', help = 'Change to svg, png or both if you want figures to be saved.')
     
     args = parser.parse_args()
@@ -537,8 +593,9 @@ def main():
         df_internal = df_locs.loc[df_locs['label']=='internal']
         df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
         df_loc_counts = pd.merge(df_internal, df_counts, on='#kmer', how='inner')
-        # add block ids don't drop anything
-        df_loc_counts = add_block_ids(df_loc_counts)
+        
+        # add block ids don't drop anything, blocks are only split by position
+        df_loc_counts = add_block_ids(df_loc_counts, count_cols= None)
         print(df_loc_counts)
         
     
@@ -550,55 +607,17 @@ def main():
         df_loc_counts = pd.merge(df_loc_counts, df_cnt_uni[['#kmer', 'rare_count']], on='#kmer', how='left')
         df_loc_counts.set_index('#kmer').to_csv(os.path.join(outpath, "kmer_locations.tsv"), sep='\t')
 
-        ### block calls for all kmers (rare blocks are a subset: blocks never mix rare and non-rare)
-        #df_blk_call_all = call_blocks(df_blocks=df_loc_counts, df_hits=df_hits)
-        #rare_blocks = df_loc_counts.loc[df_loc_counts['rare_count'].notna(), 'block_id'].unique()
-        #df_blk_call_all['rare_block'] = df_blk_call_all['block_id'].isin(rare_blocks)
-        #df_blk_call_all.set_index(['sample', 'block_id']).to_csv(os.path.join(outpath, "block_calls.tsv"), sep='\t')
+    # get theoretical 0 counts using poisson of non 0s
+    df_non0 = zero_inflate_poisson(df_hits)
+    print(df_non0)
+    df_cov_depth = df_cov_depth.merge(df_non0, on='sample', how='left')
 
-        #df_blk_call_rare = df_blk_call_all.loc[df_blk_call_all['rare_block']]
-
-        #df_blk_cov_w_all = get_block_weighted_coverage(df_blk_call_all, alpha=args.weight_alpha,
-         #                                              size_weight=args.size_weight)
-        #df_blk_cov_w_rare = get_block_weighted_coverage(df_blk_call_rare, alpha=args.weight_alpha,
-          #                                              size_weight=args.size_weight)
-        # depth based weights
-        #baseline = df_cov_depth.set_index('sample')['depth_rare_kmers']
-        #df_blk_cov_dw = get_block_depth_weighted_coverage(df_blk_call_all, baseline,
-        #                                                  beta=args.depth_beta, alpha=args.weight_alpha,
-        #                                                  mode=args.depth_mode, pseudo=args.depth_pseudo,
-        #                                                  size_weight=args.size_weight)
-
-        #df_cov_depth = (df_cov_depth
-                        #.merge(df_blk_cov_w_all.set_index('sample').add_prefix('all_').reset_index(),
-                        #       on='sample', how='left')
-        #                .merge(df_blk_cov_w_rare.set_index('sample').add_prefix('rare_').reset_index(),
-        #                       on='sample', how='left')
-        #                .merge(df_blk_cov_dw, on='sample', how='left'))
-        
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-
-    r = 1.1        # dispersion; calibrate on samples where you know the truth, see below
-    df_cov_depth['nb_depth'] = nb_depth(df_cov_depth['coverage_all_kmers'], r)
-
     df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
     
-    # robust depth per sample: trims a high-depth kmer subset and removes an assembly zero floor
-    samples = [c for c in df_hits.columns if c != '#kmer']
-    df_hits_rare = df_hits.loc[df_hits['#kmer'].isin(df_cnt_uni['#kmer'])]
-    print(f'Robust depth on {len(df_hits_rare)} rare kmers ({df_cnt_uni["rare_count"].iloc[0]})')
 
-    df_robust = pd.DataFrame([{'sample': s, **robust_depth(df_hits_rare[s].to_numpy())}
-                              for s in samples])
-    df_robust = (df_robust.drop(columns='lam_mean')          # duplicates depth_rare_kmers
-                          .rename(columns={'depth_robust': 'depth_robust_rare',
-                                           'cov_kept':     'cov_kept_rare',
-                                           'frac_trimmed': 'frac_trimmed_rare',
-                                           'thr':          'robust_thr_rare'})
-                          .round(4))
-    df_cov_depth = df_cov_depth.merge(df_robust, on='sample', how='left')
-
+    # Exports and figures
     if args.strain:
         df_cov_depth['strain'] = args.strain 
     df_cov_depth.set_index(['strain', 'sample']).round(4).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
@@ -607,10 +626,11 @@ def main():
 
     if args.figures != 'none':
         if not args.reference:
-            raise SystemExit('--figures requires --reference (kmer locations)')
+            plot_hit_distribution(df_hits, args.output_dir, basename, quality=args.figures)
         basename = args.strain if args.strain else 'contig_map'
         plot_map(df_loc_counts, args.output_dir, basename,
                  df_hits=df_hits, quality=args.figures)
+        plot_hit_distribution(df_hits, args.output_dir, basename, quality=args.figures)
 
 
         

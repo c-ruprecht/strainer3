@@ -7,7 +7,7 @@ import re
 import io
 import subprocess
 import os
-
+import pandas as pd
 
 def open_counts(path):
     """Open a kmer_scrub_count(_individual) table as text.
@@ -24,30 +24,6 @@ def open_counts(path):
         return gzip.open(path, 'rt')
     return open(path)
 
-parser = argparse.ArgumentParser(description = "\
-DESCRIPTION: Script will take as input the output from the program kmer_scrub_count \n\
-that lists every kmer in a strain of interest and the frequency of that kmer in a \n\
-set of pangenomes and a set of metagenomes.\n\
-With this program we then filter the set of kmers for the strain to select those that are most informative\n\
-")
-
-# the input file
-parser.add_argument("--scrub_count_file", "-s", help = "This is the input file \
-with the kmer counts to the pangenome and metagenomes", required = False)
-
-parser.add_argument("--scrub_count_list", "-l", help = "A text file containing \
-a list of input files containing kmer counts", required = False)
-
-parser.add_argument("--min_fraction", "-m", help = "The minimum fraction of  \
-kmers to keep (so don't scrub everything); default 0.04; range (0.0-1.0)", required = False, default = 0.04, type=float)
-
-parser.add_argument("--independent", "-i", help = "Independently  \
-scrub metagenome and pangenome (without this flag, it scrubs them together so there is definitely -m min_fraction left)", action='store_true')
-
-parser.add_argument("--output_dir", "-O", help = "Output directory for scrubbed kmer file", required= True)
-parser.add_argument("--basename", '-n', help= "Rename filename")
-
-args = parser.parse_args()
 
 def scrub_max_kmers(min_frac_to_keep, kmer_hash, total_kmers):
     min_kmer_count = -1
@@ -158,9 +134,57 @@ def joint_scrub(min_fraction, pangenome_hash, metagenome_hash, strain_hash, all_
 
     return strain_hash
    
+def get_lowest_percentile(df, percentile=0.01, drug_scrub='count_hard'):
 
+    if df['drug_count'].isna().all():
+        print('No drug counts found, continuing without drugscrub')
+        df['drug_count'] = 0
+
+    if drug_scrub == 'percentile':
+        lowest = df[
+            (df['reference_count'] <= df['reference_count'].quantile(percentile)) &
+            (df['pangenome_count'] <= df['pangenome_count'].quantile(percentile)) &
+            (df['metagenome_count'] <= df['metagenome_count'].quantile(percentile)) &
+            (df['drug_count'] <= df['drug_count'].quantile(percentile))
+        ].copy()
+
+    if drug_scrub == 'count_hard':
+        lowest = df[
+            (df['reference_count'] <= df['reference_count'].quantile(percentile)) &
+            (df['pangenome_count'] <= df['pangenome_count'].quantile(percentile)) &
+            (df['metagenome_count'] <= df['metagenome_count'].quantile(percentile)) &
+            (df['drug_count'] == 0)
+        ].copy()
+    return lowest
 
 def main():
+
+    parser = argparse.ArgumentParser(description = "\
+    DESCRIPTION: Script will take as input the output from the program kmer_scrub_count \n\
+    that lists every kmer in a strain of interest and the frequency of that kmer in a \n\
+    set of pangenomes and a set of metagenomes.\n\
+    With this program we then filter the set of kmers for the strain to select those that are most informative\n\
+    ")
+
+    # the input file
+    parser.add_argument("--scrub_count_file", "-s", help = "This is the input file \
+    with the kmer counts to the pangenome and metagenomes", required = False)
+
+    parser.add_argument("--scrub_count_list", "-l", help = "A text file containing \
+    a list of input files containing kmer counts", required = False)
+
+    parser.add_argument("--min_fraction", "-m", help = "The minimum fraction of  \
+    kmers to keep (so don't scrub everything); default 0.04; range (0.0-1.0)", required = False, default = 0.04, type=float)
+
+    parser.add_argument("--independent", "-i", help = "Independently  \
+    scrub metagenome and pangenome (without this flag, it scrubs them together so there is definitely -m min_fraction left)", action='store_true')
+
+    parser.add_argument("--output_dir", "-O", help = "Output directory for scrubbed kmer file", required= True)
+    parser.add_argument("--basename", '-n', help= "Rename filename")
+    parser.add_argument("--keep_equal_rare", action='store_true' ,help = 'keeps all kmers that have the same count as the rarest percentile, \
+                        this can lead to larger kmer counts with bad scrubs')
+
+    args = parser.parse_args()
     if args.min_fraction < 0.0 or args.min_fraction > 1.0:
         sys.stderr.write("error --min_fraction (-m) must be between 0.0 and 1.0 (" + str(args.min_fraction) + ")\n")
     if not args.scrub_count_file and not args.scrub_count_list:
@@ -168,84 +192,89 @@ def main():
     if args.scrub_count_file and args.scrub_count_list:
         sys.stderr.write("error: can provide only one of either scrub_count_file or scrub_count_list.")
     
-    
-    scrub_count_files = []
-    if args.scrub_count_file:
-        scrub_count_files.append(args.scrub_count_file)
-    elif args.scrub_count_list:
-        with open(args.scrub_count_list) as file:
-            for line in file:
-                scrub_count_files.append(line.rstrip())
-
-    strain_hash = {} # n times kmer detected in self genome
-    metagenome_hash = {} # n times kmer detected in any scrub metagenome
-    pangenome_hash = {} # n times kmer detected in any scrub genome
-    drug_genome_hash = {} # n times kmer detected in non-self consortia genomes
-    drug_filter = 0 
-    all_kmers = 0
-
-    for i, file in enumerate(scrub_count_files):
-        # strain_hash and all_kmers should be the same across all files being
-        # combined and should not be added up across files
-
-        if i > 0:
-            previous_strain_hash = strain_hash
-
-        strain_hash = {} # reset to 0
-        all_kmers = 0 # reset to 0
-
-        with open_counts(file) as reader:
-            for line in reader:
-                if(not line.startswith('#')): # use # at the beginning to have comments and things
-                    content = line.rstrip('\n').split('\t')
-                    key = content[0]
-                    all_kmers += 1
-                    content[1] = int(content[1])
-                    content[2] = int(content[2])
-                    content[3] = int(content[3])
-                    strain_hash[key] = content[1]
-                    
-    
-                    if (content[2] > 0):
-                        pangenome_hash[key] = pangenome_hash.get(key, 0) + content[2]
-                    if (content[3] > 0):
-                        metagenome_hash[key] = metagenome_hash.get(key, 0) + content[3]
-    
-                    if (len(content) == 5):
-                        drug_filter = 1
-                        content[4] = int(content[4])        
-                        if (content[4] > 0):
-                            drug_genome_hash[key] = drug_genome_hash.get(key, 0) + content[4]
-                    #strain_hash[key] = content[1]
-                    #print("A:" + content[0] + " B:" + content[1] + " C:" + content[2])
-
-        if i > 0:
-            if strain_hash != previous_strain_hash:
-                sys.exit("error: input files do not have identical hash and strain hash values.")
-
-
-    print("#total kmers in strain:" + str(all_kmers) + "," + str(len(strain_hash)) + " pangenome: " + str(len(pangenome_hash)) + " metagenome: " + str(len(metagenome_hash)))
-
-
-    drug_scrubbed = 0 # how many kmers are scrubbed because they overlap between strains in the same drug
-    if (drug_filter): 
-        print("#total kmers cross drug:" + str(len(drug_genome_hash)))
-        strain_hash = drug_scrub(drug_genome_hash, strain_hash, all_kmers)
-        fraction_kmer_remaining_post_drug_scrub = float(len(strain_hash)/float(all_kmers));
-        drug_scrubbed = all_kmers - len(strain_hash)
-        print("#fraction kmers remaining drug post scrub:" + str(fraction_kmer_remaining_post_drug_scrub))
-        print("#drug_scrubbed kmers:" + str(drug_scrubbed))
-
-        # don't go on if not enough kmers left after the drug scrub
-        if (fraction_kmer_remaining_post_drug_scrub < args.min_fraction * 2):
-            raise Exception('ERROR: too few kmers remain after drug scrub. Are your drug strains too similar?')
-
-    
-
-    if args.independent:
-        strain_hash_scrubbed = independent_scrub(args.min_fraction, pangenome_hash, metagenome_hash, strain_hash, all_kmers)
+    if args.keep_equal_rare:
+        df_scrub = pd.read_csv(args.scrub_count_file, sep = '\t')
+        df_perc = get_lowest_percentile(df_scrub, percentile = args.min_fraction, drug_scrub= 'count_hard')
+        all_kmers = len(df_scrub)                                    
+        strain_hash_scrubbed = dict.fromkeys(df_perc['#kmer'])      
     else:
-        strain_hash_scrubbed = joint_scrub(args.min_fraction, pangenome_hash, metagenome_hash, strain_hash, all_kmers, drug_scrubbed) 
+        scrub_count_files = []
+        if args.scrub_count_file:
+            scrub_count_files.append(args.scrub_count_file)
+        elif args.scrub_count_list:
+            with open(args.scrub_count_list) as file:
+                for line in file:
+                    scrub_count_files.append(line.rstrip())
+
+        strain_hash = {} # n times kmer detected in self genome
+        metagenome_hash = {} # n times kmer detected in any scrub metagenome
+        pangenome_hash = {} # n times kmer detected in any scrub genome
+        drug_genome_hash = {} # n times kmer detected in non-self consortia genomes
+        drug_filter = 0 
+        all_kmers = 0
+
+        for i, file in enumerate(scrub_count_files):
+            # strain_hash and all_kmers should be the same across all files being
+            # combined and should not be added up across files
+
+            if i > 0:
+                previous_strain_hash = strain_hash
+
+            strain_hash = {} # reset to 0
+            all_kmers = 0 # reset to 0
+
+            with open_counts(file) as reader:
+                for line in reader:
+                    if(not line.startswith('#')): # use # at the beginning to have comments and things
+                        content = line.rstrip('\n').split('\t')
+                        key = content[0]
+                        all_kmers += 1
+                        content[1] = int(content[1])
+                        content[2] = int(content[2])
+                        content[3] = int(content[3])
+                        strain_hash[key] = content[1]
+                        
+        
+                        if (content[2] > 0):
+                            pangenome_hash[key] = pangenome_hash.get(key, 0) + content[2]
+                        if (content[3] > 0):
+                            metagenome_hash[key] = metagenome_hash.get(key, 0) + content[3]
+        
+                        if (len(content) == 5):
+                            drug_filter = 1
+                            content[4] = int(content[4])        
+                            if (content[4] > 0):
+                                drug_genome_hash[key] = drug_genome_hash.get(key, 0) + content[4]
+                        #strain_hash[key] = content[1]
+                        #print("A:" + content[0] + " B:" + content[1] + " C:" + content[2])
+
+            if i > 0:
+                if strain_hash != previous_strain_hash:
+                    sys.exit("error: input files do not have identical hash and strain hash values.")
+
+
+        print("#total kmers in strain:" + str(all_kmers) + "," + str(len(strain_hash)) + " pangenome: " + str(len(pangenome_hash)) + " metagenome: " + str(len(metagenome_hash)))
+
+
+        drug_scrubbed = 0 # how many kmers are scrubbed because they overlap between strains in the same drug
+        if (drug_filter): 
+            print("#total kmers cross drug:" + str(len(drug_genome_hash)))
+            strain_hash = drug_scrub(drug_genome_hash, strain_hash, all_kmers)
+            fraction_kmer_remaining_post_drug_scrub = float(len(strain_hash)/float(all_kmers));
+            drug_scrubbed = all_kmers - len(strain_hash)
+            print("#fraction kmers remaining drug post scrub:" + str(fraction_kmer_remaining_post_drug_scrub))
+            print("#drug_scrubbed kmers:" + str(drug_scrubbed))
+
+            # don't go on if not enough kmers left after the drug scrub
+            if (fraction_kmer_remaining_post_drug_scrub < args.min_fraction * 2):
+                raise Exception('ERROR: too few kmers remain after drug scrub. Are your drug strains too similar?')
+
+        
+
+        if args.independent:
+            strain_hash_scrubbed = independent_scrub(args.min_fraction, pangenome_hash, metagenome_hash, strain_hash, all_kmers)
+        else:
+            strain_hash_scrubbed = joint_scrub(args.min_fraction, pangenome_hash, metagenome_hash, strain_hash, all_kmers, drug_scrubbed) 
 
 
     print("#post scrub kmers " + str(len(strain_hash_scrubbed)) + " out of " + str(all_kmers))

@@ -743,10 +743,10 @@ def main():
 
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-    #df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
-    #df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
-
-
+    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+    df_cov_depth['relative_abundance_zroball'] = round((df_cov_depth['zroball_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
+    df_cov_depth['relative_abundance_zrobrare'] = round((df_cov_depth['zrobrare_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
+    
     # Exports and figures
     if args.strain:
         df_cov_depth['strain'] = args.strain 

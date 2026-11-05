@@ -228,6 +228,84 @@ def zero_inflate_robust(df_hits, q=0.99, min_pos=10):
     out = out.reset_index(names=['sample'])
     return out
 
+def kmer_gc(kmers):
+    """GC fraction per kmer, straight from the kmer string"""
+    s = pd.Series(kmers, dtype='string').str.upper()
+    return ((s.str.count('G') + s.str.count('C')) / s.str.len()).to_numpy(dtype=np.float64)
+
+def gc_stratified_0_inflation(df_hits, n_bins=4, min_pos=10):
+    """
+    Zero inflation corrected for GC bias: kmers are split into GC quantile bins (per strain), depth (robust lambda)
+    and expected zeros are estimated per bin and summed. A strain whose high-GC kmers are under-covered is then not
+    mistaken for a partially absent strain.
+    gc_frac_absent : structurally absent kmers after GC correction
+    gc_depth_slope : change in log robust depth per 10% GC (sequencing GC bias for this strain x sample)
+    gc_depth_cv    : spread of robust depth across GC bins (0 = no GC bias)
+    """
+    df = df_hits.set_index('#kmer')
+    gc = kmer_gc(df.index)
+    edges = np.unique(np.quantile(gc, np.linspace(0, 1, n_bins + 1)))
+    bins = np.clip(np.searchsorted(edges, gc, side='right') - 1, 0, len(edges) - 2)
+    gc_bin = np.array([gc[bins == b].mean() for b in range(len(edges) - 1)])
+
+    rows = {}
+    for smp in df.columns:
+        x = df[smp].to_numpy()
+        total, obs_0 = len(x), (x == 0).sum()
+        lam_b, exp0_b, n_b = [], [], []
+        for b in range(len(edges) - 1):
+            r = robust_0_inflation(x[bins == b], min_pos=min_pos)
+            lam_b.append(r['lambda']); exp0_b.append(r['exp_0_cnts']); n_b.append((bins == b).sum())
+        lam_b, exp0_b, n_b = np.array(lam_b, float), np.array(exp0_b, float), np.array(n_b)
+        ok = np.isfinite(lam_b) & (lam_b > 0) & np.isfinite(exp0_b)
+        if ok.sum() == len(lam_b):                       # every GC bin has a usable depth estimate
+            gc_fa = np.clip((obs_0 - exp0_b.sum()) / total, 0, 1)
+        else:
+            gc_fa = np.nan
+        if ok.sum() >= 2:
+            slope = np.polyfit(gc_bin[ok], np.log(lam_b[ok]), 1, w=np.sqrt(n_b[ok]))[0] * 0.1
+            cv = np.std(lam_b[ok]) / np.mean(lam_b[ok])
+        else:
+            slope, cv = np.nan, np.nan
+        rows[smp] = {'gc_frac_absent': gc_fa, 'gc_depth_slope': slope, 'gc_depth_cv': cv}
+    out = pd.DataFrame.from_dict(rows, orient='index').reset_index(names=['sample'])
+    return out
+
+def window_evenness(df_loc, df_hits, window=200):
+    """
+    Spatial patchiness along the genome. Mapped kmers are cut into windows of `window` consecutive kmers per contig.
+    A present strain is covered evenly, a relative leaves whole regions uncovered (zeros cluster in windows).
+    zero_window_frac     : fraction of windows with zero coverage
+    window_cov_dispersion: variance of window coverage / variance expected if kmers were hit independently (1 = even)
+    window_depth_cv      : coefficient of variation of window depth
+    """
+    samples = [c for c in df_hits.columns if c != '#kmer']
+    loc = df_loc[['#kmer', 'contig_id', 'kmer_position']].sort_values(['contig_id', 'kmer_position']).copy()
+    loc['window'] = loc.groupby('contig_id').cumcount() // window
+    loc['window'] = loc['contig_id'].astype(str) + '_' + loc['window'].astype(str)
+    df = loc.merge(df_hits, on='#kmer', how='left').fillna({s: 0 for s in samples})
+    n_win = df.groupby('window').size()
+    df = df.loc[df['window'].map(n_win) >= window // 2]          # drop short contig-end windows
+    g = df.groupby('window')
+    n = g.size().to_numpy(float)
+    cov = (df[samples] > 0).groupby(df['window']).mean()
+    dep = df[samples].groupby(df['window']).mean()
+    rows = {}
+    for smp in samples:
+        c, d = cov[smp].to_numpy(float), dep[smp].to_numpy(float)
+        p = np.average(c, weights=n)
+        var_exp = np.average(p * (1 - p) / n, weights=n)
+        var_obs = np.average((c - p) ** 2, weights=n)
+        if var_exp > 0:
+            disp = var_obs / var_exp
+        else:                                                    # coverage 0 or 1 everywhere: perfectly even
+            disp = 1.0 if var_obs < 1e-12 else np.nan
+        rows[smp] = {'zero_window_frac': (c == 0).mean() if len(c) else np.nan,
+                     'window_cov_dispersion': disp,
+                     'window_depth_cv': d.std() / d.mean() if d.mean() > 0 else np.nan}
+    out = pd.DataFrame.from_dict(rows, orient='index').reset_index(names=['sample'])
+    return out
+
 
 
 def load_genome(genome_path):
@@ -741,6 +819,10 @@ def main():
     df_zrob_rare = zero_inflate_robust(df_hits_unique.reset_index()).set_index('sample').add_prefix('zrobrare_').reset_index()
     df_zrob_share = zero_inflate_robust(df_hits_shared.reset_index()).set_index('sample').add_prefix('zrobshare_').reset_index()
 
+    # GC-bias corrected zero inflation (kmer GC from the kmer strings)
+    df_gc_all = gc_stratified_0_inflation(df_hits).set_index('sample').add_prefix('gcall_').reset_index()
+    df_gc_rare = gc_stratified_0_inflation(df_hits_unique.reset_index()).set_index('sample').add_prefix('gcrare_').reset_index()
+
     df_blocks_gpd = df_blocks.groupby('sample').agg(**{'block_count': ('block_id', 'count'),
                                                        '0_cov_blocks': ('block_coverage', lambda x: sum(x==0))})
  
@@ -754,7 +836,16 @@ def main():
                     .merge(df_zrob_all, on='sample', how='left')
                     .merge(df_zrob_rare, on='sample', how='left')
                     .merge(df_zrob_share, on='sample', how='left')
+                    .merge(df_gc_all, on='sample', how='left')
+                    .merge(df_gc_rare, on='sample', how='left')
                     .merge(df_blocks_gpd, on='sample', how='left'))
+
+    # spatial evenness along the genome (needs --reference for kmer positions)
+    if args.reference:
+        df_cov_depth = df_cov_depth.merge(window_evenness(df_loc_counts, df_hits), on='sample', how='left')
+
+    # strain GC content: a genus-level fingerprint (taxon proxy) -> for stratifying / checking, not as a model feature
+    df_cov_depth['strain_gc'] = round(kmer_gc(df_hits['#kmer']).mean(), 4)
 
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
@@ -778,6 +869,9 @@ def main():
     # relative abundance from depth among present kmers (robust lambda: no zeros, no high-depth tail)
     for est in ['zroball', 'zrobrare', 'zhyball', 'zhybrare']:
         df_cov_depth[f'relative_abundance_{est}'] = round((df_cov_depth[f'{est}_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
+
+    # depth of strain-specific vs shared kmers among present kmers: a relative inflates shared depth (ratio < 1)
+    df_cov_depth['depth_rare_over_share'] = df_cov_depth['zhybrare_lambda'] / df_cov_depth['zhybshare_lambda']
 
 
     # Exports and figures

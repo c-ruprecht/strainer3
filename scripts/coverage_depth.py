@@ -47,13 +47,7 @@ def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
                 thr=thr,
                 lam_mean=x.mean())
 
-def estimate_depth_rare_subset():
-    pass
 
-### coverages
-def nb_depth(cov, r = 2):
-    cov = cov.where(cov < 1)
-    return r * ((1 - cov) ** (-1.0 / r) - 1)
 
 def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
 
@@ -94,7 +88,132 @@ def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
                             })
     df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_uni, df_cov_depth_nonuni], axis = 1)    
 
-    return df_cov_depth, df_counts_uni
+    return df_cov_depth, df_counts_uni, df_unique, df_nonunique
+
+def ztp_lambda(m_pos):
+    """MLE of λ for a zero-truncated Poisson with mean m_pos."""
+    if not np.isfinite(m_pos) or m_pos <= 1:
+        return 0.0            # all positives are 1s → λ → 0
+    return brentq(lambda l: l / (1 - np.exp(-l)) - m_pos, 1e-9, m_pos)
+
+def zero_inflate_poisson(df_hits):
+    df = df_hits.set_index('#kmer')
+    hits = (df > 0).sum(axis=0)
+    total = len(df)
+    
+    out = pd.DataFrame({'obs_0_cnts': total - hits ,
+                        'coverage': (df > 0).sum(axis=0)/len((df > 0)),
+                        'depth_pos': df[df > 0].mean(axis=0),
+                        })
+    
+    out['lambda_ztp'] = out['depth_pos'].apply(ztp_lambda)
+    p0 = np.exp(-out['lambda_ztp'])
+
+    # Zeros expected among the k-mers that are actually present
+    exp0 = (hits * p0 / (1 - p0)).replace([np.inf, -np.inf], np.nan)
+    out['exp_0_cnts'] = exp0.round().astype('Int64')    # Coverage expected if every k-mer were present
+    out['exp_coverage'] = 1 - p0
+
+    out['excess_0'] = out['obs_0_cnts'] - out['exp_0_cnts']     # structurally absent k-mers
+    out['frac_absent'] = (out['excess_0'] / total).clip(lower=0) 
+    out['zi_index'] = out['excess_0'] / out['obs_0_cnts']              # share of zeros that are structural
+    out['zero_ratio'] = out['obs_0_cnts'] / out['exp_0_cnts']          # obs/exp zeros; 1 = pure Poisson
+    out = out.reset_index(names=['sample'])
+    return out
+
+def zero_inflate_stats(obs_0, total, lam, exp0):
+    """shared output columns for the zero-inflation estimators (same definitions as zero_inflate_poisson)"""
+    excess_0 = obs_0 - exp0
+    return {'lambda': lam,
+            'exp_0_cnts': exp0,
+            'exp_coverage': 1 - np.exp(-lam) if np.isfinite(lam) else np.nan,
+            'excess_0': excess_0,
+            'frac_absent': np.clip(excess_0 / total, 0, 1) if np.isfinite(exp0) else np.nan,   # structurally absent kmers
+            'zi_index': excess_0 / obs_0 if obs_0 > 0 else 0.0,                               # share of zeros that are structural
+            'zero_ratio': obs_0 / exp0 if exp0 > 0 else np.inf}                               # obs/exp zeros; 1 = pure Poisson
+
+def lowcount_0_inflation(x, min_f1=5):
+    """
+    Low-count estimator: depth only from kmers seen once (f1) and twice (f2), ignores zeros and the high-depth tail.
+    Poisson: f2/f1 = lam/2 -> expected zeros f0 = f1/lam = f1^2/(2 f2)  (Chao1, bias corrected: f1(f1-1)/(2(f2+1)))
+    """
+    f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
+    total, obs_0, f1, f2 = f.sum(), f[0], f[1], f[2]
+    if f1 < min_f1:
+        # few singletons: deep coverage (no zeros expected) or no signal at all
+        deep = (total - obs_0) >= min_f1
+        out = zero_inflate_stats(obs_0, total, np.nan, 0.0 if deep else np.nan)
+        return {**out, 'f1': f1, 'f2': f2, 'reliable': deep}
+    exp0 = f1 * (f1 - 1) / (2.0 * (f2 + 1))
+    lam = 2.0 * (f2 + 1) / f1
+    return {**zero_inflate_stats(obs_0, total, lam, exp0), 'f1': f1, 'f2': f2, 'reliable': True}
+
+def trunc_poisson_lambda(f, thr):
+    """MLE of lam for a Poisson truncated to 1..thr, from the count histogram f"""
+    k = np.arange(len(f))
+    keep = (k >= 1) & (k <= thr)
+    n_kept = f[keep].sum()
+    if n_kept == 0:
+        return np.nan, 0
+    m = (k[keep] * f[keep]).sum() / n_kept
+    if m <= 1:                                     # all positives are 1s -> lam -> 0
+        return 0.0, n_kept
+    # E[X | 1 <= X <= thr] = lam * P(X <= thr-1) / (P(X <= thr) - P(0))
+    g = lambda l: l * poisson.cdf(thr - 1, l) / (poisson.cdf(thr, l) - np.exp(-l)) - m
+    hi = max(2 * m, 10.0)
+    while g(hi) < 0 and hi < 1e7:
+        hi *= 2
+    return (brentq(g, 1e-9, hi) if g(hi) >= 0 else np.nan), n_kept
+
+def robust_0_inflation(x, q=0.99, min_pos=10, n_iter=30):
+    """
+    Robust ZTP: zero- and right-truncated Poisson fitted on the Poisson body of the positives.
+    start lam = 2 f2/f1, thr = Poisson q-quantile, kmers > thr are high-depth (present, but not used for lam),
+    refit lam on 1..thr, iterate until thr is stable. Zeros are never used to estimate lam.
+    """
+    f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
+    total, obs_0 = f.sum(), f[0]
+    pos = total - obs_0
+    if pos < min_pos:
+        return {**zero_inflate_stats(obs_0, total, np.nan, np.nan), 'frac_trimmed': np.nan, 'thr': np.nan, 'reliable': False}
+
+    k = np.arange(len(f))
+    lam = 2.0 * f[2] / f[1] if f[1] > 0 and f[2] > 0 else np.median(np.repeat(k[1:], f[1:]))
+    lam = max(lam, 1e-3)
+    thr_prev = None
+    for _ in range(n_iter):
+        thr = int(max(poisson.ppf(q, lam), 2))
+        if thr == thr_prev:
+            break
+        lam_new, _ = trunc_poisson_lambda(f, thr)
+        if not np.isfinite(lam_new):
+            break
+        lam, thr_prev = lam_new, thr
+
+    thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
+    lam_fit, n_kept = trunc_poisson_lambda(f, thr)
+    lam = lam_fit if np.isfinite(lam_fit) else lam
+    frac_trimmed = f[thr + 1:].sum() / pos
+    if lam <= 0:
+        return {**zero_inflate_stats(obs_0, total, 0.0, np.nan), 'frac_trimmed': frac_trimmed, 'thr': thr, 'reliable': False}
+
+    # present kmers in the body = kept / P(1 <= X <= thr); zeros expected among them
+    exp0 = n_kept / (poisson.cdf(thr, lam) - np.exp(-lam)) * np.exp(-lam)
+    return {**zero_inflate_stats(obs_0, total, lam, exp0), 'frac_trimmed': frac_trimmed, 'thr': thr, 'reliable': True}
+
+def zero_inflate_lowcount(df_hits, min_f1=5):
+    df = df_hits.set_index('#kmer')
+    out = pd.DataFrame.from_dict({s: lowcount_0_inflation(df[s].to_numpy(), min_f1=min_f1) for s in df.columns}, orient='index')
+    out = out.reset_index(names=['sample'])
+    return out
+
+def zero_inflate_robust(df_hits, q=0.99, min_pos=10):
+    df = df_hits.set_index('#kmer')
+    out = pd.DataFrame.from_dict({s: robust_0_inflation(df[s].to_numpy(), q=q, min_pos=min_pos) for s in df.columns}, orient='index')
+    out = out.reset_index(names=['sample'])
+    return out
+
+
 
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
@@ -531,36 +650,7 @@ def plot_hit_distribution(df_hits, outdir, prefix, samples=None, quality='both')
             paths.append(path)
     return paths
 
-def ztp_lambda(m_pos):
-    """MLE of λ for a zero-truncated Poisson with mean m_pos."""
-    if not np.isfinite(m_pos) or m_pos <= 1:
-        return 0.0            # all positives are 1s → λ → 0
-    return brentq(lambda l: l / (1 - np.exp(-l)) - m_pos, 1e-9, m_pos)
 
-def zero_inflate_poisson(df_hits):
-    df = df_hits.set_index('#kmer')
-    hits = (df > 0).sum(axis=0)
-    total = len(df)
-    
-    out = pd.DataFrame({'obs_0_cnts': total - hits ,
-                        'coverage': (df > 0).sum(axis=0)/len((df > 0)),
-                        'depth_pos': df[df > 0].mean(axis=0),
-                        })
-    
-    out['lambda_ztp'] = out['depth_pos'].apply(ztp_lambda)
-    p0 = np.exp(-out['lambda_ztp'])
-
-    # Zeros expected among the k-mers that are actually present
-    exp0 = (hits * p0 / (1 - p0)).replace([np.inf, -np.inf], np.nan)
-    out['exp_0_cnts'] = exp0.round().astype('Int64')    # Coverage expected if every k-mer were present
-    out['exp_coverage'] = 1 - p0
-
-    out['excess_0'] = out['obs_0_cnts'] - out['exp_0_cnts']     # structurally absent k-mers
-    out['frac_absent'] = (out['excess_0'] / total).clip(lower=0) 
-    out['zi_index'] = out['excess_0'] / out['obs_0_cnts']              # share of zeros that are structural
-    out['zero_ratio'] = out['obs_0_cnts'] / out['exp_0_cnts']          # obs/exp zeros; 1 = pure Poisson
-    out = out.reset_index(names=['sample'])
-    return out
 
 
 
@@ -600,18 +690,19 @@ def main():
         df_locs, _ = build_mapped_kmers_ahocorasick(records= load_genome(args.reference),
                                                     terminal_dist= args.terminal_dist,
                                                     kmers = df_hits['#kmer'].to_list())
+        
         print(f"Removing {len(df_locs.loc[df_locs['label']=='terminal'])} terminal kmers")
+        
         df_internal = df_locs.loc[df_locs['label']=='internal']
         df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
         df_loc_counts = pd.merge(df_internal, df_counts, on='#kmer', how='inner')
         
         # add block ids don't drop anything, blocks are only split by position
         df_loc_counts = add_block_ids(df_loc_counts, count_cols= None)
-        print(df_loc_counts)
         
     
     # get sample coverage for all kemrs and unique/rare kmers
-    df_cov_depth, df_cnt_uni = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
+    df_cov_depth, df_cnt_uni, df_hits_unique, df_hits_shared = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
     df_cov_depth = df_cov_depth.reset_index(names='sample')
 
     if args.reference:
@@ -621,18 +712,39 @@ def main():
         df_blocks.to_csv(os.path.join(outpath, "blocks.tsv"), sep='\t')
 
     # get theoretical 0 counts using poisson of non 0s
-    df_non0 = zero_inflate_poisson(df_hits)
+    df_zpt_all = zero_inflate_poisson(df_hits).set_index('sample').add_prefix('zptall_').reset_index()
+    df_zpt_rare = zero_inflate_poisson(df_hits_unique.reset_index()).set_index('sample').add_prefix('zptrare_').reset_index()
+    df_zpt_share = zero_inflate_poisson(df_hits_shared.reset_index()).set_index('sample').add_prefix('zptshare_').reset_index()
+
+    # low-count estimator (f1, f2) -> robust to high-depth tail
+    df_zlc_all = zero_inflate_lowcount(df_hits).set_index('sample').add_prefix('zlcall_').reset_index()
+    df_zlc_rare = zero_inflate_lowcount(df_hits_unique.reset_index()).set_index('sample').add_prefix('zlcrare_').reset_index()
+    df_zlc_share = zero_inflate_lowcount(df_hits_shared.reset_index()).set_index('sample').add_prefix('zlcshare_').reset_index()
+
+    # robust zero truncated poisson, high depth kmers trimmed
+    df_zrob_all = zero_inflate_robust(df_hits).set_index('sample').add_prefix('zroball_').reset_index()
+    df_zrob_rare = zero_inflate_robust(df_hits_unique.reset_index()).set_index('sample').add_prefix('zrobrare_').reset_index()
+    df_zrob_share = zero_inflate_robust(df_hits_shared.reset_index()).set_index('sample').add_prefix('zrobshare_').reset_index()
+
     df_blocks_gpd = df_blocks.groupby('sample').agg(**{'block_count': ('block_id', 'count'),
                                                        '0_cov_blocks': ('block_coverage', lambda x: sum(x==0))})
  
 
-    df_cov_depth = (df_cov_depth.merge(df_non0, on='sample', how='left')
+    df_cov_depth = (df_cov_depth.merge(df_zpt_all, on='sample', how='left')
+                    .merge(df_zpt_rare, on='sample', how='left')
+                    .merge(df_zpt_share, on='sample', how='left')
+                    .merge(df_zlc_all, on='sample', how='left')
+                    .merge(df_zlc_rare, on='sample', how='left')
+                    .merge(df_zlc_share, on='sample', how='left')
+                    .merge(df_zrob_all, on='sample', how='left')
+                    .merge(df_zrob_rare, on='sample', how='left')
+                    .merge(df_zrob_share, on='sample', how='left')
                     .merge(df_blocks_gpd, on='sample', how='left'))
 
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
-    df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+    #df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+    #df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
 
 
     # Exports and figures

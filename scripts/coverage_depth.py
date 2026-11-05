@@ -761,6 +761,24 @@ def main():
     #df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
     #df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
 
+    # relative signature: rare kmers missing while shared kmers are present
+    df_cov_depth['percentage_rare'] = df_cov_depth['rare_kmers_total'] / df_cov_depth['all_kmers_total']
+    for est in ['zrob', 'zlc']:
+        df_cov_depth[f'{est}_rare_minus_share'] = df_cov_depth[f'{est}rare_frac_absent'] - df_cov_depth[f'{est}share_frac_absent']
+        # no shared kmers (percentage_rare == 1): a relative can't explain the hits -> rare-only value
+        no_shared = df_cov_depth[f'{est}share_frac_absent'].isna() & df_cov_depth[f'{est}rare_frac_absent'].notna()
+        df_cov_depth.loc[no_shared, f'{est}_rare_minus_share'] = df_cov_depth.loc[no_shared, f'{est}rare_frac_absent']
+
+    # hybrid: robust estimate, NaN (too few positive kmers) filled with the low-count estimate
+    for sub in ['all', 'rare', 'share']:
+        for stat in ['lambda', 'frac_absent', 'zi_index']:
+            df_cov_depth[f'zhyb{sub}_{stat}'] = df_cov_depth[f'zrob{sub}_{stat}'].fillna(df_cov_depth[f'zlc{sub}_{stat}'])
+    df_cov_depth['zhyb_rare_minus_share'] = df_cov_depth['zrob_rare_minus_share'].fillna(df_cov_depth['zlc_rare_minus_share'])
+
+    # relative abundance from depth among present kmers (robust lambda: no zeros, no high-depth tail)
+    for est in ['zroball', 'zrobrare', 'zhyball', 'zhybrare']:
+        df_cov_depth[f'relative_abundance_{est}'] = round((df_cov_depth[f'{est}_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
+
 
     # Exports and figures
     if args.strain:

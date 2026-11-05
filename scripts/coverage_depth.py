@@ -132,15 +132,17 @@ def zero_inflate_stats(obs_0, total, lam, exp0):
             'zi_index': excess_0 / obs_0 if obs_0 > 0 else 0.0,                               # share of zeros that are structural
             'zero_ratio': obs_0 / exp0 if exp0 > 0 else np.inf}                               # obs/exp zeros; 1 = pure Poisson
 
-def lowcount_0_inflation(x, min_f1=5):
+def lowcount_0_inflation(x, min_f1=5, deep_median=5):
     """
     Low-count estimator: depth only from kmers seen once (f1) and twice (f2), ignores zeros and the high-depth tail.
     Poisson: f2/f1 = lam/2 -> expected zeros f0 = f1/lam = f1^2/(2 f2)  (Chao1, bias corrected: f1(f1-1)/(2(f2+1)))
     """
     f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
     total, obs_0, f1, f2 = f.sum(), f[0], f[1], f[2]
-    if f1 < min_f1:
-        # few singletons: deep coverage (no zeros expected) or no signal at all
+    pos_med = np.median(np.repeat(np.arange(1, len(f)), f[1:])) if total > obs_0 else 0
+    if f1 < min_f1 or pos_med > deep_median:
+        # few singletons, or most positives far above 1-2 (deep strain: 1s and 2s are noise)
+        # -> no sampling zeros expected; or no signal at all
         deep = (total - obs_0) >= min_f1
         out = zero_inflate_stats(obs_0, total, np.nan, 0.0 if deep else np.nan)
         return {**out, 'f1': f1, 'f2': f2, 'reliable': deep}
@@ -169,7 +171,8 @@ def robust_0_inflation(x, q=0.99, min_pos=10, n_iter=30):
     """
     Robust ZTP: zero- and right-truncated Poisson fitted on the Poisson body of the positives.
     start lam = 2 f2/f1, thr = Poisson q-quantile, kmers > thr are high-depth (present, but not used for lam),
-    refit lam on 1..thr, iterate until thr is stable. Zeros are never used to estimate lam.
+    refit lam on 1..thr, iterate until thr is stable. If that body holds < 50% of the positives (low-count noise on
+    a deep strain), restart from the median of the positives. Zeros are never used to estimate lam.
     """
     f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
     total, obs_0 = f.sum(), f[0]
@@ -178,17 +181,29 @@ def robust_0_inflation(x, q=0.99, min_pos=10, n_iter=30):
         return {**zero_inflate_stats(obs_0, total, np.nan, np.nan), 'frac_trimmed': np.nan, 'thr': np.nan, 'reliable': False}
 
     k = np.arange(len(f))
-    lam = 2.0 * f[2] / f[1] if f[1] > 0 and f[2] > 0 else np.median(np.repeat(k[1:], f[1:]))
-    lam = max(lam, 1e-3)
-    thr_prev = None
-    for _ in range(n_iter):
-        thr = int(max(poisson.ppf(q, lam), 2))
-        if thr == thr_prev:
-            break
-        lam_new, _ = trunc_poisson_lambda(f, thr)
-        if not np.isfinite(lam_new):
-            break
-        lam, thr_prev = lam_new, thr
+
+    def fit_from(lam):
+        lam = max(lam, 1e-3)
+        thr_prev = None
+        for _ in range(n_iter):
+            thr = int(max(poisson.ppf(q, lam), 2))
+            if thr == thr_prev:
+                break
+            lam_new, _ = trunc_poisson_lambda(f, thr)
+            if not np.isfinite(lam_new):
+                break
+            lam, thr_prev = lam_new, thr
+        thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
+        return lam, f[1:thr + 1].sum() / pos            # lam, share of positives in the Poisson body
+
+    # start from the low end (robust to the high-depth tail); if that 'body' explains less than half of the
+    # positives, the 1s and 2s are noise on top of a deep strain -> restart from the median of the positives
+    pos_med = np.median(np.repeat(k[1:], f[1:]))
+    lam, share = fit_from(2.0 * f[2] / f[1]) if f[1] > 0 and f[2] > 0 else fit_from(pos_med)
+    if share < 0.5:
+        lam_m, share_m = fit_from(pos_med)
+        if share_m > share:
+            lam = lam_m
 
     thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
     lam_fit, n_kept = trunc_poisson_lambda(f, thr)
@@ -201,9 +216,9 @@ def robust_0_inflation(x, q=0.99, min_pos=10, n_iter=30):
     exp0 = n_kept / (poisson.cdf(thr, lam) - np.exp(-lam)) * np.exp(-lam)
     return {**zero_inflate_stats(obs_0, total, lam, exp0), 'frac_trimmed': frac_trimmed, 'thr': thr, 'reliable': True}
 
-def zero_inflate_lowcount(df_hits, min_f1=5):
+def zero_inflate_lowcount(df_hits, min_f1=5, deep_median=5):
     df = df_hits.set_index('#kmer')
-    out = pd.DataFrame.from_dict({s: lowcount_0_inflation(df[s].to_numpy(), min_f1=min_f1) for s in df.columns}, orient='index')
+    out = pd.DataFrame.from_dict({s: lowcount_0_inflation(df[s].to_numpy(), min_f1=min_f1, deep_median=deep_median) for s in df.columns}, orient='index')
     out = out.reset_index(names=['sample'])
     return out
 
@@ -743,10 +758,10 @@ def main():
 
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-    df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
-    df_cov_depth['relative_abundance_zroball'] = round((df_cov_depth['zroball_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
-    df_cov_depth['relative_abundance_zrobrare'] = round((df_cov_depth['zrobrare_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
-    
+    #df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+    #df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
+
+
     # Exports and figures
     if args.strain:
         df_cov_depth['strain'] = args.strain 

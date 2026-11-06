@@ -82,7 +82,6 @@ def ztp_lambda(m_pos):
     # λ / (1 - e^-λ) with expm1: exact near 0, where 1 - exp(-λ) loses precision and brentq sees no sign change
     return brentq(lambda l: l / -np.expm1(-l) - m_pos, 1e-8, m_pos + 1)
 
-
 def ztp_mixture(x, K=2, n_iter=300, tol=1e-8):
     """EM for a mixture of K zero-truncated Poissons on the positive counts (histogram based). Zeros are never used."""
     f = np.bincount(np.asarray(x, dtype=np.int64)); k = np.arange(len(f))
@@ -127,7 +126,11 @@ def mode_groups(lam, npos, real, dip=0.25):
             valleys.append(k[v]); cur = nxt
         elif dens[nxt] > dens[cur]:
             cur = nxt
-    return np.searchsorted(np.array(valleys, float), lr)
+    # assign each component by the position of its own peak (ZTP mode = max(1, floor(λ))), then number the
+    # occupied modes 0, 1, ... so the lowest occupied mode is always 0
+    peak_pos = np.maximum(1, np.floor(lr))
+    m = np.searchsorted(np.array(valleys, float), peak_pos, side='right')
+    return np.unique(m, return_inverse=True)[1]
 
 def robust_0_inflation(x, k_max=3, min_weight=0.05, noise_lam=1.0, dip=0.25, min_pos=10):
     """
@@ -159,6 +162,8 @@ def robust_0_inflation(x, k_max=3, min_weight=0.05, noise_lam=1.0, dip=0.25, min
     mode = np.full(len(lam), -1)
     mode[real] = mode_groups(lam, npos, real, dip=dip)
     target = mode == 0
+    if not target.any() or npos[target].sum() <= 0:            # safety net: lowest real component is the target
+        target = np.zeros(len(lam), bool); target[np.where(real)[0][0]] = True
     lam_t = np.average(lam[target], weights=npos[target])
 
     p0 = np.exp(-lam[real])
@@ -177,9 +182,22 @@ def robust_0_inflation(x, k_max=3, min_weight=0.05, noise_lam=1.0, dip=0.25, min
             # kept for plotting
             '_lams': lam, '_pis': pi, '_npos': npos, '_real': real, '_target': target}
 
-def zero_inflate_robust(df_hits, **kw):
+def robust_0_inflation_safe(x, label='', **kw):
+    """robust_0_inflation that never stops the run: a failed fit gives NaN and logs the histogram to reproduce it"""
+    try:
+        return robust_0_inflation(x, **kw)
+    except Exception as e:
+        f = np.bincount(np.asarray(x, dtype=np.int64))
+        k = np.nonzero(f)[0]
+        print(f'WARNING: zero-inflation fit failed for {label}: {type(e).__name__}: {e}')
+        print(f'  histogram count:n_kmers {dict(zip(k.tolist(), f[k].tolist()))}')
+        print(f'  settings {kw}')
+        return robust_0_inflation(np.zeros(0, np.int64), **kw)      # all-NaN result
+
+def zero_inflate_robust(df_hits, label='', **kw):
     df = df_hits.set_index('#kmer')
-    out = pd.DataFrame.from_dict({s: robust_0_inflation(df[s].to_numpy(), **kw) for s in df.columns}, orient='index')
+    out = pd.DataFrame.from_dict({s: robust_0_inflation_safe(df[s].to_numpy(), label=f'{label} {s}', **kw)
+                                  for s in df.columns}, orient='index')
     out = out.drop(columns=[c for c in out.columns if c.startswith('_') or c == 'exp_0_cnts'])
     out = out.reset_index(names=['sample'])
     return out
@@ -209,7 +227,7 @@ def refit_from_histograms(df_hist, **params):
     rows = []
     for (strain, smp, sub), d in df_hist.groupby(['strain', 'sample', 'subset'], sort=False):
         x = np.repeat(d['count'].to_numpy(), d['n_kmers'].to_numpy())
-        r = robust_0_inflation(x, **p)
+        r = robust_0_inflation_safe(x, label=f'{strain} {sub} {smp}', **p)
         rows.append({'strain': strain, 'sample': smp, 'subset': sub,
                      **{k: v for k, v in r.items() if not k.startswith('_')}})
     return pd.DataFrame(rows)
@@ -575,7 +593,8 @@ def plot_zi_distribution(subsets, outdir, prefix, samples=None, quality='both', 
 
     paths = []
     for smp in samples:
-        fits = {name: robust_0_inflation(df[smp].to_numpy(), **(zi_params or ZI_PARAMS)) for name, df in subsets.items()}
+        fits = {name: robust_0_inflation_safe(df[smp].to_numpy(), label=f'{prefix} {name} {smp}', **(zi_params or ZI_PARAMS))
+                for name, df in subsets.items()}
         fig = make_subplots(rows=1, cols=len(fits), horizontal_spacing=0.06,
                             subplot_titles=[f'{name} ({len(subsets[name])} kmers)<br><sup>{zi_label(r)}</sup>'
                                             for name, r in fits.items()])
@@ -679,7 +698,7 @@ def main():
     zi_subsets = {'all': df_hits, 'rare': df_hits_unique.reset_index(), 'share': df_hits_shared.reset_index()}
     zi_subsets = {k: v for k, v in zi_subsets.items() if len(v) and (k == 'all' or len(v) < len(df_hits))}
     for sub, df_sub in zi_subsets.items():
-        df_zi = zero_inflate_robust(df_sub, **zi_params).set_index('sample').add_prefix(f'{sub}_').reset_index()
+        df_zi = zero_inflate_robust(df_sub, label=f'{basename} {sub}', **zi_params).set_index('sample').add_prefix(f'{sub}_').reset_index()
         df_cov_depth = df_cov_depth.merge(df_zi, on='sample', how='left')
 
     # blocks and spatial evenness along the genome (needs --reference for kmer positions)

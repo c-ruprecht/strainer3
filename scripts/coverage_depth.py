@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from pycirclize import Circos
 from scipy.stats import poisson
-from scipy.special import gammaln
 import re
 import json
 from matplotlib.colors import LogNorm, Normalize
@@ -65,122 +64,91 @@ def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
     return df_cov_depth, df_counts_uni, df_unique, df_nonunique
 
 
-### zero inflation: mixture of zero-truncated Poissons, target depth = lowest real peak
-# fitting settings; all exposed on the command line (--zi_*) and written to zi_params.json
-ZI_PARAMS = dict(k_max=3,          # max number of Poisson components (chosen by BIC)
-                 min_weight=0.05,  # min share of the positives for a real peak
-                 noise_lam=1.0,    # peaks below this λ are low-count noise if deeper peaks hold the majority
-                 dip=0.25,         # min density dip between two maxima to call them separate genomes
-                 min_pos=10)       # min positive kmers to fit at all
+### zero inflation: robust zero- and right-truncated Poisson (one-sided)
+# settings, exposed on the command line (--zi_q, --zi_min_pos) and written to zi_params.json
+# tuned on strain_challenge_2 (5M reads): q 0.90-0.95 best, min_pos 5-25 makes no difference
+ZI_PARAMS = dict(q=0.95,       # Poisson quantile for the upper trim: kmers above it are high-depth (present, not used for λ)
+                 min_pos=10)   # min positive kmers to fit at all
 
-def ztp_lambda(m_pos):
-    """MLE of λ for a zero-truncated Poisson with mean m_pos (mean of the positive counts)"""
-    if not np.isfinite(m_pos) or m_pos <= 1:
-        return 1e-6                                            # all positives are 1s -> λ -> 0
-    if m_pos < 1 + 1e-4:
-        return max(2.0 * (m_pos - 1), 1e-6)                    # small λ: E[X | X > 0] = 1 + λ/2 + O(λ²)
-    # λ / (1 - e^-λ) with expm1: exact near 0, where 1 - exp(-λ) loses precision and brentq sees no sign change
-    return brentq(lambda l: l / -np.expm1(-l) - m_pos, 1e-8, m_pos + 1)
+def zero_inflate_stats(obs_0, total, lam, exp0):
+    """shared output columns of the zero-inflation fit"""
+    excess_0 = obs_0 - exp0
+    return {'lambda': lam,
+            'zi_frac': np.clip(excess_0 / total, 0, 1) if np.isfinite(exp0) else np.nan,     # zero inflation fraction
+            'zi_index': excess_0 / obs_0 if obs_0 > 0 else 0.0,                              # zero inflation index
+            'exp_0_cnts': exp0}
 
-def ztp_mixture(x, K=2, n_iter=300, tol=1e-8):
-    """EM for a mixture of K zero-truncated Poissons on the positive counts (histogram based). Zeros are never used."""
-    f = np.bincount(np.asarray(x, dtype=np.int64)); k = np.arange(len(f))
-    kk, w = k[1:][f[1:] > 0], f[1:][f[1:] > 0].astype(float)
-    n = w.sum()
-    lam = np.quantile(np.repeat(kk, w.astype(int)), (np.arange(K) + 0.5) / K) + 0.1   # starts spread over quantiles
-    pi = np.full(K, 1 / K); ll_old = -np.inf
-    with np.errstate(divide='ignore', invalid='ignore'):
-        for _ in range(n_iter):
-            logp = (kk[None, :] * np.log(lam[:, None]) - lam[:, None] - gammaln(kk[None, :] + 1)
-                    - np.log1p(-np.exp(-lam[:, None])) + np.log(pi[:, None]))
-            mx = logp.max(0); lse = mx + np.log(np.exp(logp - mx).sum(0))
-            ll = (w * lse).sum()
-            resp = np.exp(logp - lse)
-            nk = (resp * w).sum(1)
-            pi = nk / n
-            lam = np.array([ztp_lambda((resp[j] * w * kk).sum() / nk[j]) if nk[j] > 0 else 1e-6 for j in range(K)])
-            if ll - ll_old < tol * abs(ll):
-                break
-            ll_old = ll
-    order = np.argsort(lam)
-    return dict(lam=lam[order], pi=pi[order], n_pos=nk[order], bic=-2 * ll + (2 * K - 1) * np.log(n))
+def trunc_poisson_lambda(f, thr):
+    """MLE of lam for a Poisson truncated to 1..thr, from the count histogram f"""
+    k = np.arange(len(f))
+    keep = (k >= 1) & (k <= thr)
+    n_kept = f[keep].sum()
+    if n_kept == 0:
+        return np.nan, 0
+    m = (k[keep] * f[keep]).sum() / n_kept
+    if m <= 1 + 1e-6:                              # (almost) all positives are 1s -> lam not identifiable
+        return 0.0, n_kept
+    # E[X | 1 <= X <= thr] = lam * P(X <= thr-1) / (P(X <= thr) - P(0))
+    g = lambda l: l * poisson.cdf(thr - 1, l) / (poisson.cdf(thr, l) - np.exp(-l)) - m
+    lo, hi = 1e-9, max(2 * m, 10.0)
+    while g(hi) < 0 and hi < 1e7:
+        hi *= 2
+    if not (g(lo) < 0 <= g(hi)):
+        return np.nan, n_kept
+    return brentq(g, lo, hi), n_kept
 
-def mode_groups(lam, npos, real, dip=0.25):
+def robust_0_inflation(x, q=0.95, min_pos=10, n_iter=30):
     """
-    Group the real mixture components into modes of the fitted density (k >= 1).
-    Two neighbouring maxima are separate modes only if the density dips between them by >= dip of the lower maximum;
-    otherwise they are one hump: overdispersed coverage of one genome, not two genomes.
-    Returns the mode index of each real component (0 = lowest mode).
+    Robust ZTP: zero- and right-truncated Poisson fitted on the Poisson body of the positives.
+    start lam = 2 f2/f1, thr = Poisson q-quantile, kmers > thr are high-depth (present, but not used for lam),
+    refit lam on 1..thr, iterate until thr is stable. If that body holds < 50% of the positives (low-count noise on
+    a deep strain), restart from the median of the positives. Zeros are never used to estimate lam.
+    lam not identifiable (all positives are 1s) -> NaN, never 'present at depth ~0'
+    zi_frac  : excess zeros / all kmers       -> zero inflation fraction, share of the strain not in the sample
+    zi_index : excess zeros / observed zeros  -> zero inflation index, share of the zeros that are structural
     """
-    lr, nr = lam[real], npos[real]
-    kmax = int(lr.max() + 5 * np.sqrt(max(lr.max(), 1)) + 5)
-    k = np.arange(1, kmax + 1)
-    dens = (nr[:, None] * poisson.pmf(k[None, :], lr[:, None]) / (1 - np.exp(-lr[:, None]))).sum(0)
-    peaks = [i for i in range(len(k)) if dens[i] >= dens[max(i - 1, 0)] and dens[i] >= dens[min(i + 1, len(k) - 1)]
-             and (i == 0 or dens[i] > dens[i - 1])]
-    valleys = []                                             # count positions separating real modes
-    cur = peaks[0] if peaks else 0
-    for nxt in peaks[1:]:
-        v = cur + int(np.argmin(dens[cur:nxt + 1]))
-        if dens[v] <= (1 - dip) * min(dens[cur], dens[nxt]):
-            valleys.append(k[v]); cur = nxt
-        elif dens[nxt] > dens[cur]:
-            cur = nxt
-    # assign each component by the position of its own peak (ZTP mode = max(1, floor(λ))), then number the
-    # occupied modes 0, 1, ... so the lowest occupied mode is always 0
-    peak_pos = np.maximum(1, np.floor(lr))
-    m = np.searchsorted(np.array(valleys, float), peak_pos, side='right')
-    return np.unique(m, return_inverse=True)[1]
-
-def robust_0_inflation(x, k_max=3, min_weight=0.05, noise_lam=1.0, dip=0.25, min_pos=10):
-    """
-    Robust zero inflation from a mixture of zero-truncated Poissons fitted on the positive counts (K = 1..k_max by BIC).
-    Target depth = lowest mode: every target kmer carries at least the target depth, kmers shared with a relative
-    sit higher, multi-copy kmers higher still.
-      real peak  : weight >= min_weight; a peak with λ < noise_lam is low-count noise only if peaks >= 5 x noise_lam
-                   hold the majority of the positives
-      target     : real peaks forming the lowest mode of the fitted density. Peaks without a dip between them are one
-                   hump (overdispersed coverage of one genome) and are merged.
-    zi_frac  : (total - present kmers) / total         -> zero inflation fraction, share of the strain not in the sample
-    zi_index : (obs_0 - exp_0) / obs_0                  -> zero inflation index, share of the zeros that are structural
-    """
-    x = np.asarray(x, dtype=np.int64)
-    total, obs_0 = len(x), int((x == 0).sum())
+    f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
+    total, obs_0 = f.sum(), f[0]
     pos = total - obs_0
-    nan = {'lambda': np.nan, 'lambda_present': np.nan, 'n_modes': np.nan, 'peaks': np.nan, 'target_weight': np.nan,
-           'mode_ratio': np.nan,
-           'zi_frac': np.nan, 'zi_index': np.nan, 'exp_0_cnts': np.nan}
+    nan = {**zero_inflate_stats(obs_0, total, np.nan, np.nan), 'zi_index': np.nan, 'frac_trimmed': np.nan, 'thr': np.nan}
     if pos < min_pos:
         return nan
 
-    best = min((ztp_mixture(x, K) for K in range(1, k_max + 1)), key=lambda r: r['bic'])
-    lam, pi, npos = best['lam'], best['pi'], best['n_pos']
-    deep = pi[lam >= 5 * noise_lam].sum()                                     # positives held by clearly deeper peaks
-    real = (pi >= min_weight) & ~((lam < noise_lam) & (deep >= 0.5))
-    if not real.any():
-        real = pi == pi.max()
-    mode = np.full(len(lam), -1)
-    mode[real] = mode_groups(lam, npos, real, dip=dip)
-    target = mode == 0
-    if not target.any() or npos[target].sum() <= 0:            # safety net: lowest real component is the target
-        target = np.zeros(len(lam), bool); target[np.where(real)[0][0]] = True
-    lam_t = np.average(lam[target], weights=npos[target])
+    k = np.arange(len(f))
 
-    p0 = np.exp(-lam[real])
-    present = (npos[real] / (1 - p0)).sum()                                   # real peaks incl. their zeros
-    exp_0 = (npos[real] * p0 / (1 - p0)).sum()                                # zeros expected among present kmers
-    excess_0 = obs_0 - exp_0
-    return {'lambda': lam_t,                                                            # depth of the target (lowest) peak
-            'lambda_present': np.average(lam[real], weights=npos[real]),                # depth over all present kmers
-            'n_modes': int(mode.max() + 1),                                             # separate depth modes (genomes)
-            'peaks': ';'.join(f'{l:.2f}:{w:.3f}:{m}' for l, w, m in zip(lam[real], pi[real], mode[real])),  # λ:weight:mode
-            'target_weight': pi[target].sum(),                                          # share of positives in the target mode
-            'mode_ratio': (np.average(lam[mode == 1], weights=npos[mode == 1]) / lam_t) if (mode == 1).any() else 1.0,
-            'zi_frac': float(np.clip((total - present) / total, 0, 1)),
-            'zi_index': excess_0 / obs_0 if obs_0 > 0 else 0.0,
-            'exp_0_cnts': exp_0,
-            # kept for plotting
-            '_lams': lam, '_pis': pi, '_npos': npos, '_real': real, '_target': target}
+    def fit_from(lam):
+        lam = max(lam, 1e-3)
+        thr_prev = None
+        for _ in range(n_iter):
+            thr = int(max(poisson.ppf(q, lam), 2))
+            if thr == thr_prev:
+                break
+            lam_new, _ = trunc_poisson_lambda(f, thr)
+            if not np.isfinite(lam_new):
+                break
+            lam, thr_prev = lam_new, thr
+        thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
+        return lam, f[1:thr + 1].sum() / pos            # lam, share of positives in the Poisson body
+
+    # start from the low end (robust to the high-depth tail); if that 'body' explains less than half of the
+    # positives, the 1s and 2s are noise on top of a deep strain -> restart from the median of the positives
+    pos_med = np.median(np.repeat(k[1:], f[1:]))
+    lam, share = fit_from(2.0 * f[2] / f[1]) if f[1] > 0 and f[2] > 0 else fit_from(pos_med)
+    if share < 0.5:
+        lam_m, share_m = fit_from(pos_med)
+        if share_m > share:
+            lam = lam_m
+
+    thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
+    lam_fit, n_kept = trunc_poisson_lambda(f, thr)
+    lam = lam_fit if np.isfinite(lam_fit) else lam
+    frac_trimmed = f[thr + 1:].sum() / pos
+    if not np.isfinite(lam) or lam <= 0:
+        return {**nan, 'frac_trimmed': frac_trimmed, 'thr': thr}
+
+    # present kmers in the body = kept / P(1 <= X <= thr); zeros expected among them
+    exp0 = n_kept / (poisson.cdf(thr, lam) - np.exp(-lam)) * np.exp(-lam)
+    return {**zero_inflate_stats(obs_0, total, lam, exp0), 'frac_trimmed': frac_trimmed, 'thr': thr}
 
 def robust_0_inflation_safe(x, label='', **kw):
     """robust_0_inflation that never stops the run: a failed fit gives NaN and logs the histogram to reproduce it"""
@@ -198,7 +166,7 @@ def zero_inflate_robust(df_hits, label='', **kw):
     df = df_hits.set_index('#kmer')
     out = pd.DataFrame.from_dict({s: robust_0_inflation_safe(df[s].to_numpy(), label=f'{label} {s}', **kw)
                                   for s in df.columns}, orient='index')
-    out = out.drop(columns=[c for c in out.columns if c.startswith('_') or c == 'exp_0_cnts'])
+    out = out.drop(columns=['exp_0_cnts'])
     out = out.reset_index(names=['sample'])
     return out
 
@@ -228,8 +196,7 @@ def refit_from_histograms(df_hist, **params):
     for (strain, smp, sub), d in df_hist.groupby(['strain', 'sample', 'subset'], sort=False):
         x = np.repeat(d['count'].to_numpy(), d['n_kmers'].to_numpy())
         r = robust_0_inflation_safe(x, label=f'{strain} {sub} {smp}', **p)
-        rows.append({'strain': strain, 'sample': smp, 'subset': sub,
-                     **{k: v for k, v in r.items() if not k.startswith('_')}})
+        rows.append({'strain': strain, 'sample': smp, 'subset': sub, **r})
     return pd.DataFrame(rows)
 
 
@@ -531,60 +498,48 @@ def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=
     return df.drop(columns='_group')
 
 # colours of the zero-inflation histogram
-C_TARGET, C_OTHER, C_EXP0, C_EXC0, C_FIT, C_ALL = '#2a78d6', '#b4b2a9', '#86b6ef', '#e34948', '#0b0b0b', '#52514e'
+C_BODY, C_TRUNC, C_EXP0, C_EXC0, C_FIT = '#2a78d6', '#b4b2a9', '#86b6ef', '#e34948', '#0b0b0b'
 
 def zi_traces(x, r, showlegend=True):
     """
     one zero-inflation histogram
-    blue  : counts belonging mostly to the target peak (used for λ), grey: other peaks (relative / high-depth / noise)
-    zeros : expected from the real peaks (light blue) / excess = zero inflation (red)
-    lines : target Poisson (black), all real peaks (grey dashed)
+    blue  : Poisson body 1..thr (used for λ), grey: high-depth kmers above thr (present, not used for λ)
+    zeros : expected from the fitted Poisson (light blue) / excess = zero inflation (red)
+    line  : fitted Poisson over the present body kmers
     """
     x = np.asarray(x, dtype=np.int64)
-    lam, pi, npos, real, target = r['_lams'], r['_pis'], r['_npos'], r['_real'], r['_target']
-    big = real & (pi >= 0.10)                                # small far peaks (high-depth) go to the last bar
-    top = lam[big].max() if big.any() else lam[real].max()
-    kmax = int(top + 4 * np.sqrt(max(top, 1)) + 2)
+    lam, thr = r['lambda'], int(r['thr'])
+    kmax = int(max(thr + 3 * np.sqrt(max(lam, 1)) + 2, thr + 3))
     n_over = int((x > kmax).sum())
     f = np.bincount(np.minimum(x, kmax), minlength=kmax + 1)  # counts above kmax lumped in the last bar
     k = np.arange(kmax + 1)
-
-    # expected kmers per peak at each count; at 0 the zeros expected among the present kmers of that peak
-    comp = np.array([npos[j] * poisson.pmf(k, lam[j]) / (1 - np.exp(-lam[j])) for j in range(len(lam))])
-    comp[:, 0] = npos * np.exp(-lam) / (1 - np.exp(-lam))
-    tgt = comp[target].sum(0)
-    is_tgt = tgt > 0.5 * comp.sum(0)
-    if n_over:
-        is_tgt[kmax] = False
+    body = (k >= 1) & (k <= thr)
     obs_0 = f[0]
     exp_0 = min(r['exp_0_cnts'], obs_0)
+    n_body = f[body].sum()
+    body_present = n_body / (poisson.cdf(thr, lam) - np.exp(-lam))          # body kmers incl. their zeros
     leg = dict(showlegend=showlegend)
-    return [go.Bar(x=k, y=np.where(is_tgt & (k > 0), f, 0), marker_color=C_TARGET,
-                   name='target peak (used for λ)', legendgroup='target', **leg),
-            go.Bar(x=k, y=np.where(~is_tgt & (k > 0), f, 0), marker_color=C_OTHER,
-                   name='other peaks (relative / high-depth / noise)', legendgroup='other',
+    return [go.Bar(x=k, y=np.where(body, f, 0), marker_color=C_BODY, name='Poisson body 1..thr (used for λ)',
+                   legendgroup='body', **leg),
+            go.Bar(x=k, y=np.where(k > thr, f, 0), marker_color=C_TRUNC, name='high-depth > thr (present, trimmed)',
+                   legendgroup='trunc',
                    customdata=[f'+{n_over} kmers > {kmax}' if (i == kmax and n_over) else '' for i in k],
-                   hovertemplate='%{x}: %{y} %{customdata}<extra>other</extra>', **leg),
+                   hovertemplate='%{x}: %{y} %{customdata}<extra>trimmed</extra>', **leg),
             go.Bar(x=[0], y=[exp_0], marker_color=C_EXP0, name='0: expected (Poisson)', legendgroup='exp0', **leg),
             go.Bar(x=[0], y=[obs_0 - exp_0], marker_color=C_EXC0, name='0: excess (zero inflation)',
                    legendgroup='exc0', **leg),
-            go.Scatter(x=k, y=tgt, mode='lines+markers', line=dict(color=C_FIT, width=2), marker=dict(size=4),
-                       name='target Poisson', legendgroup='fit', **leg),
-            go.Scatter(x=k, y=comp[real].sum(0), mode='lines', line=dict(color=C_ALL, width=1.5, dash='dash'),
-                       name='all peaks', legendgroup='all', **leg)]
+            go.Scatter(x=k, y=body_present * poisson.pmf(k, lam), mode='lines+markers',
+                       line=dict(color=C_FIT, width=2), marker=dict(size=4), name='fitted Poisson', legendgroup='fit', **leg)]
 
 def zi_label(r):
     if not np.isfinite(r['lambda']):
-        return 'too few positive kmers'
-    n = r['n_modes']
-    peaks = ', '.join(f'{float(l):.1f} ({float(w):.0%})' for l, w, _ in (p.split(':') for p in r['peaks'].split(';')))
-    return (f"<b>target depth λ = {r['lambda']:.2f}</b>  (all present kmers: {r['lambda_present']:.2f})<br>"
-            f"{n} depth mode{'s' if n > 1 else ''} | Poisson peaks λ (weight): {peaks}<br>"
+        return 'λ not identifiable (too few kmers or all positives are 1s)'
+    return (f"<b>depth λ = {r['lambda']:.2f}</b>  (body 1..{int(r['thr'])}, {r['frac_trimmed']:.1%} of positives trimmed)<br>"
             f"zi_frac = {r['zi_frac']:.3f}   zi_index = {r['zi_index']:.2f}")
 
 def plot_zi_distribution(subsets, outdir, prefix, samples=None, quality='both', zi_params=None):
     """
-    One figure per sample: zero-inflation histogram with the mixture fit for each kmer subset.
+    One figure per sample: zero-inflation histogram with the robust Poisson fit for each kmer subset.
     subsets: dict name -> '#kmer' x samples hit table, e.g. {'all': df_hits, 'rare': ..., 'share': ...}
     """
     subsets = {k: (v.set_index('#kmer') if '#kmer' in v.columns else v) for k, v in subsets.items() if len(v)}
@@ -637,10 +592,7 @@ def main():
     parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
     parser.add_argument('--figures', choices=['png','svg', 'both','none'], default='none', help = 'Change to svg, png or both if you want figures to be saved.')
     parser.add_argument('--export_hist', action='store_true', help = 'export kmer hit count histograms per sample and kmer subset (input for parameter optimisation)')
-    parser.add_argument('--zi_k_max', type = int, default = ZI_PARAMS['k_max'], help = 'max number of Poisson components in the mixture')
-    parser.add_argument('--zi_min_weight', type = float, default = ZI_PARAMS['min_weight'], help = 'min share of positive kmers for a real peak')
-    parser.add_argument('--zi_noise_lam', type = float, default = ZI_PARAMS['noise_lam'], help = 'peaks below this depth are low-count noise if deeper peaks hold the majority')
-    parser.add_argument('--zi_dip', type = float, default = ZI_PARAMS['dip'], help = 'min density dip between two maxima to call them separate genomes')
+    parser.add_argument('--zi_q', type = float, default = ZI_PARAMS['q'], help = 'Poisson quantile for the upper trim: kmers above it are high-depth, present but not used for the depth fit')
     parser.add_argument('--zi_min_pos', type = int, default = ZI_PARAMS['min_pos'], help = 'min positive kmers to fit')
 
     args = parser.parse_args()
@@ -649,8 +601,7 @@ def main():
     counts_path = args.counts
     outpath = args.output_dir
     basename = args.strain if args.strain else 'contig_map'
-    zi_params = dict(k_max=args.zi_k_max, min_weight=args.zi_min_weight, noise_lam=args.zi_noise_lam,
-                     dip=args.zi_dip, min_pos=args.zi_min_pos)
+    zi_params = dict(q=args.zi_q, min_pos=args.zi_min_pos)
     with open(os.path.join(outpath, 'zi_params.json'), 'w') as fh:
         json.dump(zi_params, fh, indent=2)
 
@@ -693,7 +644,7 @@ def main():
         df_blocks = call_blocks(df_hits= df_hits, df_blocks=df_loc_counts, counts = None)
         df_blocks.to_csv(os.path.join(outpath, "blocks.tsv"), sep='\t')
 
-    # robust zero inflation: mixture of zero truncated poissons, depth = lowest real peak
+    # robust zero inflation: zero- and right-truncated poisson, high depth kmers trimmed
     # a subset is only fitted if it has kmers and is not identical to all kmers (e.g. every kmer rare -> no share subset)
     zi_subsets = {'all': df_hits, 'rare': df_hits_unique.reset_index(), 'share': df_hits_shared.reset_index()}
     zi_subsets = {k: v for k, v in zi_subsets.items() if len(v) and (k == 'all' or len(v) < len(df_hits))}
@@ -721,12 +672,11 @@ def main():
         # depth of strain-specific vs shared kmers among present kmers: a relative inflates shared depth (ratio < 1)
         df_cov_depth['depth_rare_over_share'] = df_cov_depth['rare_lambda'] / df_cov_depth['share_lambda']
 
-    # relative abundance from the target peak depth (no zeros, no relative / high-depth peaks)
+    # relative abundance from the robust depth (no zeros, no high-depth tail)
     for sub in zi_subsets:
         if sub == 'share':
             continue
         df_cov_depth[f'relative_abundance_{sub}'] = round((df_cov_depth[f'{sub}_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
-    df_cov_depth['relative_abundance_present'] = round((df_cov_depth['all_lambda_present'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
 
 
     # Exports and figures

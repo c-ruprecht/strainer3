@@ -8,44 +8,18 @@ from Bio.Seq import Seq
 import gzip
 #plotting
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from pycirclize import Circos
 from scipy.stats import poisson
+from scipy.special import gammaln
 import re
+import json
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.cm import ScalarMappable
 from scipy.optimize import brentq
-
-
-
-def robust_depth(x, f_bad=0.02, q=1 - 1e-4, n_iter=20):
-    """Depth estimate robust to a high-depth k-mer subset and an assembly zero floor.
-    Returns lam, coverage on kept k-mers, fraction of k-mers trimmed as high-depth, threshold."""
-    x = np.asarray(x)
-    n = len(x)
-    n1, n2 = (x == 1).sum(), (x == 2).sum()
-    lam = 2 * n2 / n1 if n1 > 0 else np.median(x)      # low-count start: ignores zeros + tail
-    lam = max(lam, 1e-6)
-
-    for _ in range(n_iter):
-        thr = poisson.ppf(q, lam)
-        keep = x <= thr
-        p0 = (x[keep] == 0).mean() if keep.any() else 1.0
-        p0_adj = np.clip((p0 - f_bad) / (1 - f_bad), 1 / n, 1)   # remove assembly floor
-        lam_new = -np.log(p0_adj)
-        if abs(lam_new - lam) < 1e-6 * max(lam, 1):
-            lam = lam_new
-            break
-        lam = max(lam_new, 1e-6)
-
-    thr = poisson.ppf(q, lam)
-    keep = x <= thr
-    return dict(depth_robust=lam,
-                cov_kept=(x[keep] > 0).mean() if keep.any() else 0.0,
-                frac_trimmed=1 - keep.mean(),
-                thr=thr,
-                lam_mean=x.mean())
 
 
 
@@ -80,196 +54,162 @@ def get_sample_coverage(df_hits, df_counts, rare_t = 1000):
                             })
 
     df_nonunique = df_hits.loc[df_hits['#kmer'].isin(df_counts_uni['#kmer'])==False].set_index('#kmer')
-    
+
     df_cov_depth_nonuni = pd.DataFrame({'nonrare_kmers_hit': (df_nonunique > 0).sum(axis=0),
                                 'nonrare_kmers_total': len(df_nonunique),
                                 'coverage_nonrare_kmers': round((df_nonunique > 0).sum(axis=0)/len(df_nonunique),4),
                                 'depth_nonrare_kmers': round(df_nonunique.mean(axis=0),2),
                             })
-    df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_uni, df_cov_depth_nonuni], axis = 1)    
+    df_cov_depth = pd.concat([df_cov_depth, df_cov_depth_uni, df_cov_depth_nonuni], axis = 1)
 
     return df_cov_depth, df_counts_uni, df_unique, df_nonunique
 
+
+### zero inflation: mixture of zero-truncated Poissons, target depth = lowest real peak
+# fitting settings; all exposed on the command line (--zi_*) and written to zi_params.json
+ZI_PARAMS = dict(k_max=3,          # max number of Poisson components (chosen by BIC)
+                 min_weight=0.05,  # min share of the positives for a real peak
+                 noise_lam=1.0,    # peaks below this λ are low-count noise if deeper peaks hold the majority
+                 dip=0.25,         # min density dip between two maxima to call them separate genomes
+                 min_pos=10)       # min positive kmers to fit at all
+
 def ztp_lambda(m_pos):
-    """MLE of λ for a zero-truncated Poisson with mean m_pos."""
-    if not np.isfinite(m_pos) or m_pos <= 1:
-        return 0.0            # all positives are 1s → λ → 0
+    """MLE of λ for a zero-truncated Poisson with mean m_pos (mean of the positive counts)"""
+    if not np.isfinite(m_pos) or m_pos <= 1 + 1e-9:
+        return 1e-6                                            # all positives are 1s -> λ -> 0
     return brentq(lambda l: l / (1 - np.exp(-l)) - m_pos, 1e-9, m_pos)
 
-def zero_inflate_poisson(df_hits):
-    df = df_hits.set_index('#kmer')
-    hits = (df > 0).sum(axis=0)
-    total = len(df)
-    
-    out = pd.DataFrame({'obs_0_cnts': total - hits ,
-                        'coverage': (df > 0).sum(axis=0)/len((df > 0)),
-                        'depth_pos': df[df > 0].mean(axis=0),
-                        })
-    
-    out['lambda_ztp'] = out['depth_pos'].apply(ztp_lambda)
-    p0 = np.exp(-out['lambda_ztp'])
-
-    # Zeros expected among the k-mers that are actually present
-    exp0 = (hits * p0 / (1 - p0)).replace([np.inf, -np.inf], np.nan)
-    out['exp_0_cnts'] = exp0.round().astype('Int64')    # Coverage expected if every k-mer were present
-    out['exp_coverage'] = 1 - p0
-
-    out['excess_0'] = out['obs_0_cnts'] - out['exp_0_cnts']     # structurally absent k-mers
-    out['frac_absent'] = (out['excess_0'] / total).clip(lower=0) 
-    out['zi_index'] = out['excess_0'] / out['obs_0_cnts']              # share of zeros that are structural
-    out['zero_ratio'] = out['obs_0_cnts'] / out['exp_0_cnts']          # obs/exp zeros; 1 = pure Poisson
-    out = out.reset_index(names=['sample'])
-    return out
-
-def zero_inflate_stats(obs_0, total, lam, exp0):
-    """shared output columns for the zero-inflation estimators (same definitions as zero_inflate_poisson)"""
-    excess_0 = obs_0 - exp0
-    return {'lambda': lam,
-            'exp_0_cnts': exp0,
-            'exp_coverage': 1 - np.exp(-lam) if np.isfinite(lam) else np.nan,
-            'excess_0': excess_0,
-            'frac_absent': np.clip(excess_0 / total, 0, 1) if np.isfinite(exp0) else np.nan,   # structurally absent kmers
-            'zi_index': excess_0 / obs_0 if obs_0 > 0 else 0.0,                               # share of zeros that are structural
-            'zero_ratio': obs_0 / exp0 if exp0 > 0 else np.inf}                               # obs/exp zeros; 1 = pure Poisson
-
-def lowcount_0_inflation(x, min_f1=5, deep_median=5):
-    """
-    Low-count estimator: depth only from kmers seen once (f1) and twice (f2), ignores zeros and the high-depth tail.
-    Poisson: f2/f1 = lam/2 -> expected zeros f0 = f1/lam = f1^2/(2 f2)  (Chao1, bias corrected: f1(f1-1)/(2(f2+1)))
-    """
-    f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
-    total, obs_0, f1, f2 = f.sum(), f[0], f[1], f[2]
-    pos_med = np.median(np.repeat(np.arange(1, len(f)), f[1:])) if total > obs_0 else 0
-    if f1 < min_f1 or pos_med > deep_median:
-        # few singletons, or most positives far above 1-2 (deep strain: 1s and 2s are noise)
-        # -> no sampling zeros expected; or no signal at all
-        deep = (total - obs_0) >= min_f1
-        out = zero_inflate_stats(obs_0, total, np.nan, 0.0 if deep else np.nan)
-        return {**out, 'f1': f1, 'f2': f2, 'reliable': deep}
-    exp0 = f1 * (f1 - 1) / (2.0 * (f2 + 1))
-    lam = 2.0 * (f2 + 1) / f1
-    return {**zero_inflate_stats(obs_0, total, lam, exp0), 'f1': f1, 'f2': f2, 'reliable': True}
-
-def trunc_poisson_lambda(f, thr):
-    """MLE of lam for a Poisson truncated to 1..thr, from the count histogram f"""
-    k = np.arange(len(f))
-    keep = (k >= 1) & (k <= thr)
-    n_kept = f[keep].sum()
-    if n_kept == 0:
-        return np.nan, 0
-    m = (k[keep] * f[keep]).sum() / n_kept
-    if m <= 1:                                     # all positives are 1s -> lam -> 0
-        return 0.0, n_kept
-    # E[X | 1 <= X <= thr] = lam * P(X <= thr-1) / (P(X <= thr) - P(0))
-    g = lambda l: l * poisson.cdf(thr - 1, l) / (poisson.cdf(thr, l) - np.exp(-l)) - m
-    hi = max(2 * m, 10.0)
-    while g(hi) < 0 and hi < 1e7:
-        hi *= 2
-    return (brentq(g, 1e-9, hi) if g(hi) >= 0 else np.nan), n_kept
-
-def robust_0_inflation(x, q=0.99, min_pos=10, n_iter=30):
-    """
-    Robust ZTP: zero- and right-truncated Poisson fitted on the Poisson body of the positives.
-    start lam = 2 f2/f1, thr = Poisson q-quantile, kmers > thr are high-depth (present, but not used for lam),
-    refit lam on 1..thr, iterate until thr is stable. If that body holds < 50% of the positives (low-count noise on
-    a deep strain), restart from the median of the positives. Zeros are never used to estimate lam.
-    """
-    f = np.bincount(np.asarray(x, dtype=np.int64), minlength=3)
-    total, obs_0 = f.sum(), f[0]
-    pos = total - obs_0
-    if pos < min_pos:
-        return {**zero_inflate_stats(obs_0, total, np.nan, np.nan), 'frac_trimmed': np.nan, 'thr': np.nan, 'reliable': False}
-
-    k = np.arange(len(f))
-
-    def fit_from(lam):
-        lam = max(lam, 1e-3)
-        thr_prev = None
+def ztp_mixture(x, K=2, n_iter=300, tol=1e-8):
+    """EM for a mixture of K zero-truncated Poissons on the positive counts (histogram based). Zeros are never used."""
+    f = np.bincount(np.asarray(x, dtype=np.int64)); k = np.arange(len(f))
+    kk, w = k[1:][f[1:] > 0], f[1:][f[1:] > 0].astype(float)
+    n = w.sum()
+    lam = np.quantile(np.repeat(kk, w.astype(int)), (np.arange(K) + 0.5) / K) + 0.1   # starts spread over quantiles
+    pi = np.full(K, 1 / K); ll_old = -np.inf
+    with np.errstate(divide='ignore', invalid='ignore'):
         for _ in range(n_iter):
-            thr = int(max(poisson.ppf(q, lam), 2))
-            if thr == thr_prev:
+            logp = (kk[None, :] * np.log(lam[:, None]) - lam[:, None] - gammaln(kk[None, :] + 1)
+                    - np.log1p(-np.exp(-lam[:, None])) + np.log(pi[:, None]))
+            mx = logp.max(0); lse = mx + np.log(np.exp(logp - mx).sum(0))
+            ll = (w * lse).sum()
+            resp = np.exp(logp - lse)
+            nk = (resp * w).sum(1)
+            pi = nk / n
+            lam = np.array([ztp_lambda((resp[j] * w * kk).sum() / nk[j]) if nk[j] > 0 else 1e-6 for j in range(K)])
+            if ll - ll_old < tol * abs(ll):
                 break
-            lam_new, _ = trunc_poisson_lambda(f, thr)
-            if not np.isfinite(lam_new):
-                break
-            lam, thr_prev = lam_new, thr
-        thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
-        return lam, f[1:thr + 1].sum() / pos            # lam, share of positives in the Poisson body
+            ll_old = ll
+    order = np.argsort(lam)
+    return dict(lam=lam[order], pi=pi[order], n_pos=nk[order], bic=-2 * ll + (2 * K - 1) * np.log(n))
 
-    # start from the low end (robust to the high-depth tail); if that 'body' explains less than half of the
-    # positives, the 1s and 2s are noise on top of a deep strain -> restart from the median of the positives
-    pos_med = np.median(np.repeat(k[1:], f[1:]))
-    lam, share = fit_from(2.0 * f[2] / f[1]) if f[1] > 0 and f[2] > 0 else fit_from(pos_med)
-    if share < 0.5:
-        lam_m, share_m = fit_from(pos_med)
-        if share_m > share:
-            lam = lam_m
+def mode_groups(lam, npos, real, dip=0.25):
+    """
+    Group the real mixture components into modes of the fitted density (k >= 1).
+    Two neighbouring maxima are separate modes only if the density dips between them by >= dip of the lower maximum;
+    otherwise they are one hump: overdispersed coverage of one genome, not two genomes.
+    Returns the mode index of each real component (0 = lowest mode).
+    """
+    lr, nr = lam[real], npos[real]
+    kmax = int(lr.max() + 5 * np.sqrt(max(lr.max(), 1)) + 5)
+    k = np.arange(1, kmax + 1)
+    dens = (nr[:, None] * poisson.pmf(k[None, :], lr[:, None]) / (1 - np.exp(-lr[:, None]))).sum(0)
+    peaks = [i for i in range(len(k)) if dens[i] >= dens[max(i - 1, 0)] and dens[i] >= dens[min(i + 1, len(k) - 1)]
+             and (i == 0 or dens[i] > dens[i - 1])]
+    valleys = []                                             # count positions separating real modes
+    cur = peaks[0] if peaks else 0
+    for nxt in peaks[1:]:
+        v = cur + int(np.argmin(dens[cur:nxt + 1]))
+        if dens[v] <= (1 - dip) * min(dens[cur], dens[nxt]):
+            valleys.append(k[v]); cur = nxt
+        elif dens[nxt] > dens[cur]:
+            cur = nxt
+    return np.searchsorted(np.array(valleys, float), lr)
 
-    thr = int(max(poisson.ppf(q, lam), 2)) if lam > 0 else 2
-    lam_fit, n_kept = trunc_poisson_lambda(f, thr)
-    lam = lam_fit if np.isfinite(lam_fit) else lam
-    frac_trimmed = f[thr + 1:].sum() / pos
-    if lam <= 0:
-        return {**zero_inflate_stats(obs_0, total, 0.0, np.nan), 'frac_trimmed': frac_trimmed, 'thr': thr, 'reliable': False}
+def robust_0_inflation(x, k_max=3, min_weight=0.05, noise_lam=1.0, dip=0.25, min_pos=10):
+    """
+    Robust zero inflation from a mixture of zero-truncated Poissons fitted on the positive counts (K = 1..k_max by BIC).
+    Target depth = lowest mode: every target kmer carries at least the target depth, kmers shared with a relative
+    sit higher, multi-copy kmers higher still.
+      real peak  : weight >= min_weight; a peak with λ < noise_lam is low-count noise only if peaks >= 5 x noise_lam
+                   hold the majority of the positives
+      target     : real peaks forming the lowest mode of the fitted density. Peaks without a dip between them are one
+                   hump (overdispersed coverage of one genome) and are merged.
+    zi_frac  : (total - present kmers) / total         -> zero inflation fraction, share of the strain not in the sample
+    zi_index : (obs_0 - exp_0) / obs_0                  -> zero inflation index, share of the zeros that are structural
+    """
+    x = np.asarray(x, dtype=np.int64)
+    total, obs_0 = len(x), int((x == 0).sum())
+    pos = total - obs_0
+    nan = {'lambda': np.nan, 'lambda_present': np.nan, 'n_modes': np.nan, 'peaks': np.nan, 'target_weight': np.nan,
+           'mode_ratio': np.nan,
+           'zi_frac': np.nan, 'zi_index': np.nan, 'exp_0_cnts': np.nan}
+    if pos < min_pos:
+        return nan
 
-    # present kmers in the body = kept / P(1 <= X <= thr); zeros expected among them
-    exp0 = n_kept / (poisson.cdf(thr, lam) - np.exp(-lam)) * np.exp(-lam)
-    return {**zero_inflate_stats(obs_0, total, lam, exp0), 'frac_trimmed': frac_trimmed, 'thr': thr, 'reliable': True}
+    best = min((ztp_mixture(x, K) for K in range(1, k_max + 1)), key=lambda r: r['bic'])
+    lam, pi, npos = best['lam'], best['pi'], best['n_pos']
+    deep = pi[lam >= 5 * noise_lam].sum()                                     # positives held by clearly deeper peaks
+    real = (pi >= min_weight) & ~((lam < noise_lam) & (deep >= 0.5))
+    if not real.any():
+        real = pi == pi.max()
+    mode = np.full(len(lam), -1)
+    mode[real] = mode_groups(lam, npos, real, dip=dip)
+    target = mode == 0
+    lam_t = np.average(lam[target], weights=npos[target])
 
-def zero_inflate_lowcount(df_hits, min_f1=5, deep_median=5):
+    p0 = np.exp(-lam[real])
+    present = (npos[real] / (1 - p0)).sum()                                   # real peaks incl. their zeros
+    exp_0 = (npos[real] * p0 / (1 - p0)).sum()                                # zeros expected among present kmers
+    excess_0 = obs_0 - exp_0
+    return {'lambda': lam_t,                                                            # depth of the target (lowest) peak
+            'lambda_present': np.average(lam[real], weights=npos[real]),                # depth over all present kmers
+            'n_modes': int(mode.max() + 1),                                             # separate depth modes (genomes)
+            'peaks': ';'.join(f'{l:.2f}:{w:.3f}:{m}' for l, w, m in zip(lam[real], pi[real], mode[real])),  # λ:weight:mode
+            'target_weight': pi[target].sum(),                                          # share of positives in the target mode
+            'mode_ratio': (np.average(lam[mode == 1], weights=npos[mode == 1]) / lam_t) if (mode == 1).any() else 1.0,
+            'zi_frac': float(np.clip((total - present) / total, 0, 1)),
+            'zi_index': excess_0 / obs_0 if obs_0 > 0 else 0.0,
+            'exp_0_cnts': exp_0,
+            # kept for plotting
+            '_lams': lam, '_pis': pi, '_npos': npos, '_real': real, '_target': target}
+
+def zero_inflate_robust(df_hits, **kw):
     df = df_hits.set_index('#kmer')
-    out = pd.DataFrame.from_dict({s: lowcount_0_inflation(df[s].to_numpy(), min_f1=min_f1, deep_median=deep_median) for s in df.columns}, orient='index')
+    out = pd.DataFrame.from_dict({s: robust_0_inflation(df[s].to_numpy(), **kw) for s in df.columns}, orient='index')
+    out = out.drop(columns=[c for c in out.columns if c.startswith('_') or c == 'exp_0_cnts'])
     out = out.reset_index(names=['sample'])
     return out
 
-def zero_inflate_robust(df_hits, q=0.99, min_pos=10):
-    df = df_hits.set_index('#kmer')
-    out = pd.DataFrame.from_dict({s: robust_0_inflation(df[s].to_numpy(), q=q, min_pos=min_pos) for s in df.columns}, orient='index')
-    out = out.reset_index(names=['sample'])
-    return out
 
-def kmer_gc(kmers):
-    """GC fraction per kmer, straight from the kmer string"""
-    s = pd.Series(kmers, dtype='string').str.upper()
-    return ((s.str.count('G') + s.str.count('C')) / s.str.len()).to_numpy(dtype=np.float64)
-
-def gc_stratified_0_inflation(df_hits, n_bins=4, min_pos=10):
+def hit_histograms(subsets, strain):
     """
-    Zero inflation corrected for GC bias: kmers are split into GC quantile bins (per strain), depth (robust lambda)
-    and expected zeros are estimated per bin and summed. A strain whose high-GC kmers are under-covered is then not
-    mistaken for a partially absent strain.
-    gc_frac_absent : structurally absent kmers after GC correction
-    gc_depth_slope : change in log robust depth per 10% GC (sequencing GC bias for this strain x sample)
-    gc_depth_cv    : spread of robust depth across GC bins (0 = no GC bias)
+    kmer hit count histogram per sample and kmer subset: everything the zero-inflation fit uses.
+    long format: strain, sample, subset, subset_kmers, count, n_kmers (only counts that occur)
     """
-    df = df_hits.set_index('#kmer')
-    gc = kmer_gc(df.index)
-    edges = np.unique(np.quantile(gc, np.linspace(0, 1, n_bins + 1)))
-    bins = np.clip(np.searchsorted(edges, gc, side='right') - 1, 0, len(edges) - 2)
-    gc_bin = np.array([gc[bins == b].mean() for b in range(len(edges) - 1)])
+    rows = []
+    for sub, df in subsets.items():
+        df = df.set_index('#kmer') if '#kmer' in df.columns else df
+        for smp in df.columns:
+            f = np.bincount(df[smp].to_numpy(dtype=np.int64))
+            k = np.nonzero(f)[0]
+            rows.append(pd.DataFrame({'strain': strain, 'sample': smp, 'subset': sub, 'subset_kmers': len(df),
+                                      'count': k, 'n_kmers': f[k]}))
+    return pd.concat(rows, ignore_index=True)
 
-    rows = {}
-    for smp in df.columns:
-        x = df[smp].to_numpy()
-        total, obs_0 = len(x), (x == 0).sum()
-        lam_b, exp0_b, n_b = [], [], []
-        for b in range(len(edges) - 1):
-            r = robust_0_inflation(x[bins == b], min_pos=min_pos)
-            lam_b.append(r['lambda']); exp0_b.append(r['exp_0_cnts']); n_b.append((bins == b).sum())
-        lam_b, exp0_b, n_b = np.array(lam_b, float), np.array(exp0_b, float), np.array(n_b)
-        ok = np.isfinite(lam_b) & (lam_b > 0) & np.isfinite(exp0_b)
-        if ok.sum() == len(lam_b):                       # every GC bin has a usable depth estimate
-            gc_fa = np.clip((obs_0 - exp0_b.sum()) / total, 0, 1)
-        else:
-            gc_fa = np.nan
-        if ok.sum() >= 2:
-            slope = np.polyfit(gc_bin[ok], np.log(lam_b[ok]), 1, w=np.sqrt(n_b[ok]))[0] * 0.1
-            cv = np.std(lam_b[ok]) / np.mean(lam_b[ok])
-        else:
-            slope, cv = np.nan, np.nan
-        rows[smp] = {'gc_frac_absent': gc_fa, 'gc_depth_slope': slope, 'gc_depth_cv': cv}
-    out = pd.DataFrame.from_dict(rows, orient='index').reset_index(names=['sample'])
-    return out
+def refit_from_histograms(df_hist, **params):
+    """
+    rerun the zero-inflation fit on exported histograms (e.g. to optimise ZI_PARAMS against a truth table)
+    returns one row per strain x sample x subset
+    """
+    p = {**ZI_PARAMS, **params}
+    rows = []
+    for (strain, smp, sub), d in df_hist.groupby(['strain', 'sample', 'subset'], sort=False):
+        x = np.repeat(d['count'].to_numpy(), d['n_kmers'].to_numpy())
+        r = robust_0_inflation(x, **p)
+        rows.append({'strain': strain, 'sample': smp, 'subset': sub,
+                     **{k: v for k, v in r.items() if not k.startswith('_')}})
+    return pd.DataFrame(rows)
+
 
 def window_evenness(df_loc, df_hits, window=200):
     """
@@ -356,7 +296,6 @@ def build_mapped_kmers_ahocorasick(records, kmers, terminal_dist):
 
     return df, dict_len
 
-# get kmer blocks: a new block starts at a new contig, a position gap, or a change in count
 # get kmer blocks: a new block starts at a new contig, a position gap, or (if count_cols is given) a change in count
 def add_block_ids(df, count_cols = ['pangenome_count', 'metagenome_count', 'drug_count']):
     df = df.sort_values(['contig_id', 'kmer_position']).copy()
@@ -410,162 +349,6 @@ def call_blocks(df_blocks, df_hits, counts='count'):
         out_cols.insert(2, 'block_count')
     return df_gpd[out_cols]
 
-def get_block_pair_coverage(df_called_blocks):
-    # blocks x samples coverage and depth matrices
-    df_cov = (df_called_blocks
-              .pivot(index='block_id', columns='sample', values='block_coverage')
-              .fillna(0))
-    df_cov.columns = df_cov.columns.astype(str)
-    C = df_cov.to_numpy(dtype=np.float64)                   # B x S
-    D = (df_called_blocks
-         .pivot(index='block_id', columns='sample', values='block_depth')
-         .fillna(0)
-         .reindex(df_cov.index)
-         .to_numpy(dtype=np.float64))                       # B x S, same order as C
-    B = C.shape[0]
-    P = B * (B - 1) // 2                                    # all block pairs
-
-    # sum over all pairs a<b of sqrt(C[a]*C[b])
-    tot = np.sqrt(C).sum(axis=0)
-    pair_sum = (tot * tot - C.sum(axis=0)) / 2.0
-
-    # sum over all pairs a<b of min(D[a], D[b]): k-th smallest (0-based) is the min of B-1-k pairs
-    w = (B - 1 - np.arange(B))[:, None]
-    depth_sum = (np.sort(D, axis=0) * w).sum(axis=0)
-
-    return pd.DataFrame({
-        'sample':         df_cov.columns,
-        'blocks_total':   B,
-        'pairs_total':    P,
-        'pair_cov_geo':   np.round(pair_sum / P, 4) if P else 0.0,
-        'pair_depth_min': np.round(depth_sum / P, 2) if P else 0.0,
-    })
-
-# create pairs and triplets with weights
-def e2(v):                                                   # sum over pairs a<b of v[a]*v[b], per column
-    return (v.sum(axis=0) ** 2 - (v * v).sum(axis=0)) / 2.0
- 
- 
-def wmin_sum(V, W, k):
-    """sum over all pairs (k=2) or triplets (k=3) of prod(weights) * min(values)"""
-    idx = np.argsort(V, axis=0, kind='stable')
-    Vs = np.take_along_axis(V, idx, 0)
-    Ws = np.take_along_axis(W, idx, 0)
-    S1 = Ws.sum(axis=0) - np.cumsum(Ws, axis=0)              # weight of the elements sorted after each one
-    if k == 2:
-        later = S1
-    else:
-        S2 = (Ws ** 2).sum(axis=0) - np.cumsum(Ws ** 2, axis=0)
-        later = (S1 ** 2 - S2) / 2.0
-    return (Vs * Ws * later).sum(axis=0)
- 
- 
-def count_weight(count, alpha=1.0):
-    """count = number of other genomes carrying the kmer; rarer -> heavier. count 0 -> weight 1"""
-    return (1.0 + np.asarray(count, dtype=np.float64)) ** (-alpha)
- 
-def get_weighted_coverage(df_hits, df_counts, alpha = 1):
-
-    df_counts['count_weight'] = df_counts['count']
-    return df
-
-def get_block_weighted_coverage(df_called_blocks, alpha=1.0, size_weight=False):
-    """
-    Weighted mean over all block pairs, weight of a pair = w_a * w_b,
-    w = (1 + block_count)^-alpha, optionally multiplied by block_total (kmers per block).
-    """
-    def piv(col):
-        return df_called_blocks.pivot(index='block_id', columns='sample', values=col).fillna(0)
-
-    df_cov = piv('block_coverage')
-    df_cov.columns = df_cov.columns.astype(str)
-    C = df_cov.to_numpy(dtype=np.float64)                    # B x S coverage
-    D = piv('block_depth').reindex(df_cov.index).to_numpy(dtype=np.float64)
-    B, S = C.shape
-
-    # one count / size per block, identical across samples
-    blk = (df_called_blocks.groupby('block_id', observed=True)[['block_count', 'block_total']]
-           .first().reindex(df_cov.index))
-    w = count_weight(blk['block_count'].to_numpy(), alpha)
-    if size_weight:
-        w = w * blk['block_total'].to_numpy(dtype=np.float64)
-    W = np.repeat(w[:, None], S, axis=1)                     # B x S (needed for take_along_axis)
-
-    def ratio(num, den):
-        num = np.asarray(num, dtype=np.float64)
-        den = np.broadcast_to(np.asarray(den, dtype=np.float64), num.shape)
-        return np.divide(num, den, out=np.zeros_like(num), where=den > 0)
-
-    den2 = e2(W)                                             # sum over pairs of w_a*w_b
-
-    # sum over pairs of w_a*w_b*(D_a + D_b) = sum_a w_a*D_a*(W_total - w_a)
-    pair_sum = (W * D * (W.sum(axis=0) - W)).sum(axis=0)
-    min_sum = wmin_sum(D, W, 2)
-    max_sum = pair_sum - min_sum                             # min + max = D_a + D_b
-
-    return pd.DataFrame({
-        'sample':              df_cov.columns,
-        'blocks_total_cw':     B,
-        'pair_cov_geo_cw':     np.round(ratio(e2(W * np.sqrt(C)), den2), 4),
-        'pair_depth_min_cw':   np.round(ratio(min_sum, den2), 2),
-        'pair_depth_mean_cw':  np.round(ratio(pair_sum / 2.0, den2), 2),
-        'pair_depth_max_cw':   np.round(ratio(max_sum, den2), 2),
-        'count_weight_alpha':  alpha,
-    })
-
-def depth_weight(D, baseline, beta=1.0, mode='over', pseudo=1.0):
-    """
-    per block x sample weight from depth discrepancy to the rare-kmer baseline depth.
-    r = (D + pseudo) / (baseline + pseudo)
-    mode 'over': penalise only depth above baseline (shared regions inflated by relatives)
-    mode 'both': penalise both directions (careful: zero-depth blocks then drop out of coverage)
-    """
-    r = (D + pseudo) / (np.asarray(baseline, dtype=np.float64)[None, :] + pseudo)
-    dev = np.maximum(r, 1.0) if mode == 'over' else np.maximum(r, 1.0 / r)
-    return dev ** (-beta)
-
-
-def get_block_depth_weighted_coverage(df_called_blocks, baseline, beta=1.0, alpha=0.0,
-                                      mode='over', pseudo=1.0, size_weight=False):
-    """
-    Weighted pair statistics over all blocks; block weight = count weight * depth weight.
-    baseline: pd.Series sample -> baseline depth (e.g. depth_rare_kmers)
-    alpha = 0 -> depth weighting only.
-    """
-    def piv(col):
-        return df_called_blocks.pivot(index='block_id', columns='sample', values=col).fillna(0)
-
-    df_cov = piv('block_coverage')
-    df_cov.columns = df_cov.columns.astype(str)
-    C = df_cov.to_numpy(dtype=np.float64)                    # B x S coverage
-    D = piv('block_depth').reindex(df_cov.index).to_numpy(dtype=np.float64)
-    base = baseline.reindex(df_cov.columns).fillna(0).to_numpy(dtype=np.float64)
-
-    blk = (df_called_blocks.groupby('block_id', observed=True)[['block_count', 'block_total']]
-           .first().reindex(df_cov.index))
-    w = count_weight(blk['block_count'].to_numpy(), alpha)
-    if size_weight:
-        w = w * blk['block_total'].to_numpy(dtype=np.float64)
-    W = w[:, None] * depth_weight(D, base, beta=beta, mode=mode, pseudo=pseudo)   # B x S, per sample
-
-    def ratio(num, den):
-        return np.divide(num, den, out=np.zeros_like(num, dtype=np.float64), where=den > 0)
-
-    den2 = e2(W)
-    pair_sum = (W * D * (W.sum(axis=0) - W)).sum(axis=0)
-    min_sum = wmin_sum(D, W, 2)
-
-    return pd.DataFrame({
-        'sample':             df_cov.columns,
-        'depth_baseline_dw':  base,
-        'eff_blocks_dw':      np.round(ratio(W.sum(axis=0) ** 2, (W ** 2).sum(axis=0)), 1),
-        'pair_cov_geo_dw':    np.round(ratio(e2(W * np.sqrt(C)), den2), 4),
-        'pair_depth_min_dw':  np.round(ratio(min_sum, den2), 2),
-        'pair_depth_mean_dw': np.round(ratio(pair_sum / 2.0, den2), 2),
-        'pair_depth_max_dw':  np.round(ratio(pair_sum - min_sum, den2), 2),
-        'depth_weight_beta':  beta,
-        'count_weight_alpha': alpha,
-    })
 
 ### plots
 def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=3,
@@ -725,17 +508,89 @@ def plot_map(df_loc, outdir, prefix, df_hits=None, samples=None, ymax_min=20, s=
 
     return df.drop(columns='_group')
 
-def plot_hit_distribution(df_hits, outdir, prefix, samples=None, quality='both'):
-    """One histogram of k-mer hit counts per sample."""
-    df = df_hits.set_index('#kmer') if '#kmer' in df_hits.columns else df_hits
-    samples = list(df.columns) if samples is None else [s for s in samples if s in df.columns]
+# colours of the zero-inflation histogram
+C_TARGET, C_OTHER, C_EXP0, C_EXC0, C_FIT, C_ALL = '#2a78d6', '#b4b2a9', '#86b6ef', '#e34948', '#0b0b0b', '#52514e'
+
+def zi_traces(x, r, showlegend=True):
+    """
+    one zero-inflation histogram
+    blue  : counts belonging mostly to the target peak (used for λ), grey: other peaks (relative / high-depth / noise)
+    zeros : expected from the real peaks (light blue) / excess = zero inflation (red)
+    lines : target Poisson (black), all real peaks (grey dashed)
+    """
+    x = np.asarray(x, dtype=np.int64)
+    lam, pi, npos, real, target = r['_lams'], r['_pis'], r['_npos'], r['_real'], r['_target']
+    big = real & (pi >= 0.10)                                # small far peaks (high-depth) go to the last bar
+    top = lam[big].max() if big.any() else lam[real].max()
+    kmax = int(top + 4 * np.sqrt(max(top, 1)) + 2)
+    n_over = int((x > kmax).sum())
+    f = np.bincount(np.minimum(x, kmax), minlength=kmax + 1)  # counts above kmax lumped in the last bar
+    k = np.arange(kmax + 1)
+
+    # expected kmers per peak at each count; at 0 the zeros expected among the present kmers of that peak
+    comp = np.array([npos[j] * poisson.pmf(k, lam[j]) / (1 - np.exp(-lam[j])) for j in range(len(lam))])
+    comp[:, 0] = npos * np.exp(-lam) / (1 - np.exp(-lam))
+    tgt = comp[target].sum(0)
+    is_tgt = tgt > 0.5 * comp.sum(0)
+    if n_over:
+        is_tgt[kmax] = False
+    obs_0 = f[0]
+    exp_0 = min(r['exp_0_cnts'], obs_0)
+    leg = dict(showlegend=showlegend)
+    return [go.Bar(x=k, y=np.where(is_tgt & (k > 0), f, 0), marker_color=C_TARGET,
+                   name='target peak (used for λ)', legendgroup='target', **leg),
+            go.Bar(x=k, y=np.where(~is_tgt & (k > 0), f, 0), marker_color=C_OTHER,
+                   name='other peaks (relative / high-depth / noise)', legendgroup='other',
+                   customdata=[f'+{n_over} kmers > {kmax}' if (i == kmax and n_over) else '' for i in k],
+                   hovertemplate='%{x}: %{y} %{customdata}<extra>other</extra>', **leg),
+            go.Bar(x=[0], y=[exp_0], marker_color=C_EXP0, name='0: expected (Poisson)', legendgroup='exp0', **leg),
+            go.Bar(x=[0], y=[obs_0 - exp_0], marker_color=C_EXC0, name='0: excess (zero inflation)',
+                   legendgroup='exc0', **leg),
+            go.Scatter(x=k, y=tgt, mode='lines+markers', line=dict(color=C_FIT, width=2), marker=dict(size=4),
+                       name='target Poisson', legendgroup='fit', **leg),
+            go.Scatter(x=k, y=comp[real].sum(0), mode='lines', line=dict(color=C_ALL, width=1.5, dash='dash'),
+                       name='all peaks', legendgroup='all', **leg)]
+
+def zi_label(r):
+    if not np.isfinite(r['lambda']):
+        return 'too few positive kmers'
+    n = r['n_modes']
+    peaks = ', '.join(f'{float(l):.1f} ({float(w):.0%})' for l, w, _ in (p.split(':') for p in r['peaks'].split(';')))
+    return (f"<b>target depth λ = {r['lambda']:.2f}</b>  (all present kmers: {r['lambda_present']:.2f})<br>"
+            f"{n} depth mode{'s' if n > 1 else ''} | Poisson peaks λ (weight): {peaks}<br>"
+            f"zi_frac = {r['zi_frac']:.3f}   zi_index = {r['zi_index']:.2f}")
+
+def plot_zi_distribution(subsets, outdir, prefix, samples=None, quality='both', zi_params=None):
+    """
+    One figure per sample: zero-inflation histogram with the mixture fit for each kmer subset.
+    subsets: dict name -> '#kmer' x samples hit table, e.g. {'all': df_hits, 'rare': ..., 'share': ...}
+    """
+    subsets = {k: (v.set_index('#kmer') if '#kmer' in v.columns else v) for k, v in subsets.items() if len(v)}
+    cols = list(next(iter(subsets.values())).columns)
+    samples = cols if samples is None else [s for s in samples if s in cols]
 
     paths = []
     for smp in samples:
-        fig = px.histogram(df[smp], width=800, template='simple_white',
-                           title=f'{prefix} | {smp}')
+        fits = {name: robust_0_inflation(df[smp].to_numpy(), **(zi_params or ZI_PARAMS)) for name, df in subsets.items()}
+        fig = make_subplots(rows=1, cols=len(fits), horizontal_spacing=0.06,
+                            subplot_titles=[f'{name} ({len(subsets[name])} kmers)<br><sup>{zi_label(r)}</sup>'
+                                            for name, r in fits.items()])
+        first = True
+        for i, (name, r) in enumerate(fits.items()):
+            if not np.isfinite(r['lambda']):
+                continue
+            for t in zi_traces(subsets[name][smp].to_numpy(), r, showlegend=first):
+                fig.add_trace(t, row=1, col=i + 1)
+            first = False
+        n = len(fits)
+        fig.update_layout(barmode='stack', bargap=0.1, template='simple_white', width=max(520 * n, 760),
+                          height=520 if n > 1 else 620, title=f'{prefix} | {smp}', margin=dict(t=150, b=40),
+                          legend=dict(orientation='h', yanchor='top', y=-0.2 if n > 1 else -0.16, x=0))
+        fig.update_xaxes(title_text='kmer hit count')
+        fig.update_yaxes(title_text='kmers', col=1)
+        fig.update_annotations(font_size=11)
         safe = re.sub(r'[^\w.-]', '_', str(smp))
-        base = os.path.join(outdir, f'{prefix}.hit_distribution.{safe}')
+        base = os.path.join(outdir, f'{prefix}.zi_distribution.{safe}')
         for fmt in (['svg', 'png'] if quality == 'both' else [quality]):
             path = f'{base}.{fmt}'
             fig.write_image(path, scale=2 if fmt == 'png' else None)
@@ -758,42 +613,53 @@ def main():
     parser.add_argument('--terminal_dist', type = int, default = 0, help = 'distance from end of contig. Kmers within that range will be dropped')
     parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
     parser.add_argument('--figures', choices=['png','svg', 'both','none'], default='none', help = 'Change to svg, png or both if you want figures to be saved.')
-    
+    parser.add_argument('--export_hist', action='store_true', help = 'export kmer hit count histograms per sample and kmer subset (input for parameter optimisation)')
+    parser.add_argument('--zi_k_max', type = int, default = ZI_PARAMS['k_max'], help = 'max number of Poisson components in the mixture')
+    parser.add_argument('--zi_min_weight', type = float, default = ZI_PARAMS['min_weight'], help = 'min share of positive kmers for a real peak')
+    parser.add_argument('--zi_noise_lam', type = float, default = ZI_PARAMS['noise_lam'], help = 'peaks below this depth are low-count noise if deeper peaks hold the majority')
+    parser.add_argument('--zi_dip', type = float, default = ZI_PARAMS['dip'], help = 'min density dip between two maxima to call them separate genomes')
+    parser.add_argument('--zi_min_pos', type = int, default = ZI_PARAMS['min_pos'], help = 'min positive kmers to fit')
+
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     hits_path = args.hits
     counts_path = args.counts
     outpath = args.output_dir
+    basename = args.strain if args.strain else 'contig_map'
+    zi_params = dict(k_max=args.zi_k_max, min_weight=args.zi_min_weight, noise_lam=args.zi_noise_lam,
+                     dip=args.zi_dip, min_pos=args.zi_min_pos)
+    with open(os.path.join(outpath, 'zi_params.json'), 'w') as fh:
+        json.dump(zi_params, fh, indent=2)
 
 
     df_hits = pd.read_csv(hits_path, sep = '\t')
     df_counts = pd.read_csv(counts_path, sep = '\t')
-    
-    # get total evaluated kmers for relative abundance evaluation 
+
+    # get total evaluated kmers for relative abundance evaluation
     total_evaluated = df_hits.loc[df_hits['#kmer']=='total_evaluated'].drop(columns='#kmer').T.reset_index()#.to_dict()
     total_evaluated.columns = ['sample', 'total_evaluated']
     total_evaluated['total_strain_kmers'] = len(df_counts)
     print(total_evaluated)
     df_hits = df_hits.loc[df_hits['#kmer'] !='total_evaluated'].copy()
 
-    
-    
+
+
     # get hit locations and strip terminal kmers
     if args.reference:
         df_locs, _ = build_mapped_kmers_ahocorasick(records= load_genome(args.reference),
                                                     terminal_dist= args.terminal_dist,
                                                     kmers = df_hits['#kmer'].to_list())
-        
+
         print(f"Removing {len(df_locs.loc[df_locs['label']=='terminal'])} terminal kmers")
-        
+
         df_internal = df_locs.loc[df_locs['label']=='internal']
         df_hits = df_hits.loc[df_hits['#kmer'].isin(df_internal['#kmer'])].copy()
         df_loc_counts = pd.merge(df_internal, df_counts, on='#kmer', how='inner')
-        
+
         # add block ids don't drop anything, blocks are only split by position
         df_loc_counts = add_block_ids(df_loc_counts, count_cols= None)
-        
-    
+
+
     # get sample coverage for all kemrs and unique/rare kmers
     df_cov_depth, df_cnt_uni, df_hits_unique, df_hits_shared = get_sample_coverage(df_hits=df_hits, df_counts= df_counts, rare_t = args.rare_min_count)
     df_cov_depth = df_cov_depth.reset_index(names='sample')
@@ -804,93 +670,62 @@ def main():
         df_blocks = call_blocks(df_hits= df_hits, df_blocks=df_loc_counts, counts = None)
         df_blocks.to_csv(os.path.join(outpath, "blocks.tsv"), sep='\t')
 
-    # get theoretical 0 counts using poisson of non 0s
-    df_zpt_all = zero_inflate_poisson(df_hits).set_index('sample').add_prefix('zptall_').reset_index()
-    df_zpt_rare = zero_inflate_poisson(df_hits_unique.reset_index()).set_index('sample').add_prefix('zptrare_').reset_index()
-    df_zpt_share = zero_inflate_poisson(df_hits_shared.reset_index()).set_index('sample').add_prefix('zptshare_').reset_index()
+    # robust zero inflation: mixture of zero truncated poissons, depth = lowest real peak
+    # a subset is only fitted if it has kmers and is not identical to all kmers (e.g. every kmer rare -> no share subset)
+    zi_subsets = {'all': df_hits, 'rare': df_hits_unique.reset_index(), 'share': df_hits_shared.reset_index()}
+    zi_subsets = {k: v for k, v in zi_subsets.items() if len(v) and (k == 'all' or len(v) < len(df_hits))}
+    for sub, df_sub in zi_subsets.items():
+        df_zi = zero_inflate_robust(df_sub, **zi_params).set_index('sample').add_prefix(f'{sub}_').reset_index()
+        df_cov_depth = df_cov_depth.merge(df_zi, on='sample', how='left')
 
-    # low-count estimator (f1, f2) -> robust to high-depth tail
-    df_zlc_all = zero_inflate_lowcount(df_hits).set_index('sample').add_prefix('zlcall_').reset_index()
-    df_zlc_rare = zero_inflate_lowcount(df_hits_unique.reset_index()).set_index('sample').add_prefix('zlcrare_').reset_index()
-    df_zlc_share = zero_inflate_lowcount(df_hits_shared.reset_index()).set_index('sample').add_prefix('zlcshare_').reset_index()
-
-    # robust zero truncated poisson, high depth kmers trimmed
-    df_zrob_all = zero_inflate_robust(df_hits).set_index('sample').add_prefix('zroball_').reset_index()
-    df_zrob_rare = zero_inflate_robust(df_hits_unique.reset_index()).set_index('sample').add_prefix('zrobrare_').reset_index()
-    df_zrob_share = zero_inflate_robust(df_hits_shared.reset_index()).set_index('sample').add_prefix('zrobshare_').reset_index()
-
-    # GC-bias corrected zero inflation (kmer GC from the kmer strings)
-    df_gc_all = gc_stratified_0_inflation(df_hits).set_index('sample').add_prefix('gcall_').reset_index()
-    df_gc_rare = gc_stratified_0_inflation(df_hits_unique.reset_index()).set_index('sample').add_prefix('gcrare_').reset_index()
-
-    df_blocks_gpd = df_blocks.groupby('sample').agg(**{'block_count': ('block_id', 'count'),
-                                                       '0_cov_blocks': ('block_coverage', lambda x: sum(x==0))})
- 
-
-    df_cov_depth = (df_cov_depth.merge(df_zpt_all, on='sample', how='left')
-                    .merge(df_zpt_rare, on='sample', how='left')
-                    .merge(df_zpt_share, on='sample', how='left')
-                    .merge(df_zlc_all, on='sample', how='left')
-                    .merge(df_zlc_rare, on='sample', how='left')
-                    .merge(df_zlc_share, on='sample', how='left')
-                    .merge(df_zrob_all, on='sample', how='left')
-                    .merge(df_zrob_rare, on='sample', how='left')
-                    .merge(df_zrob_share, on='sample', how='left')
-                    .merge(df_gc_all, on='sample', how='left')
-                    .merge(df_gc_rare, on='sample', how='left')
-                    .merge(df_blocks_gpd, on='sample', how='left'))
-
-    # spatial evenness along the genome (needs --reference for kmer positions)
+    # blocks and spatial evenness along the genome (needs --reference for kmer positions)
     if args.reference:
+        df_blocks_gpd = df_blocks.groupby('sample', observed=True).agg(**{'block_count': ('block_id', 'count'),
+                                                                          '0_cov_blocks': ('block_coverage', lambda x: sum(x==0))}).reset_index()
+        df_cov_depth = df_cov_depth.merge(df_blocks_gpd, on='sample', how='left')
         df_cov_depth = df_cov_depth.merge(window_evenness(df_loc_counts, df_hits), on='sample', how='left')
 
     # strain GC content: a genus-level fingerprint (taxon proxy) -> for stratifying / checking, not as a model feature
-    df_cov_depth['strain_gc'] = round(kmer_gc(df_hits['#kmer']).mean(), 4)
+    df_cov_depth['strain_gc'] = round(np.mean([(k.upper().count('G') + k.upper().count('C')) / len(k) for k in df_hits['#kmer']]), 4)
 
     # get relative abundance
     df_cov_depth = df_cov_depth.merge(total_evaluated, on='sample', how='left')
-    #df_cov_depth['relative_abundance'] =round((df_cov_depth['depth_rare_kmers'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
-    #df_cov_depth['relative_abundance_pos'] =round((df_cov_depth['depth_pos'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100,4)
 
     # relative signature: rare kmers missing while shared kmers are present
     df_cov_depth['percentage_rare'] = df_cov_depth['rare_kmers_total'] / df_cov_depth['all_kmers_total']
-    for est in ['zrob', 'zlc']:
-        df_cov_depth[f'{est}_rare_minus_share'] = df_cov_depth[f'{est}rare_frac_absent'] - df_cov_depth[f'{est}share_frac_absent']
-        # no shared kmers (percentage_rare == 1): a relative can't explain the hits -> rare-only value
-        no_shared = df_cov_depth[f'{est}share_frac_absent'].isna() & df_cov_depth[f'{est}rare_frac_absent'].notna()
-        df_cov_depth.loc[no_shared, f'{est}_rare_minus_share'] = df_cov_depth.loc[no_shared, f'{est}rare_frac_absent']
+    if 'rare' in zi_subsets and 'share' in zi_subsets:
+        df_cov_depth['zi_frac_rare_minus_share'] = df_cov_depth['rare_zi_frac'] - df_cov_depth['share_zi_frac']
+        # depth of strain-specific vs shared kmers among present kmers: a relative inflates shared depth (ratio < 1)
+        df_cov_depth['depth_rare_over_share'] = df_cov_depth['rare_lambda'] / df_cov_depth['share_lambda']
 
-    # hybrid: robust estimate, NaN (too few positive kmers) filled with the low-count estimate
-    for sub in ['all', 'rare', 'share']:
-        for stat in ['lambda', 'frac_absent', 'zi_index']:
-            df_cov_depth[f'zhyb{sub}_{stat}'] = df_cov_depth[f'zrob{sub}_{stat}'].fillna(df_cov_depth[f'zlc{sub}_{stat}'])
-    df_cov_depth['zhyb_rare_minus_share'] = df_cov_depth['zrob_rare_minus_share'].fillna(df_cov_depth['zlc_rare_minus_share'])
-
-    # relative abundance from depth among present kmers (robust lambda: no zeros, no high-depth tail)
-    for est in ['zroball', 'zrobrare', 'zhyball', 'zhybrare']:
-        df_cov_depth[f'relative_abundance_{est}'] = round((df_cov_depth[f'{est}_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
-
-    # depth of strain-specific vs shared kmers among present kmers: a relative inflates shared depth (ratio < 1)
-    df_cov_depth['depth_rare_over_share'] = df_cov_depth['zhybrare_lambda'] / df_cov_depth['zhybshare_lambda']
+    # relative abundance from the target peak depth (no zeros, no relative / high-depth peaks)
+    for sub in zi_subsets:
+        if sub == 'share':
+            continue
+        df_cov_depth[f'relative_abundance_{sub}'] = round((df_cov_depth[f'{sub}_lambda'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
+    df_cov_depth['relative_abundance_present'] = round((df_cov_depth['all_lambda_present'] * df_cov_depth['total_strain_kmers'] / df_cov_depth['total_evaluated']) * 100, 4)
 
 
     # Exports and figures
-    if args.strain:
-        df_cov_depth['strain'] = args.strain 
+    df_cov_depth['strain'] = args.strain if args.strain else basename
     df_cov_depth.set_index(['strain', 'sample']).round(4).to_csv(os.path.join(outpath,"coverage_depth.tsv"), sep = '\t')
     print(f'Saved coverage dataframe to \n {outpath}')
     print(df_cov_depth.head(5))
 
+    # histograms for parameter optimisation on real data (refit_from_histograms)
+    if args.export_hist:
+        hist_path = os.path.join(outpath, f'{basename}.zi_hist.tsv.gz')
+        hit_histograms(zi_subsets, basename).to_csv(hist_path, sep='\t', index=False)
+        print(f'Saved hit histograms to \n {hist_path}')
+
     if args.figures != 'none':
-        if not args.reference:
-            plot_hit_distribution(df_hits, args.output_dir, basename, quality=args.figures)
-        basename = args.strain if args.strain else 'contig_map'
-        plot_map(df_loc_counts, args.output_dir, basename,
-                 df_hits=df_hits, quality=args.figures)
-        plot_hit_distribution(df_hits, args.output_dir, basename, quality=args.figures)
+        plot_zi_distribution(zi_subsets, args.output_dir, basename, quality=args.figures, zi_params=zi_params)
+        if args.reference:
+            plot_map(df_loc_counts, args.output_dir, basename,
+                     df_hits=df_hits, quality=args.figures)
 
 
-        
+
 
 
 if __name__ == '__main__':

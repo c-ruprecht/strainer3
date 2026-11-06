@@ -4,8 +4,10 @@ import argparse
 import glob
 import json
 import numpy as np
+import xgboost as xgb
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(SCRIPT_DIR, '..', 'data')
 
 
 def concat_files(paths, label):
@@ -22,13 +24,50 @@ def concat_files(paths, label):
     return pd.concat(li_dfs, ignore_index=True)
 
 
+def load_model(prefix):
+    """load the xgb model (<prefix>.json) and its metadata (<prefix>_meta.json) exported by the notebook"""
+    with open(f'{prefix}_meta.json') as fh:
+        meta = json.load(fh)
+    model = xgb.XGBClassifier()
+    model.load_model(f'{prefix}.json')
+    return model, meta
+
+
+def xgb_hit_call(df, model, meta, cutoff_rule=None):
+    """add xgb_prob (P(present)) and xgb_call (0/1) to df using the features stored in meta"""
+    features = meta['features']
+    missing = [f for f in features if f not in df.columns]
+    if missing:
+        raise KeyError(f'model needs columns {missing}, not found in coverage table')
+
+    if cutoff_rule:
+        if cutoff_rule not in meta['cutoffs']:
+            raise KeyError(f"cutoff rule '{cutoff_rule}' not in model, choose from {list(meta['cutoffs'])}")
+        threshold = meta['cutoffs'][cutoff_rule]['threshold']
+    else:
+        cutoff_rule, threshold = meta['cutoff_rule'], meta['threshold']
+
+    # same preparation as in training: inf -> +/-1e12, NaN kept (xgboost routes missing values)
+    X = df[features].replace([np.inf, -np.inf], [1e12, -1e12]).astype(float)
+    df = df.copy()
+    df['xgb_prob'] = model.predict_proba(X)[:, 1]
+    df['xgb_call'] = (df['xgb_prob'] >= threshold).astype(int)
+    print(f"xgb hit call: features {features}, rule '{cutoff_rule}', threshold {threshold:.3f} "
+          f"-> {df['xgb_call'].sum()} of {len(df)} strain x sample calls")
+    return df
+
+
 def main():
     # to do, basename + strain name addition
     parser = argparse.ArgumentParser(description='Using coverage and depth to make hit calls')
     parser.add_argument('--coverage_file', help='a coverage_depth.tsv file')
     parser.add_argument('--hist_file', help='a zi_hist.tsv.gz file (coverage_depth_locations.py --export_hist)')
     parser.add_argument('--coverage_dir', help = "Directory in which coverage files are contained, will discover 'coverage_depth.tsv' and 'zi_hist.tsv.gz' files in subdirectories and concat them")
-    parser.add_argument('--cutoffs', help = 'Cutoff file path from strainer3', default=os.path.join(SCRIPT_DIR,'..', 'data', 'cutoffs.tsv'))
+    parser.add_argument('--model', help = 'xgb model prefix: <prefix>.json + <prefix>_meta.json',
+                        default=os.path.join(DATA_DIR, 'xgb_hitcall_2param'))
+    parser.add_argument('--cutoff_rule', default='precision >= 0.95',
+                        help = "probability cutoff stored in the model meta, e.g. 'max F1' or 'precision >= 0.99' "
+                        "(default: 'precision >= 0.95')")
     parser.add_argument('--output_dir', help='directory where output is saved')
     parser.add_argument('--verbose',action='store_true', help = 'incluces all possible metrics from coverage_depth into hit call table')
     args = parser.parse_args()
@@ -37,9 +76,6 @@ def main():
         parser.error('give --coverage_file or --coverage_dir')
 
     os.makedirs(args.output_dir, exist_ok=True)
-    # concat hit files for different strains
-    df_cutoffs = pd.read_csv(args.cutoffs, sep = '\t')
-    print(df_cutoffs)
 
     df_cov = None
     df_hist = None
@@ -84,29 +120,18 @@ def main():
         print(f"Saved {df_hist[['strain', 'sample']].drop_duplicates().shape[0]} strain x sample histograms to \n {hist_path}")
 
 
-    # get rare cutoffs
-    df_cutoffs_s = df_cutoffs[['rare kmers', 'PR']].sort_values('rare kmers')
-    df_cov = df_cov.sort_values('coverage_rare_kmers')
-    df_cov = pd.merge_asof(df_cov, df_cutoffs_s,
-                           left_on='coverage_rare_kmers', right_on='rare kmers',
-                           direction='backward')
-
-    df_cov['hit_call_pr'] = df_cov['PR'].astype(str) + ' (' + df_cov['rare kmers'].astype(str) + ')'
-    df_cov.loc[df_cov['PR'].isna(), 'hit_call_pr'] = np.nan
-    df_cov = df_cov.drop(columns=['PR', 'rare kmers'])
-
     df_cov['depth_ratio'] = df_cov['depth_rare_kmers']/df_cov['depth_nonrare_kmers']
 
-    # get all metrics neccessary for xgb hit calling
-    df_hits = df_cov[[ 'strain','sample', 'hit_call_pr', 'coverage_rare_kmers', 'rare_count']].copy()
+    # make the hit call with the xgb model
+    model, meta = load_model(args.model)
+    df_cov = xgb_hit_call(df_cov, model, meta, args.cutoff_rule)
 
-    # make the hit call
-
-    print(df_hits)
+    # non verbose: the model's input columns, its probability and the call
+    df_hits = df_cov[['strain', 'sample'] + meta['features'] + ['xgb_prob', 'xgb_call']].copy()
     if args.verbose:
         df_hits = df_cov.copy()
-        print(df_hits)
-    df_hits.sort_values('coverage_rare_kmers', ascending= False).to_csv(os.path.join(args.output_dir, 'hit_calls.tsv'), sep = '\t', index = None)
+    print(df_hits)
+    df_hits.sort_values('xgb_prob', ascending= False).to_csv(os.path.join(args.output_dir, 'hit_calls.tsv'), sep = '\t', index = None)
 
 
 if __name__ == "__main__":

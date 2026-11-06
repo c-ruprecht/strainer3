@@ -75,9 +75,13 @@ ZI_PARAMS = dict(k_max=3,          # max number of Poisson components (chosen by
 
 def ztp_lambda(m_pos):
     """MLE of λ for a zero-truncated Poisson with mean m_pos (mean of the positive counts)"""
-    if not np.isfinite(m_pos) or m_pos <= 1 + 1e-9:
+    if not np.isfinite(m_pos) or m_pos <= 1:
         return 1e-6                                            # all positives are 1s -> λ -> 0
-    return brentq(lambda l: l / (1 - np.exp(-l)) - m_pos, 1e-9, m_pos)
+    if m_pos < 1 + 1e-4:
+        return max(2.0 * (m_pos - 1), 1e-6)                    # small λ: E[X | X > 0] = 1 + λ/2 + O(λ²)
+    # λ / (1 - e^-λ) with expm1: exact near 0, where 1 - exp(-λ) loses precision and brentq sees no sign change
+    return brentq(lambda l: l / -np.expm1(-l) - m_pos, 1e-8, m_pos + 1)
+
 
 def ztp_mixture(x, K=2, n_iter=300, tol=1e-8):
     """EM for a mixture of K zero-truncated Poissons on the positive counts (histogram based). Zeros are never used."""

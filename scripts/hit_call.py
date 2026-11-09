@@ -130,10 +130,36 @@ def parse_model_arg(arg):
     return None, arg
 
 
+# rule names of the first notebook export ('thresholds' layout) -> names used here
+OLD_RULE_NAMES = {'max_F1': 'max F1', 'default_0.5': 'p >= 0.5',
+                  'precision_0.90': 'precision >= 0.90', 'precision_0.95': 'precision >= 0.95',
+                  'precision_0.99': 'precision >= 0.99'}
+
+
+def meta_path(prefix):
+    """<prefix>_meta.json, or <prefix>.meta.json as written by the first notebook export"""
+    for p in (f'{prefix}_meta.json', f'{prefix}.meta.json'):
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f'no {prefix}_meta.json or {prefix}.meta.json')
+
+
+def normalise_meta(meta):
+    """accept both meta layouts: cutoffs/cutoff_rule/threshold, or the older thresholds/recommended_threshold"""
+    if 'cutoffs' not in meta and 'thresholds' in meta:
+        meta['cutoffs'] = {OLD_RULE_NAMES.get(k, k): {'threshold': v}
+                           for k, v in meta['thresholds'].items() if v is not None}
+        rec = meta.get('recommended_threshold')
+        meta.setdefault('cutoff_rule', OLD_RULE_NAMES.get(rec, rec) if rec else next(iter(meta['cutoffs'])))
+    if 'threshold' not in meta and meta.get('cutoff_rule') in meta.get('cutoffs', {}):
+        meta['threshold'] = meta['cutoffs'][meta['cutoff_rule']]['threshold']
+    return meta
+
+
 def load_model(prefix):
-    """load the xgb model (<prefix>.json) and its metadata (<prefix>_meta.json) exported by the notebook"""
-    with open(f'{prefix}_meta.json') as fh:
-        meta = json.load(fh)
+    """load the xgb model (<prefix>.json) and its metadata (<prefix>_meta.json or <prefix>.meta.json)"""
+    with open(meta_path(prefix)) as fh:
+        meta = normalise_meta(json.load(fh))
     model = xgb.XGBClassifier()
     model.load_model(f'{prefix}.json')
     return model, meta

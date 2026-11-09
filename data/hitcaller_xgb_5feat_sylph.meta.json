@@ -1,0 +1,92 @@
+{
+  "model_name": "hitcaller_xgb_5feat_sylph",
+  "created": "2026-11-09T12:03:55",
+  "features": [
+    "coverage_rare_kmers",
+    "all_zi_frac",
+    "sylph_Naive_ANI",
+    "window_depth_cv",
+    "total_evaluated"
+  ],
+  "preprocessing": {
+    "inf_replacement": {
+      "inf": 1000000000000.0,
+      "-inf": -1000000000000.0
+    },
+    "missing": "NaN (native XGBoost handling)",
+    "dtype": "float"
+  },
+  "monotone_constraints": {
+    "coverage_rare_kmers": 1,
+    "all_zi_frac": -1,
+    "sylph_Naive_ANI": 1,
+    "window_depth_cv": -1,
+    "total_evaluated": 0
+  },
+  "params": {
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "n_estimators": 250,
+    "min_child_weight": 5,
+    "subsample": 0.8,
+    "reg_lambda": 5,
+    "gamma": 0.5,
+    "objective": "binary:logistic",
+    "tree_method": "hist",
+    "random_state": 42,
+    "monotone_constraints": [
+      1,
+      -1,
+      1,
+      -1,
+      0
+    ]
+  },
+  "thresholds": {
+    "max_F1": 0.3467216193675995,
+    "default_0.5": 0.5,
+    "precision_0.90": 0.5228692889213562,
+    "precision_0.95": 0.7640172839164734
+  },
+  "recommended_threshold": "max_F1",
+  "cv": {
+    "scheme": "StratifiedGroupKFold by sample",
+    "n_splits": 6,
+    "seed": 42,
+    "oof_PR_AUC": 0.666855780318898,
+    "oof_ROC_AUC": 0.8757412431652796
+  },
+  "training_data": {
+    "hits": "/metrica/projects/faith/strainer/20261102-zeroinflation/outputs/hit_calls._w_sylph.tsv",
+    "truth": "/metrica/projects/faith/strainer/20261102-zeroinflation/classification_truth/sc2_truth_table_ani.tsv",
+    "n_rows": 71640,
+    "n_positive": 3980,
+    "downsample_levels": [
+      0.001,
+      0.01,
+      0.05,
+      0.1,
+      0.2,
+      0.5,
+      1.0,
+      2.5,
+      5.0,
+      8.0
+    ],
+    "X_sha256": "c7df21b3ce0381ecd0b6e2cbc69b095bed1edd8b38eb8613a75e6ca2385124c3"
+  },
+  "shap_mean_abs": {
+    "window_depth_cv": 0.7392699718475342,
+    "sylph_Naive_ANI": 0.7056300044059753,
+    "coverage_rare_kmers": 0.6256700158119202,
+    "total_evaluated": 0.5877000093460083,
+    "all_zi_frac": 0.24282999336719513
+  },
+  "versions": {
+    "xgboost": "3.2.0",
+    "sklearn": "1.7.2",
+    "pandas": "2.3.3",
+    "numpy": "2.3.5",
+    "shap": "0.52.0"
+  }
+}

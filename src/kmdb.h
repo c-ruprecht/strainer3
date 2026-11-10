@@ -23,16 +23,23 @@
 	               uint64   index_offset
 	               uint64   meta_offset
 	               uint64   meta_len
-	               uint64   flags      (bit 0: canonical = max(fwd, rc))
+	               uint64   flags      (bit 0: canonical = max(fwd, rc),
+	                                    bit 1: blocks carry min read hashes)
 	  [64..]     blocks, back to back. Each block is one zstd frame (with
 	             content checksum) whose decompressed payload is
 	               n varints: key deltas (first is 0, relative to
 	                          index.first_kmer)
 	               n varints: counts
+	               n varints: min read hash   (only with flag bit 1)
 	  [meta]     "key=value\n" text lines
 	  [index]    n_blocks x 32 bytes
 	               uint64 first_kmer, uint64 last_kmer, uint64 offset,
 	               uint32 comp_size,  uint32 n
+
+	Version 1 files have no read hashes. Files with read hashes (flag bit 1,
+	kmer_metagenome_db -m sample --read-hash) are written as version 2, so
+	readers that predate the extra section refuse them instead of misreading
+	them. This reader accepts both. See readhash.h for the hash.
 
 	Blocks are independent, so readers can decode any block from any
 	thread; kmdb_read_block() uses pread() and is thread-safe as long as
@@ -41,12 +48,15 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "readhash.h"
 
 #define KMDB_MAGIC            "KMDB"
-#define KMDB_VERSION          1u
+#define KMDB_VERSION          1u   /* without read hashes */
+#define KMDB_VERSION_READHASH 2u   /* with read hashes (flag bit 1) */
 #define KMDB_HEADER_SIZE      64u
 #define KMDB_INDEX_ENTRY_SIZE 32u
 #define KMDB_FLAG_CANON_MAX   1ull
+#define KMDB_FLAG_READHASH    2ull
 #define KMDB_DEFAULT_BLOCK_N  (1u << 20)
 #define KMDB_MAX_K            31
 
@@ -85,8 +95,16 @@ typedef struct kmdb_writer_s kmdb_writer;
 /* block_n == 0 -> KMDB_DEFAULT_BLOCK_N; zstd_level == 0 -> 3 */
 kmdb_writer *kmdb_writer_open(const char *path, int k, uint32_t block_n,
                               int zstd_level);
-/* Keys must be strictly increasing. Returns 0, or -1 on error. */
+/* as kmdb_writer_open; read_hash != 0 stores a min read hash per k-mer
+   (kmdb_writer_add_rh) and writes a version 2 file */
+kmdb_writer *kmdb_writer_open_rh(const char *path, int k, uint32_t block_n,
+                                 int zstd_level, int read_hash);
+/* Keys must be strictly increasing. Returns 0, or -1 on error.
+   On a read-hash writer the hash is stored as READHASH_NONE (0). */
 int  kmdb_writer_add(kmdb_writer *w, uint64_t kmer, uint32_t count);
+/* add with a min read hash (ignored by a writer opened without read_hash) */
+int  kmdb_writer_add_rh(kmdb_writer *w, uint64_t kmer, uint32_t count,
+                        uint32_t min_hash);
 /* Metadata is written at close. Keys/values must not contain '\n' or '='
    in keys. Later calls with the same key are appended, not replaced. */
 void kmdb_writer_meta(kmdb_writer *w, const char *key, const char *value);
@@ -116,6 +134,7 @@ typedef struct {
 	char            *meta;       /* NUL-terminated "key=value\n" text */
 	uint32_t         max_comp_size;
 	uint32_t         max_n;
+	int              has_read_hash;   /* flag bit 1: blocks carry min read hashes */
 } kmdb_t;
 
 /* Per-thread decode buffers. */
@@ -127,6 +146,7 @@ typedef struct {
 	size_t    raw_cap;
 	uint64_t *kmers;
 	uint32_t *counts;
+	uint32_t *min_hash;  /* per k-mer min read hash; valid only if db->has_read_hash */
 	size_t    n_cap;
 } kmdb_block_buf;
 
@@ -139,7 +159,8 @@ char       *kmdb_meta_get(const kmdb_t *db, const char *key);
 
 void kmdb_block_buf_init(kmdb_block_buf *b);
 void kmdb_block_buf_free(kmdb_block_buf *b);
-/* Decodes block i into b->kmers / b->counts. Returns n, or -1 on error. */
+/* Decodes block i into b->kmers / b->counts (and b->min_hash if the database
+   has read hashes). Returns n, or -1 on error. */
 long kmdb_read_block(const kmdb_t *db, uint64_t i, kmdb_block_buf *b);
 
 /* True if path ends in ".kmdb". */

@@ -74,6 +74,20 @@
 	  pair_dedup (metadata) records 1/0. The skipped increments are also
 	  reported on stderr (and --stats).
 
+	  Read hash (--read-hash, sample mode only)
+	  Also stores, per k-mer, the smallest read hash over the fragments that
+	  contain it (readhash.h). A fragment is a read pair with pair dedup and
+	  PE / interleaved input, otherwise a single read; fragments are numbered
+	  in input order (only those with a read of length >= k), and the number
+	  is hashed to 32 bits. k-mers seen in one fragment only carry that
+	  fragment's hash, so the number of distinct min hashes among a strain's
+	  hit k-mers estimates how many reads produced the hits. kmer_strain_detect
+	  numbers FASTQ fragments the same way, so both give identical hashes for
+	  the same reads. Costs 4 bytes per table slot (16 instead of 12) and about
+	  4-5 bytes per k-mer on disk (random hashes do not compress); the file is
+	  written as kmdb version 2 (flag bit 1). Metadata: read_hash=1 and
+	  n_fragments.
+
 	Low-memory mode (-M <passes> or -R <GB>)
 	  The k-mer space is split into M hash slices by a second hash,
 	  independent of the partition and slot hashes. Pass j reads the
@@ -117,6 +131,7 @@
 #endif
 #include "kseq.h"
 #include "kmdb.h"
+#include "readhash.h"
 #include "cli_common.h"
 
 KSEQ_INIT(gzFile, gzread)
@@ -327,24 +342,27 @@ typedef struct {
 	uint64_t *keys;
 	uint8_t  *counts;
 	uint32_t *counts32;
+	uint32_t *mh;    /* sample + --read-hash: min read hash per slot, else NULL */
 	size_t    cap;   /* power of two */
 	size_t    n;
 } tab_t;
 
-static void tab_init(tab_t *t, size_t cap, int wide)
+static void tab_init(tab_t *t, size_t cap, int wide, int rh)
 {
 	t->cap      = cap;
 	t->n        = 0;
 	t->keys     = xmalloc(cap * sizeof(uint64_t));
 	t->counts   = wide ? NULL : xmalloc(cap * sizeof(uint8_t));
 	t->counts32 = wide ? xmalloc(cap * sizeof(uint32_t)) : NULL;
+	t->mh       = (wide && rh) ? xmalloc(cap * sizeof(uint32_t)) : NULL;
 	memset(t->keys, 0xFF, cap * sizeof(uint64_t));
 }
 
 static void tab_free(tab_t *t)
 {
-	free(t->keys); free(t->counts); free(t->counts32);
-	t->keys = NULL; t->counts = NULL; t->counts32 = NULL; t->cap = t->n = 0;
+	free(t->keys); free(t->counts); free(t->counts32); free(t->mh);
+	t->keys = NULL; t->counts = NULL; t->counts32 = NULL; t->mh = NULL;
+	t->cap = t->n = 0;
 }
 
 static void tab_put_new(tab_t *t, uint64_t key, uint8_t count)
@@ -356,12 +374,13 @@ static void tab_put_new(tab_t *t, uint64_t key, uint8_t count)
 	t->n++;
 }
 
-static void tab_put_new32(tab_t *t, uint64_t key, uint32_t count)
+static void tab_put_new32(tab_t *t, uint64_t key, uint32_t count, uint32_t mh)
 {
 	size_t mask = t->cap - 1, i = mix64(key) & mask;
 	while (t->keys[i] != EMPTY_KEY) i = (i + 1) & mask;
 	t->keys[i] = key;
 	t->counts32[i] = count;
+	if (t->mh) t->mh[i] = mh;
 	t->n++;
 }
 
@@ -369,10 +388,11 @@ static void tab_grow(tab_t *t)
 {
 	tab_t nt;
 	int wide = t->counts32 != NULL;
-	tab_init(&nt, t->cap * 2, wide);
+	tab_init(&nt, t->cap * 2, wide, t->mh != NULL);
 	for (size_t i = 0; i < t->cap; i++) {
 		if (t->keys[i] == EMPTY_KEY) continue;
-		if (wide) tab_put_new32(&nt, t->keys[i], t->counts32[i]);
+		if (wide) tab_put_new32(&nt, t->keys[i], t->counts32[i],
+		                        t->mh ? t->mh[i] : READHASH_NONE);
 		else      tab_put_new(&nt, t->keys[i], t->counts[i]);
 	}
 	tab_free(t);
@@ -419,6 +439,29 @@ static inline void tab_inc32(tab_t *t, uint64_t key, uint64_t h)
 	}
 }
 
+/* sample + --read-hash: count, and keep the smallest fragment hash rh */
+static inline void tab_inc32_rh(tab_t *t, uint64_t key, uint64_t h, uint32_t rh)
+{
+	if (t->n * MAX_LOAD_DEN >= t->cap * MAX_LOAD_NUM) tab_grow(t);
+	size_t mask = t->cap - 1, i = h & mask;
+	for (;;) {
+		uint64_t k = t->keys[i];
+		if (k == key) {
+			if (t->counts32[i] != COUNT32_MAX) t->counts32[i]++;
+			if (rh < t->mh[i]) t->mh[i] = rh;
+			return;
+		}
+		if (k == EMPTY_KEY) {
+			t->keys[i] = key;
+			t->counts32[i] = 1;
+			t->mh[i] = rh;
+			t->n++;
+			return;
+		}
+		i = (i + 1) & mask;
+	}
+}
+
 /* ── shared state ─────────────────────────────────────────────────── */
 
 typedef struct {
@@ -427,6 +470,7 @@ typedef struct {
 	uint32_t *lens;
 	uint8_t  *fl;      /* FL_LAST / FL_PAIRED per read */
 	size_t    n, n_cap;
+	uint64_t  frag0;   /* number of the batch's first fragment (read hash) */
 	uint64_t  seqno;
 	int       ready;
 	int       remaining;
@@ -448,7 +492,9 @@ typedef struct {
 	input_t   *inputs;
 	int        n_inputs;
 	int        pair_dedup;     /* count each k-mer once per read pair */
+	int        read_hash;      /* sample mode: keep a min fragment hash per k-mer */
 	uint64_t   n_pairs;        /* fragments read as pairs (reader) */
+	uint64_t   n_frags;        /* fragments with >= 1 stored read (reader) */
 	uint64_t  *dd_paired;      /* per thread: hits in paired fragments */
 	uint64_t  *dd_skipped;     /* per thread: increments skipped by dedup */
 	batch_t    slots[N_SLOTS];
@@ -491,6 +537,7 @@ static batch_t *acquire_slot(ctx_t *c, uint64_t seqno)
 	pthread_mutex_unlock(&c->mtx);
 	b->seq_len = 0;
 	b->n = 0;
+	b->frag0 = c->n_frags;   /* batches start on a fragment boundary */
 	return b;
 }
 
@@ -523,7 +570,10 @@ static int batch_add(ctx_t *c, batch_t *b, const kseq_t *seq)
 static void frag_end(ctx_t *c, batch_t **b, uint64_t *next, int added,
                      uint8_t paired)
 {
-	if (added) (*b)->fl[(*b)->n - 1] = (uint8_t)(FL_LAST | paired);
+	if (added) {
+		(*b)->fl[(*b)->n - 1] = (uint8_t)(FL_LAST | paired);
+		c->n_frags++;              /* only fragments that stored a read are numbered */
+	}
 	if ((*b)->seq_len >= BATCH_BASES) {
 		publish(c, *b);
 		*b = acquire_slot(c, ++*next);
@@ -674,8 +724,9 @@ static void *reader_main(void *arg)
 {
 	ctx_t *c = arg;
 	uint64_t next = 0;
-	batch_t *b = acquire_slot(c, next);
 	c->n_pairs = 0;
+	c->n_frags = 0;
+	batch_t *b = acquire_slot(c, next);
 
 	for (int f = 0; f < c->n_inputs && !c->read_error; f++) {
 		const input_t *in = &c->inputs[f];
@@ -779,6 +830,7 @@ static void *count_main(void *arg)
 	const uint64_t mask = (k == 32) ? UINT64_MAX : ((1ull << (2 * k)) - 1);
 	tab_t *t = &c->tabs[tid];
 	const int wide = c->mode == MODE_SAMPLE;   /* loop-invariant */
+	const int rhash = wide && c->read_hash;
 	const int dedup = c->pair_dedup;
 	uint64_t valid = 0, paired_hits = 0, skipped = 0;
 	fset_t fs = { NULL, NULL, 0, 0 };
@@ -786,10 +838,13 @@ static void *count_main(void *arg)
 
 	for (uint64_t s = 0; (b = wait_batch(c, s)) != NULL; s++) {
 		const char *p = b->seq;
+		uint64_t frag = b->frag0;
 		for (size_t r = 0; r < b->n; ) {
 			/* fragment = reads r..e; FL_PAIRED sits on its last read */
 			size_t e = r;
 			while (e + 1 < b->n && !(b->fl[e] & FL_LAST)) e++;
+			const uint32_t rh = rhash ? read_hash(frag) : READHASH_NONE;
+			frag++;
 			const int dd = dedup && (b->fl[e] & FL_PAIRED);
 			if (dd) {
 				size_t nw = 0;
@@ -815,8 +870,9 @@ static void *count_main(void *arg)
 								paired_hits++;
 								if (!fset_add(&fs, can, h)) { skipped++; continue; }
 							}
-							if (wide) tab_inc32(t, can, h);
-							else      tab_inc(t, can, h);
+							if (rhash)     tab_inc32_rh(t, can, h, rh);
+							else if (wide) tab_inc32(t, can, h);
+							else           tab_inc(t, can, h);
 						}
 					}
 				}
@@ -912,7 +968,7 @@ static void *filter_main(void *arg)
 	uint8_t  *cs = xrealloc(t->counts, (keep ? keep : 1) * sizeof(uint8_t));
 
 	tab_t nt;
-	tab_init(&nt, pow2_at_least(keep * 2), 0);   /* load <= 0.5 */
+	tab_init(&nt, pow2_at_least(keep * 2), 0, 0);   /* load <= 0.5 (scrub mode: no hashes) */
 	for (size_t i = 0; i < keep; i++) tab_put_new(&nt, ks[i], cs[i]);
 	free(ks);
 	free(cs);
@@ -1066,44 +1122,49 @@ static void *compact_sort_main(void *arg)
 	return NULL;
 }
 
-/* sample mode: in-place quicksort of unique keys, carrying their counts */
-static inline void swap_kv(uint64_t *k, uint32_t *v, size_t i, size_t j)
+/* sample mode: in-place quicksort of unique keys, carrying their counts
+   and, with --read-hash, their min hashes (w == NULL otherwise) */
+static inline void swap_kv(uint64_t *k, uint32_t *v, uint32_t *w, size_t i, size_t j)
 {
 	uint64_t t = k[i]; k[i] = k[j]; k[j] = t;
 	uint32_t u = v[i]; v[i] = v[j]; v[j] = u;
+	if (w) { u = w[i]; w[i] = w[j]; w[j] = u; }
 }
 
-static void sort_kv(uint64_t *k, uint32_t *v, size_t n)
+static void sort_kv(uint64_t *k, uint32_t *v, uint32_t *w, size_t n)
 {
 	while (n > 24) {
 		size_t m = n / 2, hi = n - 1;
-		if (k[m] < k[0])  swap_kv(k, v, m, 0);
-		if (k[hi] < k[0]) swap_kv(k, v, hi, 0);
-		if (k[hi] < k[m]) swap_kv(k, v, hi, m);
-		swap_kv(k, v, 0, m);
+		if (k[m] < k[0])  swap_kv(k, v, w, m, 0);
+		if (k[hi] < k[0]) swap_kv(k, v, w, hi, 0);
+		if (k[hi] < k[m]) swap_kv(k, v, w, hi, m);
+		swap_kv(k, v, w, 0, m);
 		uint64_t p = k[0];
 		ptrdiff_t i = -1, j = (ptrdiff_t)n;
 		for (;;) {
 			do i++; while (k[i] < p);
 			do j--; while (k[j] > p);
 			if (i >= j) break;
-			swap_kv(k, v, (size_t)i, (size_t)j);
+			swap_kv(k, v, w, (size_t)i, (size_t)j);
 		}
 		size_t left = (size_t)j + 1;
 		if (left < n - left) {
-			sort_kv(k, v, left);
-			k += left; v += left; n -= left;
+			sort_kv(k, v, w, left);
+			k += left; v += left; if (w) w += left; n -= left;
 		} else {
-			sort_kv(k + left, v + left, n - left);
+			sort_kv(k + left, v + left, w ? w + left : NULL, n - left);
 			n = left;
 		}
 	}
 	for (size_t i = 1; i < n; i++) {
 		uint64_t kk = k[i];
-		uint32_t vv = v[i];
+		uint32_t vv = v[i], ww = w ? w[i] : 0;
 		size_t j = i;
-		while (j > 0 && k[j - 1] > kk) { k[j] = k[j - 1]; v[j] = v[j - 1]; j--; }
-		k[j] = kk; v[j] = vv;
+		while (j > 0 && k[j - 1] > kk) {
+			k[j] = k[j - 1]; v[j] = v[j - 1]; if (w) w[j] = w[j - 1];
+			j--;
+		}
+		k[j] = kk; v[j] = vv; if (w) w[j] = ww;
 	}
 }
 
@@ -1118,11 +1179,12 @@ static void *compact_sort_counts_main(void *arg)
 		if (t->keys[i] != EMPTY_KEY && t->counts32[i] >= c->min_count) {
 			t->keys[j]     = t->keys[i];
 			t->counts32[j] = t->counts32[i];
+			if (t->mh) t->mh[j] = t->mh[i];
 			j++;
 		}
 	}
 	t->n = j;
-	sort_kv(t->keys, t->counts32, j);
+	sort_kv(t->keys, t->counts32, t->mh, j);
 	return NULL;
 }
 
@@ -1169,7 +1231,7 @@ static size_t total_n(ctx_t *c)
 static double table_gb(ctx_t *c)
 {
 	size_t b = 0;
-	size_t slot = c->mode == MODE_SAMPLE ? 12 : 9;   /* key + count */
+	size_t slot = c->mode == MODE_SAMPLE ? (c->read_hash ? 16 : 12) : 9;   /* key + count (+ hash) */
 	for (uint32_t i = 0; i < c->P; i++) b += c->tabs[i].cap * slot;
 	return b / 1e9;
 }
@@ -1231,10 +1293,12 @@ static inline int emit_kmer(kmdb_writer *w, uint64_t key)
 	return kmdb_writer_add(w, key, 1);
 }
 
-/* sample mode: real counts */
-static inline int emit_kmer_count(kmdb_writer *w, uint64_t key, uint32_t count)
+/* sample mode: real counts (and, with --read-hash, the min read hash; a
+   writer opened without read hashes ignores it) */
+static inline int emit_kmer_count(kmdb_writer *w, uint64_t key, uint32_t count,
+                                  uint32_t mh)
 {
-	return kmdb_writer_add(w, key, count);
+	return kmdb_writer_add_rh(w, key, count, mh);
 }
 
 /* Where sorted k-mers go: the database (single pass) or a run file. */
@@ -1242,14 +1306,16 @@ typedef struct {
 	kmdb_writer *w;
 	FILE        *fp;
 	int          counts;    /* sample mode: carry counts */
+	int          rh;        /* --read-hash: carry min hashes */
 } sink_t;
 
-static inline int sink_put(sink_t *s, uint64_t key, uint32_t count)
+static inline int sink_put(sink_t *s, uint64_t key, uint32_t count, uint32_t mh)
 {
-	if (s->w) return s->counts ? emit_kmer_count(s->w, key, count)
+	if (s->w) return s->counts ? emit_kmer_count(s->w, key, count, mh)
 	                           : emit_kmer(s->w, key);
 	if (fwrite(&key, sizeof key, 1, s->fp) != 1) return -1;
 	if (s->counts && fwrite(&count, sizeof count, 1, s->fp) != 1) return -1;
+	if (s->rh && fwrite(&mh, sizeof mh, 1, s->fp) != 1) return -1;
 	return 0;
 }
 
@@ -1273,7 +1339,8 @@ static int merge_partitions(ctx_t *C, sink_t *s)
 	while (hn > 0 && !werr) {
 		uint32_t p = heap[0];
 		uint32_t cnt = C->mode == MODE_SAMPLE ? C->tabs[p].counts32[pos[p]] : 1;
-		if (sink_put(s, C->tabs[p].keys[pos[p]], cnt) != 0) werr = 1;
+		uint32_t mh  = C->tabs[p].mh ? C->tabs[p].mh[pos[p]] : READHASH_NONE;
+		if (sink_put(s, C->tabs[p].keys[pos[p]], cnt, mh) != 0) werr = 1;
 		if (++pos[p] == C->tabs[p].n) heap[0] = heap[--hn];
 		uint32_t i = 0;
 		for (;;) {
@@ -1291,19 +1358,21 @@ static int merge_partitions(ctx_t *C, sink_t *s)
 }
 
 /* final merge of the M disjoint, sorted run files into the database */
-typedef struct { FILE *fp; uint64_t key; uint32_t cnt; } runrd_t;
+typedef struct { FILE *fp; uint64_t key; uint32_t cnt, mh; } runrd_t;
 
 /* 1 = got a record, 0 = clean EOF, -1 = error */
-static int run_next(runrd_t *r, int counts)
+static int run_next(runrd_t *r, int counts, int rh)
 {
 	if (fread(&r->key, sizeof r->key, 1, r->fp) != 1)
 		return ferror(r->fp) ? -1 : 0;
 	r->cnt = 1;
+	r->mh  = READHASH_NONE;
 	if (counts && fread(&r->cnt, sizeof r->cnt, 1, r->fp) != 1) return -1;
+	if (rh && fread(&r->mh, sizeof r->mh, 1, r->fp) != 1) return -1;
 	return 1;
 }
 
-static int merge_runs(char **paths, uint32_t n, int counts, kmdb_writer *w)
+static int merge_runs(char **paths, uint32_t n, int counts, int rh, kmdb_writer *w)
 {
 	runrd_t *rd = calloc(n, sizeof *rd);
 	uint32_t *heap = xmalloc(sizeof(uint32_t) * n);
@@ -1317,7 +1386,7 @@ static int merge_runs(char **paths, uint32_t n, int counts, kmdb_writer *w)
 			break;
 		}
 		setvbuf(rd[i].fp, NULL, _IOFBF, RUN_BUF);
-		int rc = run_next(&rd[i], counts);
+		int rc = run_next(&rd[i], counts, rh);
 		if (rc < 0) { err = 1; break; }
 		if (rc == 0) continue;
 		uint32_t j = hn++;
@@ -1329,9 +1398,9 @@ static int merge_runs(char **paths, uint32_t n, int counts, kmdb_writer *w)
 	}
 	while (hn > 0 && !err) {
 		runrd_t *r = &rd[heap[0]];
-		int rc = counts ? emit_kmer_count(w, r->key, r->cnt) : emit_kmer(w, r->key);
+		int rc = counts ? emit_kmer_count(w, r->key, r->cnt, r->mh) : emit_kmer(w, r->key);
 		if (rc != 0) { err = 1; break; }
-		rc = run_next(r, counts);
+		rc = run_next(r, counts, rh);
 		if (rc < 0) { fprintf(stderr, "error: reading a run file failed\n"); err = 1; break; }
 		if (rc == 0) heap[0] = heap[--hn];
 		uint32_t j = 0;
@@ -1397,6 +1466,11 @@ static void usage(int status)
 	"               gives the old counts (each mate counted on its own).\n"
 	"               total_evaluated (metadata) = sum of all counts, so it\n"
 	"               follows the dedup setting; kmer_positions does not.\n"
+	"  --read-hash  also store per k-mer the smallest hash of the fragments (read\n"
+	"               pairs with pair dedup, else reads) that contain it; lets\n"
+	"               kmer_strain_detect --read-hash count the reads behind hits.\n"
+	"               +4 bytes per table slot, ~+4-5 bytes per k-mer on disk;\n"
+	"               written as kmdb version 2 (older readers refuse it).\n"
 	"  --interleaved  every single-file input holds mates as consecutive records\n"
 	"  --stats <file> also write the build statistics (incl. pair dedup) as TSV\n"
 	"  Memory: ~17-34 bytes per distinct k-mer in the reads (12-byte slots),\n"
@@ -1430,6 +1504,7 @@ int main(int argc, char *argv[])
 	input_t *inputs = NULL; int n_inputs = 0, cap_inputs = 0;
 	char **reads = NULL; int n_reads = 0;   /* flat list of every read file */
 	int pair_dedup = -1;       /* -1 = mode default */
+	int read_hash_opt = 0;     /* --read-hash */
 	int interleaved = 0;
 	char *stats_path = NULL;
 	char *reads_list = NULL, *genome_list = NULL;
@@ -1442,8 +1517,10 @@ int main(int argc, char *argv[])
 	int mode = MODE_SCRUB;
 	int c;
 
-	enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP, OPT_INTERLEAVED, OPT_STATS };
+	enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP, OPT_INTERLEAVED, OPT_STATS,
+	       OPT_READ_HASH };
 	static const struct option longopts[] = {
+		{ "read-hash",     no_argument,       NULL, OPT_READ_HASH },
 		{ "pair-dedup",    no_argument,       NULL, OPT_PAIR_DEDUP },
 		{ "no-pair-dedup", no_argument,       NULL, OPT_NO_PAIR_DEDUP },
 		{ "interleaved",   no_argument,       NULL, OPT_INTERLEAVED },
@@ -1458,6 +1535,7 @@ int main(int argc, char *argv[])
 		case OPT_NO_PAIR_DEDUP: pair_dedup = 0; break;
 		case OPT_INTERLEAVED:   interleaved = 1; break;
 		case OPT_STATS:         stats_path = strdup(optarg); break;
+		case OPT_READ_HASH:     read_hash_opt = 1; break;
 		case 'i': add_read_group(&inputs, &n_inputs, &cap_inputs, optarg); break;
 		case 'T': cli_renamed_flag("kmer_metagenome_db", 'T', "-m"); break;
 		case 'm':
@@ -1507,6 +1585,11 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	if (pair_dedup < 0) pair_dedup = mode == MODE_SAMPLE;
+	if (read_hash_opt && mode != MODE_SAMPLE) {
+		fprintf(stderr, "error: --read-hash is only for -m sample: a scrub "
+		        "database stores presence, not reads. Use -m sample.\n");
+		return 1;
+	}
 	int n_pe = 0, n_pei = 0, n_se = 0;
 	for (int i = 0; i < n_inputs; i++) {
 		if (inputs[i].f2) {
@@ -1605,13 +1688,14 @@ int main(int argc, char *argv[])
 	C.inputs       = inputs;
 	C.n_inputs     = n_inputs;
 	C.pair_dedup   = pair_dedup;
+	C.read_hash    = read_hash_opt;
 	C.dd_paired    = calloc((size_t)threads, sizeof(uint64_t));
 	C.dd_skipped   = calloc((size_t)threads, sizeof(uint64_t));
 	C.t_start      = now_s();
 	pthread_mutex_init(&C.mtx, NULL);
 	pthread_cond_init(&C.cv, NULL);
 	C.tabs = calloc(C.P, sizeof(tab_t));
-	const size_t slot = mode == MODE_SAMPLE ? 12 : 9;
+	const size_t slot = mode == MODE_SAMPLE ? (read_hash_opt ? 16 : 12) : 9;
 	const int wide = mode == MODE_SAMPLE;
 
 	if (genome_list && !estimate_only) {
@@ -1692,6 +1776,9 @@ int main(int argc, char *argv[])
 		        "min count %u, %u threads, %d read file(s)",
 		        name, C.k, C.min_count, C.P, n_reads);
 	fprintf(stderr, lowmem ? ", low-memory: %u pass(es)\n" : "\n", C.M);
+	if (mode == MODE_SAMPLE && read_hash_opt)
+		fprintf(stderr, "read hash: ON (min fragment hash per k-mer, 16-byte table "
+		        "slots, kmdb version 2)\n");
 	if (mode == MODE_SAMPLE) {
 		if (pair_dedup)
 			fprintf(stderr, "pair dedup: ON (each k-mer counted at most once per "
@@ -1734,7 +1821,7 @@ int main(int argc, char *argv[])
 
 	uint64_t distinct_all = 0, distinct_min = 0, final_n = 0, removed_total = 0;
 	uint64_t count_sum = 0, count_max = 0, n_saturated = 0;
-	uint64_t st_reads = 0, st_positions = 0, st_valid = 0, st_pairs = 0;
+	uint64_t st_reads = 0, st_positions = 0, st_valid = 0, st_pairs = 0, st_frags = 0;
 	uint64_t dd_paired_total = 0, dd_skipped_total = 0;
 	size_t prev_max_part = 0;   /* largest partition of the previous pass */
 	int werr = 0;
@@ -1750,7 +1837,7 @@ int main(int argc, char *argv[])
 			cap0 = cap_for(est_distinct / ((double)C.M * C.P) * 1.02);
 		else if (lowmem && pass > 0)
 			cap0 = cap_for(prev_max_part * 1.03);
-		for (uint32_t i = 0; i < C.P; i++) tab_init(&C.tabs[i], cap0, wide);
+		for (uint32_t i = 0; i < C.P; i++) tab_init(&C.tabs[i], cap0, wide, read_hash_opt);
 
 		/* 1) count */
 		fprintf(stderr, "[1/4] %scounting k-mers\n", tag);
@@ -1765,7 +1852,7 @@ int main(int argc, char *argv[])
 		}
 		if (pass == 0) {
 			st_reads = C.n_reads; st_positions = C.n_positions; st_valid = C.n_valid;
-			st_pairs = C.n_pairs;
+			st_pairs = C.n_pairs; st_frags = C.n_frags;
 			if (st_valid == 0) {
 				fprintf(stderr, "error: no valid k-mer windows in the reads, no "
 				        "database written\n");
@@ -1777,7 +1864,8 @@ int main(int argc, char *argv[])
 				        est_valid, st_valid);
 				return 1;
 			}
-		} else if (C.n_valid != st_valid || C.n_reads != st_reads) {
+		} else if (C.n_valid != st_valid || C.n_reads != st_reads ||
+		           C.n_frags != st_frags) {
 			fprintf(stderr, "error: pass %u read %" PRIu64 " reads / %" PRIu64
 			        " k-mer windows, pass 1 read %" PRIu64 " / %" PRIu64
 			        "; the input changed between passes, no database written\n",
@@ -1851,10 +1939,11 @@ int main(int argc, char *argv[])
 		final_n += pass_final;
 
 		/* write: straight into the database, or into this pass's run */
-		sink_t s = { NULL, NULL, mode == MODE_SAMPLE };
+		sink_t s = { NULL, NULL, mode == MODE_SAMPLE, read_hash_opt };
 		if (C.M == 1) {
 			fprintf(stderr, "      writing %s\n", out_path);
-			w = kmdb_writer_open(tmp_path, C.k, (uint32_t)block_n, (int)level);
+			w = kmdb_writer_open_rh(tmp_path, C.k, (uint32_t)block_n, (int)level,
+			                        read_hash_opt);
 			if (!w) return 1;
 			s.w = w;
 			if (merge_partitions(&C, &s) != 0) werr = 1;
@@ -1879,9 +1968,10 @@ int main(int argc, char *argv[])
 
 	if (C.M > 1 && !werr) {
 		fprintf(stderr, "merging %u runs into %s\n", C.M, out_path);
-		w = kmdb_writer_open(tmp_path, C.k, (uint32_t)block_n, (int)level);
+		w = kmdb_writer_open_rh(tmp_path, C.k, (uint32_t)block_n, (int)level,
+		                        read_hash_opt);
 		if (!w) return 1;
-		if (merge_runs(runs, C.M, mode == MODE_SAMPLE, w) != 0) werr = 1;
+		if (merge_runs(runs, C.M, mode == MODE_SAMPLE, read_hash_opt, w) != 0) werr = 1;
 		cleanup_runs();
 	}
 	if (count_sum && n_saturated)
@@ -1921,6 +2011,14 @@ int main(int argc, char *argv[])
 		kmdb_writer_meta_u64(w, "count_sum", count_sum);
 		kmdb_writer_meta_u64(w, "count_max", count_max);
 		kmdb_writer_meta_u64(w, "count_saturated", n_saturated);
+		kmdb_writer_meta_u64(w, "read_hash", (uint64_t)read_hash_opt);
+		if (read_hash_opt) {
+			kmdb_writer_meta(w, "read_hash_fn", "splitmix64(fragment number) >> 32, 0 -> 1 (readhash.h)");
+			kmdb_writer_meta(w, "read_hash_unit", pair_dedup && n_pe + n_pei > 0
+			                 ? "read pair (PE / interleaved inputs), single read (SE)"
+			                 : "single read");
+			kmdb_writer_meta_u64(w, "n_fragments", st_frags);
+		}
 	}
 	{
 		time_t now = time(NULL);

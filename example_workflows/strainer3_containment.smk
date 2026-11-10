@@ -61,6 +61,11 @@ SCRUB_T        = config.get("scrub_t", 0.999)                                  #
 FILTER_MIN     = config.get("filter_fraction", config.get("filter_min", 0.01)) # kmer_scrub_filter.py -m
 TERMINAL_DIST  = config.get("terminal_dist", 500)                              # coverage_depth.py --terminal_dist
 RARE_MIN_COUNT = config.get("rare_kmer_count", 1000)                           # coverage_depth.py --rare_min_count
+# read hashes: kmer_metagenome_db / kmer_strain_detect --read-hash -> {strain}.kmer_readhash.tsv.gz,
+# read-support columns in coverage_depth.tsv (rare_reads, rare_reads_eff, ...). Target kmdbs get bigger
+# (~4-5 bytes per k-mer) and are written as kmdb version 2.
+READ_HASH      = bool(config.get("read_hash", True))
+RH_FLAG        = "--read-hash" if READ_HASH else ""
 
 
 # ---------- execution environment (cluster vs local) ----------
@@ -187,6 +192,7 @@ rule target_kmdb:
     params:
         bin    = os.path.join(src_dir, "kmer_metagenome_db"),
         outdir = lambda wc, output: os.path.dirname(output[0]),
+        rh     = RH_FLAG,
     threads: R("target_kmdb", "threads")
     resources:
         lsf_queue = R("target_kmdb", "lsf_queue"),
@@ -196,7 +202,7 @@ rule target_kmdb:
         os.path.join(output_dir, "0-logs", "target_kmdb", "{target}.log")
     shell:
         """
-        {params.bin} -m sample \
+        {params.bin} -m sample {params.rh} \
             -O {params.outdir} \
             -n {wildcards.target} \
             -t {threads} \
@@ -403,9 +409,11 @@ rule strain_detect:
         kmdbs   = expand(rules.target_kmdb.output[0], target=dict_targets),
     output:
         sd("strain_detect", "{strain}.kmer_hits.tsv.gz"),
+        **({"readhash": sd("strain_detect", "{strain}.kmer_readhash.tsv.gz")} if READ_HASH else {}),
     params:
         bin    = os.path.join(src_dir, "kmer_strain_detect"),
         outdir = lambda wc, output: os.path.dirname(output[0]),
+        rh     = RH_FLAG,
     threads: R("strain_detect", "threads")
     resources:
         lsf_queue = R("strain_detect", "lsf_queue"),
@@ -420,6 +428,7 @@ rule strain_detect:
             -B {input.targets} \
             -O {params.outdir} \
             -n {wildcards.strain} \
+            {params.rh} \
             -t {threads} > {log} 2>&1
         """
 

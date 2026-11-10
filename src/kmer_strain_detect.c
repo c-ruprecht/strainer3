@@ -53,6 +53,21 @@
  * Usage:
  *   kmer_strain_detect -k <kmers[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-j threads]
  *
+ * Read hash (--read-hash): also writes <name>.kmer_readhash.tsv.gz, same rows
+ * and columns as the hits file, holding per k-mer and sample the smallest
+ * read (fragment) hash over the fragments that contain the k-mer (readhash.h;
+ * 0 = not seen). Hit k-mers that share a value were (at count 1: exactly)
+ * produced by the same read or read pair, so the number of distinct values
+ * among a strain's hit k-mers estimates the reads behind the hits. FASTQ
+ * targets: fragments are numbered while scanning (read pairs with pair dedup
+ * and PE / PEI input, else single reads; only fragments with a read of
+ * length >= k), exactly as kmer_metagenome_db -m sample --read-hash numbers
+ * them, so both give identical hashes for the same reads. .kmdb targets: the
+ * database's stored hashes (kmdb version 2); databases built without
+ * --read-hash give 0 (with a warning). Last row n_fragments: fragments
+ * numbered in the sample (FASTQ: counted here; .kmdb: its metadata, 0 if
+ * missing).
+ *
  * Build without libzstd (no -DHAVE_ZSTD): .kmdb targets are rejected with an
  * error, everything else works as before.
  */
@@ -74,6 +89,7 @@
 #include "BIO_hash.h"
 #include "genome_compare.h"
 #include "cli_common.h"
+#include "readhash.h"
 #ifdef HAVE_ZSTD
 #include "kmdb.h"
 #endif
@@ -97,7 +113,9 @@ typedef struct {
     int   type;
 } Metagenome;
 
-/* query k-mer, 2-bit packed canonical key -> its count vector */
+/* query k-mer, 2-bit packed canonical key -> its count vector.
+   With --read-hash the vector has 2 x n_total slots: counts[0..n_total) and
+   min read hashes [n_total..2 n_total). */
 typedef struct {
     uint64_t      key;
     unsigned int *counts;
@@ -113,6 +131,9 @@ typedef struct {
     size_t     n_qk;
     int        pair_dedup;   /* --pair-dedup */
     int        have_fastq;   /* any FASTQ target (for the .kmdb mismatch warning) */
+    int        read_hash;    /* --read-hash: min hashes at counts[n_total + mg_idx] */
+    int        n_total;      /* columns (targets + background) */
+    uint64_t  *n_frags;      /* per column: fragments numbered (read hash) */
 } ksd_job;
 
 typedef struct {
@@ -597,7 +618,17 @@ typedef struct {
     uint64_t  n_pairs;
     char     *rc;  size_t rc_cap;
     fset_t    fs;
+    int       rh_off;           /* --read-hash: offset of the hash slots (n_total), else -1 */
+    uint64_t  frag;             /* fragments numbered so far (read hash) */
+    uint32_t  cur_h;            /* hash of the current fragment */
 } scan_t;
+
+/* start a fragment: number it if it holds a read of length >= k (as
+   kmer_metagenome_db does), and set its hash */
+static inline void frag_begin(scan_t *S, size_t len1, size_t len2) {
+    if (S->rh_off < 0) return;
+    if (len1 >= (size_t)S->k || len2 >= (size_t)S->k) S->cur_h = read_hash(S->frag++);
+}
 
 /* Count the k-mers of one read. fs != NULL: pair dedup (skip k-mers already
    counted in this pair). Only ACGT-only windows count, as in
@@ -650,7 +681,13 @@ static void scan_read(scan_t *S, char *s, size_t len, fset_t *fs) {
 
         if (counted) {
             S->total++;
-            if (count) { count[S->mg_idx]++; S->hits++; }   /* only this thread writes this column */
+            if (count) {                                   /* only this thread writes this column */
+                count[S->mg_idx]++; S->hits++;
+                if (S->rh_off >= 0) {
+                    unsigned int *mh = &count[S->rh_off + S->mg_idx];
+                    *mh = read_hash_min(*mh, S->cur_h);
+                }
+            }
         } else {
             S->skip_total++;
             if (count) S->skip_hits++;
@@ -682,6 +719,7 @@ static void check_mates(const kstring_t *a, const kstring_t *b, const char *what
 }
 
 static void scan_pair(scan_t *S, kstring_t *r1, kstring_t *r2) {
+    frag_begin(S, r1->l, r2->l);
     fset_begin(&S->fs, n_windows(r1->l, S->k) + n_windows(r2->l, S->k));
     scan_read(S, r1->s, r1->l, &S->fs);
     scan_read(S, r2->s, r2->l, &S->fs);
@@ -708,7 +746,10 @@ static void scan_se(scan_t *S, const char *path) {
     gzFile fp = open_or_die(path);
     kseq_t *seq = kseq_init(fp);
     int l;
-    while ((l = kseq_read(seq)) >= 0) scan_read(S, seq->seq.s, seq->seq.l, NULL);
+    while ((l = kseq_read(seq)) >= 0) {
+        frag_begin(S, seq->seq.l, 0);
+        scan_read(S, seq->seq.s, seq->seq.l, NULL);
+    }
     if (l < -1) die_malformed(path, l);
     kseq_destroy(seq);
     gzclose(fp);
@@ -772,6 +813,7 @@ static void scan_target(ksd_job *job) {
     scan_t S;
     memset(&S, 0, sizeof S);
     S.h = job->h; S.k = job->seed; S.mg_idx = job->mg_idx;
+    S.rh_off = job->read_hash ? job->n_total : -1;
 
     const char *how;
     if (!job->pair_dedup) {
@@ -789,6 +831,7 @@ static void scan_target(ksd_job *job) {
         how = "SE";
     }
     job->total_kmer_counts[job->mg_idx] += S.total;
+    if (job->read_hash) job->n_frags[job->mg_idx] = S.frag;
 
     uint64_t all = S.total + S.skip_total, qall = S.hits + S.skip_hits;
     if (job->pair_dedup && mg->type != NOT_PAIRED_END)
@@ -831,7 +874,7 @@ static size_t qk_lower_bound(const QKmer *qk, size_t lo, size_t n, uint64_t key)
 
 static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
                       int mg_idx, uint64_t *total_kmer_counts, int pair_dedup,
-                      int have_fastq) {
+                      int have_fastq, int rh_off, uint64_t *n_frags) {
     kmdb_t *db = kmdb_open(path);
     if (!db) exit(1);
 
@@ -872,6 +915,18 @@ static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
                 "this run are counted %s it; their counts are not comparable\n",
                 path, db_dedup ? "with" : "without", pair_dedup ? "with" : "without");
 
+    /* --read-hash: use the database's hashes if it has them */
+    const int use_rh = rh_off >= 0 && db->has_read_hash;
+    if (rh_off >= 0) {
+        if (!db->has_read_hash)
+            fprintf(stderr, "WARNING: %s was built without --read-hash; its read "
+                    "hashes are reported as 0 (rebuild with kmer_metagenome_db "
+                    "-m sample --read-hash)\n", path);
+        char *nf = kmdb_meta_get(db, "n_fragments");
+        n_frags[mg_idx] = nf ? strtoull(nf, NULL, 10) : 0;
+        free(nf);
+    }
+
     kmdb_block_buf buf;
     kmdb_block_buf_init(&buf);
     size_t j = 0;
@@ -903,6 +958,7 @@ static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
                 }
                 if (lo < (size_t)n && keys[lo] == qk[j].key) {
                     qk[j].counts[mg_idx] += buf.counts[lo];
+                    if (use_rh) qk[j].counts[rh_off + mg_idx] = buf.min_hash[lo];
                     hits++;
                 }
             }
@@ -914,6 +970,7 @@ static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
                 else if (keys[i] > qk[j].key) j++;
                 else {
                     qk[j].counts[mg_idx] += buf.counts[i];
+                    if (use_rh) qk[j].counts[rh_off + mg_idx] = buf.min_hash[i];
                     hits++; i++; j++;
                 }
             }
@@ -949,7 +1006,8 @@ static void *ksd_worker(void *arg) {
 #ifdef HAVE_ZSTD
             scan_kmdb(job->mg->file1, job->qk, job->n_qk, job->seed,
                       job->mg_idx, job->total_kmer_counts, job->pair_dedup,
-                      job->have_fastq);
+                      job->have_fastq, job->read_hash ? job->n_total : -1,
+                      job->n_frags);
 #endif
         } else {
             scan_target(job);
@@ -1027,7 +1085,12 @@ static void usage(void) {
     fprintf(stderr, "      PE / PEI FASTQ targets: count each k-mer at most once per read pair\n");
     fprintf(stderr, "      (in R1, R2 or both, repeats included). SE targets are unchanged.\n");
     fprintf(stderr, "      --no-pair-dedup counts every mate on its own (the old counts).\n");
-    fprintf(stderr, "      .kmdb targets carry the setting they were built with.\n\n");
+    fprintf(stderr, "      .kmdb targets carry the setting they were built with.\n");
+    fprintf(stderr, "  --read-hash\n");
+    fprintf(stderr, "      also write <name>.kmer_readhash.tsv.gz: per k-mer and sample the\n");
+    fprintf(stderr, "      smallest hash of the reads (pairs) containing it, 0 = not seen;\n");
+    fprintf(stderr, "      last row n_fragments. Equal values = same read (exact at count 1).\n");
+    fprintf(stderr, "      .kmdb targets need kmer_metagenome_db -m sample --read-hash.\n\n");
     fprintf(stderr, "Output: gzipped TSV — first column is #kmer, then target columns,\n");
     fprintf(stderr, "        then b_* columns for background metagenomes. Last row\n");
     fprintf(stderr, "        total_evaluated = sum of the counts of all k-mers of the sample\n");
@@ -1046,10 +1109,12 @@ int main(int argc, char *argv[]) {
     char *out_name        = NULL;
     int   num_threads     = 4;
     int   pair_dedup      = 1;
+    int   read_hash_opt   = 0;
     int   c;
 
-    enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP };
+    enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP, OPT_READ_HASH };
     static const struct option longopts[] = {
+        { "read-hash",     no_argument, NULL, OPT_READ_HASH },
         { "pair-dedup",    no_argument, NULL, OPT_PAIR_DEDUP },
         { "no-pair-dedup", no_argument, NULL, OPT_NO_PAIR_DEDUP },
         { "help",          no_argument, NULL, 'h' },
@@ -1060,6 +1125,7 @@ int main(int argc, char *argv[]) {
         switch (c) {
             case OPT_PAIR_DEDUP:    pair_dedup = 1; break;
             case OPT_NO_PAIR_DEDUP: pair_dedup = 0; break;
+            case OPT_READ_HASH:     read_hash_opt = 1; break;
             case 'k': kmer_file       = strdup(optarg); break;
             case 'B': targets_file    = strdup(optarg); break;
             case 'G': background_file = strdup(optarg); break;
@@ -1124,7 +1190,9 @@ int main(int argc, char *argv[]) {
     BIO_hash h = BIO_initHash(DEFAULT_GENOME_HASH_SIZE);
     char **kmer_list;
     int seed = 0, n_kmers;
-    n_kmers = parse_kmer_tsv(kmer_file, h, n_total, &seed, &kmer_list);
+    /* with --read-hash every k-mer's vector also holds n_total min hashes */
+    const int n_slots = read_hash_opt ? 2 * n_total : n_total;
+    n_kmers = parse_kmer_tsv(kmer_file, h, n_slots, &seed, &kmer_list);
     fprintf(stderr, "loaded %d kmer(s) (k=%d)\n", n_kmers, seed);
 
     /* 2b. .kmdb targets: sorted 2-bit index of the query k-mers */
@@ -1174,6 +1242,7 @@ int main(int argc, char *argv[]) {
                            : "OFF (--no-pair-dedup: every mate counted on its own)",
                 n_paired, n_fastq);
     uint64_t *total_kmer_counts = calloc(n_total, sizeof(uint64_t));
+    uint64_t *n_frags = calloc(n_total, sizeof(uint64_t));
     if (n_kmers > 0) {
         ksd_pool *pool = ksd_pool_create(num_threads, n_total + 1);
         for (int i = 0; i < n_total; i++) {
@@ -1187,6 +1256,9 @@ int main(int argc, char *argv[]) {
             job->n_qk             = n_qk;
             job->pair_dedup       = pair_dedup;
             job->have_fastq       = n_fastq > 0;
+            job->read_hash        = read_hash_opt;
+            job->n_total          = n_total;
+            job->n_frags          = n_frags;
             ksd_pool_submit(pool, job);
         }
         ksd_pool_wait_and_destroy(pool);
@@ -1207,6 +1279,29 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_total; i++) gzprintf(out, "\t%s", mgs[i].basename);
     gzprintf(out, "\n");
 
+    /* --read-hash: second file, same rows and columns, min read hashes */
+    gzFile rh_out = NULL;
+    char *rh_path = NULL;
+    if (read_hash_opt) {
+        const char *suf = ".kmer_hits.tsv.gz";
+        size_t ol = strlen(outfile), sl = strlen(suf);
+        if (ol > sl && strcmp(outfile + ol - sl, suf) == 0) {
+            if (asprintf(&rh_path, "%.*s.kmer_readhash.tsv.gz", (int)(ol - sl), outfile) < 0) {
+                perror("asprintf"); return 1;
+            }
+        } else if (asprintf(&rh_path, "%s.readhash.tsv.gz", outfile) < 0) {
+            perror("asprintf"); return 1;
+        }
+        rh_out = gzopen(rh_path, "wb9");
+        if (!rh_out) {
+            fprintf(stderr, "cannot open output %s: %s\n", rh_path, strerror(errno));
+            return 1;
+        }
+        gzprintf(rh_out, "#kmer");
+        for (int i = 0; i < n_total; i++) gzprintf(rh_out, "\t%s", mgs[i].basename);
+        gzprintf(rh_out, "\n");
+    }
+
     /* data rows — in the same order as the input file */
     char kmer_rc[MAX_KMER_LEN];
     for (int i = 0; i < n_kmers; i++) {
@@ -1220,6 +1315,12 @@ int main(int argc, char *argv[]) {
         for (int j = 0; j < n_total; j++)
             gzprintf(out, "\t%u", counts ? counts[j] : 0);
         gzprintf(out, "\n");
+        if (rh_out) {
+            gzprintf(rh_out, "%s", kmer_list[i]);
+            for (int j = 0; j < n_total; j++)
+                gzprintf(rh_out, "\t%u", counts ? counts[n_total + j] : 0);
+            gzprintf(rh_out, "\n");
+        }
         free(kmer_list[i]);
     }
 
@@ -1232,6 +1333,18 @@ int main(int argc, char *argv[]) {
 
     gzclose(out);
     fprintf(stderr, "output written to %s\n", outfile);
+    if (rh_out) {
+        gzprintf(rh_out, "n_fragments");
+        for (int i = 0; i < n_total; i++) gzprintf(rh_out, "\t%" PRIu64, n_frags[i]);
+        gzprintf(rh_out, "\n");
+        if (gzclose(rh_out) != Z_OK) {
+            fprintf(stderr, "error: writing %s failed\n", rh_path);
+            return 1;
+        }
+        fprintf(stderr, "read hashes written to %s\n", rh_path);
+    }
+    free(rh_path);
+    free(n_frags);
 
     /* cleanup */
     free(qk);

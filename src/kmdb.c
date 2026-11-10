@@ -114,6 +114,7 @@ struct kmdb_writer_s {
 
 	uint64_t        *kbuf;
 	uint32_t        *cbuf;
+	uint32_t        *hbuf;       /* min read hashes, NULL without read_hash */
 	uint32_t         nbuf;
 
 	uint8_t         *raw;
@@ -137,6 +138,12 @@ struct kmdb_writer_s {
 kmdb_writer *kmdb_writer_open(const char *path, int k, uint32_t block_n,
                               int zstd_level)
 {
+	return kmdb_writer_open_rh(path, k, block_n, zstd_level, 0);
+}
+
+kmdb_writer *kmdb_writer_open_rh(const char *path, int k, uint32_t block_n,
+                                 int zstd_level, int read_hash)
+{
 	if (k < 1 || k > KMDB_MAX_K) {
 		fprintf(stderr, "kmdb_writer_open: k=%d out of range 1..%d\n",
 		        k, KMDB_MAX_K);
@@ -159,12 +166,14 @@ kmdb_writer *kmdb_writer_open(const char *path, int k, uint32_t block_n,
 	w->block_n = block_n;
 	w->kbuf    = malloc(sizeof(uint64_t) * block_n);
 	w->cbuf    = malloc(sizeof(uint32_t) * block_n);
-	w->raw_cap = (size_t)block_n * 15;            /* <=10 + <=5 bytes per entry */
+	w->hbuf    = read_hash ? malloc(sizeof(uint32_t) * block_n) : NULL;
+	w->raw_cap = (size_t)block_n * (read_hash ? 20 : 15);  /* <=10 + <=5 (+ <=5) bytes per entry */
 	w->raw     = malloc(w->raw_cap);
 	w->comp_cap = ZSTD_compressBound(w->raw_cap);
 	w->comp    = malloc(w->comp_cap);
 	w->cctx    = ZSTD_createCCtx();
-	if (!w->path || !w->kbuf || !w->cbuf || !w->raw || !w->comp || !w->cctx) {
+	if (!w->path || !w->kbuf || !w->cbuf || !w->raw || !w->comp || !w->cctx ||
+	    (read_hash && !w->hbuf)) {
 		fprintf(stderr, "kmdb_writer_open: out of memory\n");
 		exit(EXIT_FAILURE);
 	}
@@ -189,6 +198,9 @@ static int flush_block(kmdb_writer *w)
 	}
 	for (uint32_t i = 0; i < w->nbuf; i++)
 		n += put_varint(w->raw + n, w->cbuf[i]);
+	if (w->hbuf)
+		for (uint32_t i = 0; i < w->nbuf; i++)
+			n += put_varint(w->raw + n, w->hbuf[i]);
 
 	size_t c = ZSTD_compress2(w->cctx, w->comp, w->comp_cap, w->raw, n);
 	if (ZSTD_isError(c)) {
@@ -221,6 +233,12 @@ static int flush_block(kmdb_writer *w)
 
 int kmdb_writer_add(kmdb_writer *w, uint64_t kmer, uint32_t count)
 {
+	return kmdb_writer_add_rh(w, kmer, count, READHASH_NONE);
+}
+
+int kmdb_writer_add_rh(kmdb_writer *w, uint64_t kmer, uint32_t count,
+                       uint32_t min_hash)
+{
 	if (w->failed) return -1;
 	if (w->have_last && kmer <= w->last_kmer) {
 		fprintf(stderr, "kmdb_writer_add: keys not strictly increasing\n");
@@ -231,6 +249,7 @@ int kmdb_writer_add(kmdb_writer *w, uint64_t kmer, uint32_t count)
 	w->last_kmer = kmer;
 	w->kbuf[w->nbuf] = kmer;
 	w->cbuf[w->nbuf] = count;
+	if (w->hbuf) w->hbuf[w->nbuf] = min_hash;
 	w->nbuf++;
 	w->n_kmers++;
 	if (w->nbuf == w->block_n && flush_block(w) != 0) {
@@ -296,7 +315,7 @@ int kmdb_writer_close(kmdb_writer *w)
 	if (rc == 0) {
 		uint8_t h[KMDB_HEADER_SIZE] = {0};
 		memcpy(h, KMDB_MAGIC, 4);
-		put_u32(h + 4,  KMDB_VERSION);
+		put_u32(h + 4,  w->hbuf ? KMDB_VERSION_READHASH : KMDB_VERSION);
 		put_u32(h + 8,  (uint32_t)w->k);
 		put_u32(h + 12, w->block_n);
 		put_u64(h + 16, w->n_kmers);
@@ -304,7 +323,7 @@ int kmdb_writer_close(kmdb_writer *w)
 		put_u64(h + 32, index_offset);
 		put_u64(h + 40, meta_offset);
 		put_u64(h + 48, (uint64_t)w->meta_len);
-		put_u64(h + 56, KMDB_FLAG_CANON_MAX);
+		put_u64(h + 56, KMDB_FLAG_CANON_MAX | (w->hbuf ? KMDB_FLAG_READHASH : 0));
 		if (write_all(w->fd, h, sizeof h, 0) != 0) rc = -1;
 	}
 	if (rc != 0)
@@ -313,7 +332,7 @@ int kmdb_writer_close(kmdb_writer *w)
 	if (close(w->fd) != 0) rc = -1;
 
 	ZSTD_freeCCtx(w->cctx);
-	free(w->kbuf); free(w->cbuf); free(w->raw); free(w->comp);
+	free(w->kbuf); free(w->cbuf); free(w->hbuf); free(w->raw); free(w->comp);
 	free(w->blocks); free(w->meta); free(w->path);
 	free(w);
 	return rc;
@@ -338,9 +357,9 @@ kmdb_t *kmdb_open(const char *path)
 		return NULL;
 	}
 	uint32_t version = get_u32(h + 4);
-	if (version != KMDB_VERSION) {
-		fprintf(stderr, "kmdb_open: %s has version %u, this build reads %u\n",
-		        path, version, KMDB_VERSION);
+	if (version != KMDB_VERSION && version != KMDB_VERSION_READHASH) {
+		fprintf(stderr, "kmdb_open: %s has version %u, this build reads %u and %u\n",
+		        path, version, KMDB_VERSION, KMDB_VERSION_READHASH);
 		close(fd);
 		return NULL;
 	}
@@ -356,8 +375,15 @@ kmdb_t *kmdb_open(const char *path)
 	uint64_t meta_offset  = get_u64(h + 40);
 	uint64_t meta_len     = get_u64(h + 48);
 	db->flags    = get_u64(h + 56);
+	db->has_read_hash = (db->flags & KMDB_FLAG_READHASH) != 0;
 
 	uint64_t fsize = (uint64_t)st.st_size;
+	if (db->has_read_hash != (version == KMDB_VERSION_READHASH)) {
+		fprintf(stderr, "kmdb_open: %s: version %u does not match its read-hash "
+		        "flag\n", path, version);
+		kmdb_close(db);
+		return NULL;
+	}
 	if (db->k < 1 || db->k > KMDB_MAX_K ||
 	    meta_offset + meta_len > fsize ||
 	    index_offset + db->n_blocks * KMDB_INDEX_ENTRY_SIZE > fsize) {
@@ -462,7 +488,7 @@ void kmdb_block_buf_init(kmdb_block_buf *b)
 void kmdb_block_buf_free(kmdb_block_buf *b)
 {
 	ZSTD_freeDCtx((ZSTD_DCtx *)b->dctx);
-	free(b->comp); free(b->raw); free(b->kmers); free(b->counts);
+	free(b->comp); free(b->raw); free(b->kmers); free(b->counts); free(b->min_hash);
 	memset(b, 0, sizeof(*b));
 }
 
@@ -488,7 +514,7 @@ long kmdb_read_block(const kmdb_t *db, uint64_t i, kmdb_block_buf *b)
 	}
 	unsigned long long rsz = ZSTD_getFrameContentSize(b->comp, bi->comp_size);
 	if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN ||
-	    rsz > (unsigned long long)bi->n * 15) {
+	    rsz > (unsigned long long)bi->n * (db->has_read_hash ? 20 : 15)) {
 		fprintf(stderr, "kmdb: block %llu in %s is corrupt\n",
 		        (unsigned long long)i, db->path);
 		return -1;
@@ -505,9 +531,10 @@ long kmdb_read_block(const kmdb_t *db, uint64_t i, kmdb_block_buf *b)
 
 	if (b->n_cap < bi->n) {
 		size_t cap = bi->n;
-		b->kmers  = realloc(b->kmers,  cap * sizeof(uint64_t));
-		b->counts = realloc(b->counts, cap * sizeof(uint32_t));
-		if (!b->kmers || !b->counts) { perror("realloc kmdb decode"); exit(EXIT_FAILURE); }
+		b->kmers    = realloc(b->kmers,    cap * sizeof(uint64_t));
+		b->counts   = realloc(b->counts,   cap * sizeof(uint32_t));
+		b->min_hash = realloc(b->min_hash, cap * sizeof(uint32_t));
+		if (!b->kmers || !b->counts || !b->min_hash) { perror("realloc kmdb decode"); exit(EXIT_FAILURE); }
 		b->n_cap = cap;
 	}
 
@@ -525,6 +552,14 @@ long kmdb_read_block(const kmdb_t *db, uint64_t i, kmdb_block_buf *b)
 		if (!c || v > UINT32_MAX) goto corrupt;
 		p += c;
 		b->counts[j] = (uint32_t)v;
+	}
+	if (db->has_read_hash) {
+		for (uint32_t j = 0; j < bi->n; j++) {
+			size_t c = get_varint(p, end, &v);
+			if (!c || v > UINT32_MAX) goto corrupt;
+			p += c;
+			b->min_hash[j] = (uint32_t)v;
+		}
 	}
 	if (p != end || (bi->n && b->kmers[bi->n - 1] != bi->last_kmer)) goto corrupt;
 	return (long)bi->n;

@@ -237,6 +237,71 @@ def window_evenness(df_loc, df_hits, window=200):
 
 
 
+### per-kmer export (input for sliding-window / Poisson-HMM analyses)
+SCRUB_COLS = ['reference_count', 'pangenome_count', 'metagenome_count', 'drug_count']
+
+def export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename):
+    """
+    Three files, all keyed by kmer_idx = rank of the kmer along the genome (contigs by id, then position):
+      {basename}.kmers.tsv.gz        one row per mapped (internal) kmer: kmer_idx, kmer, contig_id, contig_length,
+                                     kmer_position, block_id, block_size, rare (1/0), rare_count, scrub counts
+      {basename}.kmer_hits_long.tsv.gz  sparse hits: kmer_idx, sample, count  (count > 0 only; every kmer of
+                                     kmers.tsv.gz that is missing for a sample has count 0)
+      {basename}.kmer_samples.tsv    sample, total_evaluated, kmers_hit (also lists samples with no hits at all)
+    """
+    loc = df_loc_counts.reset_index() if '#kmer' not in df_loc_counts.columns else df_loc_counts
+    loc = loc.sort_values(['contig_id', 'kmer_position']).reset_index(drop=True)
+    loc['kmer_idx'] = np.arange(len(loc), dtype=np.int64)
+    loc['rare'] = loc['rare_count'].notna().astype(int) if 'rare_count' in loc else 0
+    cols = (['kmer_idx', '#kmer', 'contig_id', 'contig_length', 'kmer_position', 'block_id', 'block_size', 'rare', 'rare_count']
+            + [c for c in SCRUB_COLS if c in loc.columns])
+    cols = [c for c in cols if c in loc.columns]
+    kmers_path = os.path.join(outpath, f'{basename}.kmers.tsv.gz')
+    loc[cols].rename(columns={'#kmer': 'kmer'}).to_csv(kmers_path, sep='\t', index=False)
+
+    samples = [c for c in df_hits.columns if c != '#kmer']
+    h = df_hits.merge(loc[['#kmer', 'kmer_idx']], on='#kmer', how='inner')
+    idx = h['kmer_idx'].to_numpy()
+    parts, n_hit = [], {}
+    for smp in samples:                                     # per sample: never materialise kmers x samples long
+        v = h[smp].to_numpy()
+        nz = v > 0
+        n_hit[smp] = int(nz.sum())
+        if nz.any():
+            parts.append(pd.DataFrame({'kmer_idx': idx[nz], 'sample': smp, 'count': v[nz].astype(np.int64)}))
+    long = (pd.concat(parts, ignore_index=True) if parts
+            else pd.DataFrame(columns=['kmer_idx', 'sample', 'count']))
+    hits_path = os.path.join(outpath, f'{basename}.kmer_hits_long.tsv.gz')
+    long.sort_values(['sample', 'kmer_idx']).to_csv(hits_path, sep='\t', index=False)
+
+    smp_tab = pd.DataFrame({'sample': samples, 'kmers_hit': [n_hit[s] for s in samples]})
+    smp_tab = smp_tab.merge(total_evaluated[['sample', 'total_evaluated']], on='sample', how='left')
+    smp_tab['kmers_total'] = len(loc)
+    smp_path = os.path.join(outpath, f'{basename}.kmer_samples.tsv')
+    smp_tab.to_csv(smp_path, sep='\t', index=False)
+    print(f'Saved per-kmer export ({len(loc)} kmers, {len(long)} non-zero hits, {len(samples)} samples) to\n {kmers_path}')
+    return kmers_path, hits_path, smp_path
+
+
+def load_kmer_export(prefix):
+    """
+    read an export_kmer_table output back: returns (kmers, samples, counts) with
+    counts[sample] = dense int array of hit counts in kmer_idx (genome) order, zeros filled in.
+    prefix = '<output_dir>/<basename>'
+    """
+    kmers = pd.read_csv(f'{prefix}.kmers.tsv.gz', sep='\t')
+    samples = pd.read_csv(f'{prefix}.kmer_samples.tsv', sep='\t')
+    long = pd.read_csv(f'{prefix}.kmer_hits_long.tsv.gz', sep='\t')
+    n = len(kmers)
+    counts = {}
+    for smp in samples['sample']:
+        v = np.zeros(n, dtype=np.int64)
+        d = long[long['sample'] == smp]
+        v[d['kmer_idx'].to_numpy()] = d['count'].to_numpy()
+        counts[smp] = v
+    return kmers, samples, counts
+
+
 def load_genome(genome_path):
     opener = gzip.open if genome_path.endswith('.gz') else open
     records = {}
@@ -592,6 +657,8 @@ def main():
     parser.add_argument('--rare_min_count', type = int, default = 1000, help = 'Minimal rare kmers required, if less count 0 kmers are present after scrub, count 1 kmers are included')
     parser.add_argument('--figures', choices=['png','svg', 'both','none'], default='none', help = 'Change to svg, png or both if you want figures to be saved.')
     parser.add_argument('--export_hist', action='store_true', help = 'export kmer hit count histograms per sample and kmer subset (input for parameter optimisation)')
+    parser.add_argument('--export_kmers', action='store_true', help = 'export per-kmer positions, blocks, rare flag, scrub counts and sparse '
+                        'per-sample hit counts (input for sliding-window / Poisson-HMM analyses; needs --reference)')
     parser.add_argument('--zi_q', type = float, default = ZI_PARAMS['q'], help = 'Poisson quantile for the upper trim: kmers above it are high-depth, present but not used for the depth fit')
     parser.add_argument('--zi_min_pos', type = int, default = ZI_PARAMS['min_pos'], help = 'min positive kmers to fit')
 
@@ -643,6 +710,10 @@ def main():
         df_loc_counts.set_index('#kmer').to_csv(os.path.join(outpath, "kmer_locations.tsv"), sep='\t')
         df_blocks = call_blocks(df_hits= df_hits, df_blocks=df_loc_counts, counts = None)
         df_blocks.to_csv(os.path.join(outpath, "blocks.tsv"), sep='\t')
+        if args.export_kmers:
+            export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename)
+    elif args.export_kmers:
+        print('WARNING: --export_kmers needs --reference (kmer positions); nothing exported')
 
     # robust zero inflation: zero- and right-truncated poisson, high depth kmers trimmed
     # a subset is only fitted if it has kmers and is not identical to all kmers (e.g. every kmer rare -> no share subset)

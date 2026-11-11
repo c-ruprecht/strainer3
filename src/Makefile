@@ -50,7 +50,7 @@ endif
 shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
 BASE_TARGETS = genome_compare genome_compare_presence \
-               kmer_strain_detect kmer_strain_detect_genome
+               kmer_strain_detect kmer_strain_detect_genome kmer_block_detect
 
 all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 
@@ -91,6 +91,10 @@ kmer_strain_detect: kmer_strain_detect.o $(shared_obj) $(KMDB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
 
 kmer_strain_detect_genome: kmer_strain_detect_genome.o $(shared_obj)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# block-aware detection straight from FASTQ (self-contained: kseq.h + zlib only)
+kmer_block_detect: kmer_block_detect.o
 	$(CC) -o $@ $^ $(LDLIBS)
 
 # quick end-to-end check on the toy genomes (poly-A / poly-T / half-and-half)

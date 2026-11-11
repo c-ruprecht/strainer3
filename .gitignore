@@ -4,6 +4,9 @@
 /test/strainer2_parallel
 /test/output
 /test/output_dedup
+/test/output_hash
+/test/output_blocks
+/test/output-snake-blocks
 /test/output-snake
 /test/output-fullscrub
 /test/out

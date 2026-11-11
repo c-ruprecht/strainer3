@@ -237,70 +237,16 @@ def window_evenness(df_loc, df_hits, window=200):
 
 
 
-### read support from kmer_strain_detect --read-hash (<name>.kmer_readhash.tsv.gz)
-def load_readhash(path, kmers=None):
-    """
-    min read hash per kmer and sample (0 = not seen), '#kmer' index, plus the n_fragments row as a Series.
-    kmers: optional list to restrict / align to (e.g. the internal kmers kept in df_hits)
-    """
-    df = pd.read_csv(path, sep='\t').set_index('#kmer')
-    n_frag = df.loc['n_fragments'] if 'n_fragments' in df.index else pd.Series(np.nan, index=df.columns)
-    df = df.drop(index=[r for r in ('n_fragments', 'total_evaluated') if r in df.index])
-    if kmers is not None:
-        df = df.reindex(kmers, fill_value=0)
-    return df, n_frag
-
-
-def read_support(df_counts, df_mh, prefix):
-    """
-    reads behind the hits of one kmer subset, per sample. Hit kmers with the same min read hash come from the
-    same read (pair) - exactly for kmers with count 1, a lower bound where reads overlap.
-      {prefix}_reads           distinct min hashes among hit kmers  (~ reads behind the hits)
-      {prefix}_reads_eff       (sum of group sizes)^2 / sum of squares: reads, robust to one read covering many kmers
-      {prefix}_kmers_per_read  hit kmers / reads
-      {prefix}_top_read_share  largest read group / hit kmers (-> 1 when one read explains everything)
-      {prefix}_multi_frac      share of hit kmers seen in >= 2 reads (count >= 2)
-    no hits -> 0 (reads, reads_eff, kmers_per_read, top_read_share, multi_frac);
-    hits but no hashes (database built without --read-hash) -> NaN
-    """
-    df_counts = df_counts.set_index('#kmer') if '#kmer' in df_counts.columns else df_counts
-    mh = df_mh.reindex(df_counts.index, fill_value=0)
-    cols = ['reads', 'reads_eff', 'kmers_per_read', 'top_read_share', 'multi_frac']
-    rows = {}
-    for smp in df_counts.columns:
-        c = df_counts[smp].to_numpy()
-        m = mh[smp].to_numpy() if smp in mh.columns else np.zeros(len(c), dtype=np.int64)
-        hit = c > 0
-        n = int(hit.sum())
-        if n == 0:
-            rows[smp] = dict.fromkeys(cols, 0.0)
-            continue
-        valid = hit & (m > 0)
-        if not valid.any():
-            rows[smp] = dict.fromkeys(cols, np.nan)
-            continue
-        sizes = np.unique(m[valid], return_counts=True)[1].astype(float)
-        nv = sizes.sum()
-        rows[smp] = {'reads': float(len(sizes)),
-                     'reads_eff': round(nv ** 2 / (sizes ** 2).sum(), 4),
-                     'kmers_per_read': round(nv / len(sizes), 4),
-                     'top_read_share': round(sizes.max() / nv, 4),
-                     'multi_frac': round(float((c[hit] >= 2).mean()), 4)}
-    out = pd.DataFrame.from_dict(rows, orient='index')[cols].add_prefix(f'{prefix}_')
-    return out.reset_index(names=['sample'])
-
-
 ### per-kmer export (input for sliding-window / Poisson-HMM analyses)
 SCRUB_COLS = ['reference_count', 'pangenome_count', 'metagenome_count', 'drug_count']
 
-def export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename, df_mh=None):
+def export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename):
     """
     Three files, all keyed by kmer_idx = rank of the kmer along the genome (contigs by id, then position):
       {basename}.kmers.tsv.gz        one row per mapped (internal) kmer: kmer_idx, kmer, contig_id, contig_length,
                                      kmer_position, block_id, block_size, rare (1/0), rare_count, scrub counts
-      {basename}.kmer_hits_long.tsv.gz  sparse hits: kmer_idx, sample, count [, min_hash]  (count > 0 only;
-                                     every kmer of kmers.tsv.gz that is missing for a sample has count 0;
-                                     min_hash with --read-hash input: equal values = same read)
+      {basename}.kmer_hits_long.tsv.gz  sparse hits: kmer_idx, sample, count  (count > 0 only; every kmer of
+                                     kmers.tsv.gz that is missing for a sample has count 0)
       {basename}.kmer_samples.tsv    sample, total_evaluated, kmers_hit (also lists samples with no hits at all)
     """
     loc = df_loc_counts.reset_index() if '#kmer' not in df_loc_counts.columns else df_loc_counts
@@ -316,21 +262,15 @@ def export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename
     samples = [c for c in df_hits.columns if c != '#kmer']
     h = df_hits.merge(loc[['#kmer', 'kmer_idx']], on='#kmer', how='inner')
     idx = h['kmer_idx'].to_numpy()
-    mh = df_mh.reindex(h['#kmer'], fill_value=0) if df_mh is not None else None
-    long_cols = ['kmer_idx', 'sample', 'count'] + (['min_hash'] if mh is not None else [])
     parts, n_hit = [], {}
     for smp in samples:                                     # per sample: never materialise kmers x samples long
         v = h[smp].to_numpy()
         nz = v > 0
         n_hit[smp] = int(nz.sum())
         if nz.any():
-            d = {'kmer_idx': idx[nz], 'sample': smp, 'count': v[nz].astype(np.int64)}
-            if mh is not None:
-                d['min_hash'] = (mh[smp].to_numpy()[nz] if smp in mh.columns
-                                 else np.zeros(int(nz.sum()), dtype=np.int64)).astype(np.int64)
-            parts.append(pd.DataFrame(d))
+            parts.append(pd.DataFrame({'kmer_idx': idx[nz], 'sample': smp, 'count': v[nz].astype(np.int64)}))
     long = (pd.concat(parts, ignore_index=True) if parts
-            else pd.DataFrame(columns=long_cols))
+            else pd.DataFrame(columns=['kmer_idx', 'sample', 'count']))
     hits_path = os.path.join(outpath, f'{basename}.kmer_hits_long.tsv.gz')
     long.sort_values(['sample', 'kmer_idx']).to_csv(hits_path, sep='\t', index=False)
 
@@ -710,9 +650,6 @@ def main():
     parser = argparse.ArgumentParser(description='Calcualting coverage and depth with kmer locations')
     parser.add_argument('--counts', help='a global_counts.tsv.zst file', required=True)
     parser.add_argument('--hits', help='a target_strain .kmer_hits.tsv.gz', required = True)
-    parser.add_argument('--readhash', help = 'kmer_strain_detect --read-hash output (<name>.kmer_readhash.tsv.gz); '
-                        'default: next to --hits if it exists. Adds read-support columns (all_/rare_reads, '
-                        'reads_eff, kmers_per_read, top_read_share, multi_frac) and min_hash to --export_kmers')
     parser.add_argument('--output_dir', help='directory where output is saved')
     parser.add_argument('--strain', help = 'add a name for the target strain you are tracking')
     parser.add_argument('--reference', '-r', help = 'Path to reference file of a strain. Can be used to map kmers to locations')
@@ -746,15 +683,6 @@ def main():
     print(total_evaluated)
     df_hits = df_hits.loc[df_hits['#kmer'] !='total_evaluated'].copy()
 
-    # read hashes (kmer_strain_detect --read-hash): given, or next to the hits file
-    readhash_path = args.readhash
-    if readhash_path is None and hits_path.endswith('.kmer_hits.tsv.gz'):
-        cand = hits_path[:-len('.kmer_hits.tsv.gz')] + '.kmer_readhash.tsv.gz'
-        readhash_path = cand if os.path.exists(cand) else None
-    df_mh, n_fragments = (load_readhash(readhash_path) if readhash_path else (None, None))
-    if df_mh is not None:
-        print(f'read hashes: {readhash_path}')
-
 
 
     # get hit locations and strip terminal kmers
@@ -783,15 +711,9 @@ def main():
         df_blocks = call_blocks(df_hits= df_hits, df_blocks=df_loc_counts, counts = None)
         df_blocks.to_csv(os.path.join(outpath, "blocks.tsv"), sep='\t')
         if args.export_kmers:
-            export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename, df_mh=df_mh)
+            export_kmer_table(df_loc_counts, df_hits, total_evaluated, outpath, basename)
     elif args.export_kmers:
         print('WARNING: --export_kmers needs --reference (kmer positions); nothing exported')
-
-    # read support: how many reads produce the hits (all kmers, rare kmers)
-    if df_mh is not None:
-        df_cov_depth = df_cov_depth.merge(read_support(df_hits, df_mh, 'all'), on='sample', how='left')
-        df_cov_depth = df_cov_depth.merge(read_support(df_hits_unique, df_mh, 'rare'), on='sample', how='left')
-        df_cov_depth['n_fragments'] = df_cov_depth['sample'].map(n_fragments)
 
     # robust zero inflation: zero- and right-truncated poisson, high depth kmers trimmed
     # a subset is only fitted if it has kmers and is not identical to all kmers (e.g. every kmer rare -> no share subset)

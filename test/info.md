@@ -1,3 +1,7 @@
+# run snakemake on subset
+snakemake -s strainer3_blocks.smk -c 32 --config strains=D6331_Faecalibacterium_prausnitzii,D6331_Escherichia_coli_B766,D6331_Bifidobacterium_adolescentis,D6331_Enterococcus_faecalis
+
+
 # select pangenome for 
 dest=/metrica/codebase/strainer3/test/scrub_pangenome; mkdir -p "$dest"
 awk -F'\t' 'NR>1 && $23 ~ /Faecalibacterium prausnitzii/ {print $15}' /metrica/databases/genomes/scrubdb-derep-hq-comp99-cont05/representatives_t96.tsv \

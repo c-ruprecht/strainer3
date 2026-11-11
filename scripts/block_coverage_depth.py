@@ -321,6 +321,11 @@ def window_evenness(df_loc, df_hits, window=200):
     df = loc.merge(df_hits, on='#kmer', how='left').fillna({s: 0 for s in samples})
     n_win = df.groupby('window').size()
     df = df.loc[df['window'].map(n_win) >= window // 2]
+    if df.empty:
+        # few rare k-mers spread over many contigs: no window reaches window // 2 k-mers -> no evenness metrics
+        print(f"NOTE: no window with >= {window // 2} k-mers; window_* metrics left empty")
+        return pd.DataFrame({'sample': samples, 'zero_window_frac': np.nan,
+                             'window_cov_dispersion': np.nan, 'window_depth_cv': np.nan})
     n = df.groupby('window').size().to_numpy(float)
     cov = (df[samples] > 0).groupby(df['window']).mean()
     dep = df[samples].groupby(df['window']).mean()

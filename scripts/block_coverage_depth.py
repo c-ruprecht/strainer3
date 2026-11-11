@@ -313,6 +313,11 @@ def zip_rate(y, e, n_iter=500, tol=1e-10, min_pos=10):
 
 
 ### spatial evenness (identical to coverage_depth.py)
+def _scaled(df, col, scale):
+    """df[col] * scale, or None if the column does not exist (estimator not available for this strain)"""
+    return df[col] * scale if col in df.columns else None
+
+
 def window_evenness(df_loc, df_hits, window=200):
     samples = [c for c in df_hits.columns if c != '#kmer']
     loc = df_loc[['#kmer', 'contig_id', 'kmer_position']].sort_values(['contig_id', 'kmer_position']).copy()
@@ -916,19 +921,20 @@ def main():
         df_cov = df_cov.merge(window_evenness(df_loc, df_kmer_hits), on='sample', how='left')
 
     # ── depth (fold coverage) and relative abundance (% of sequenced bases) for every estimate ──
+    # an estimator whose column is missing (e.g. no SNP-size blocks -> no snp_starts_*) gives None and is skipped
     L = df_cov['read_len']
     starts_scale = L / snp_n                   # starts per SNP block -> start rate per position -> read depth
     # fragments per k-mer -> read depth: a read covers L - k + 1 k-mers, and kmer_hits counts FRAGMENTS
     # (both mates of a pair count once), so scale by reads per fragment (2 for paired, 1 for single-end)
     kmer_scale = L / (L - k + 1) * df_cov['reads'] / df_cov['fragments']
     depth = {
-        'starts_robust': df_cov.get('snp_starts_lambda') * starts_scale,
-        'starts_ztp': df_cov.get('snp_starts_ztp_lambda') * starts_scale,
-        'starts_ztnb': df_cov.get('snp_starts_ztnb_mu') * starts_scale,
-        'starts_naive': df_cov.get('snp_starts_mean') * starts_scale,
-        'starts_zero': df_cov.get('snp_starts_zero_lambda') * starts_scale,
-        'starts_zero_lo': df_cov.get('snp_starts_zero_lambda_lo') * starts_scale,
-        'starts_zero_hi': df_cov.get('snp_starts_zero_lambda_hi') * starts_scale,
+        'starts_robust': _scaled(df_cov, 'snp_starts_lambda', starts_scale),
+        'starts_ztp': _scaled(df_cov, 'snp_starts_ztp_lambda', starts_scale),
+        'starts_ztnb': _scaled(df_cov, 'snp_starts_ztnb_mu', starts_scale),
+        'starts_naive': _scaled(df_cov, 'snp_starts_mean', starts_scale),
+        'starts_zero': _scaled(df_cov, 'snp_starts_zero_lambda', starts_scale),
+        'starts_zero_lo': _scaled(df_cov, 'snp_starts_zero_lambda_lo', starts_scale),
+        'starts_zero_hi': _scaled(df_cov, 'snp_starts_zero_lambda_hi', starts_scale),
         'starts_zero_allblocks': df_cov['rate_zero_allblocks'] * L,
     }
     if 'best_rate' in df_cov:

@@ -629,6 +629,38 @@ def kmer_subset_features(df_hits, subset, zi_params, label):
             .reset_index(names=['sample']))
 
 
+def write_no_blocks(args, df_stats, strain, k=31):
+    """strain without detectable blocks (empty filter output): one row per sample with QC and filter diagnostics,
+    strain_n_blocks = 0 and every estimator empty, plus header-only export files, so the workflow continues"""
+    print(f"WARNING: {strain} has no blocks (no rare segments passed the filter): writing a not-detectable row "
+          f"per sample")
+    df = df_stats.copy()
+    df['read_len'] = df['kmer_positions'] / df['reads'].where(df['reads'] > 0) + k - 1
+    df['total_bases'] = df['kmer_positions'] + df['reads'] * (k - 1)
+    sel_path = args.selection or args.blocks.replace('.blocks.tsv.gz', '.selection.json')
+    if os.path.exists(sel_path):
+        with open(sel_path) as fh:
+            for key, v in json.load(fh).items():
+                if isinstance(v, (int, float, str, bool)) or v is None:
+                    df[f"strain_{key if key.startswith('filter_') else 'filter_' + key}"] = v
+    df['strain'] = strain
+    df['genome_length'] = (int(sum(contig_lengths(args.reference).values())) if args.reference
+                           else args.genome_length)
+    df['strain_n_kmers'] = 0
+    df['strain_n_blocks'] = 0
+    df['strain_n_snp_blocks'] = 0
+    out_path = os.path.join(args.output_dir, 'block_coverage_depth.tsv')
+    df.set_index(['strain', 'sample']).to_csv(out_path, sep='\t')
+    print(f'Saved {len(df)} not-detectable rows to\n {out_path}')
+    if args.export_hist:
+        pd.DataFrame(columns=['strain', 'sample', 'subset', 'subset_n', 'count', 'n']).to_csv(
+            os.path.join(args.output_dir, f'{strain}.block_hist.tsv.gz'), sep='\t', index=False)
+    if args.export_blocks:
+        pd.DataFrame(columns=['block_id', 'sample', 'frags', 'starts', 'best', 'contig_id', 'start', 'stop',
+                              'n_kmers', 'ref_copies', 'family_id', 'segment_id', 'exposure', 'isolated']).to_csv(
+            os.path.join(args.output_dir, f'{strain}.blocks_long.tsv.gz'), sep='\t', index=False)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Hit-calling features from kmer_block_detect output (one strain, all samples)')
     parser.add_argument('--kmer_hits', required=True, help='<strain>.kmer_hits.tsv.gz from kmer_block_detect')
@@ -673,6 +705,10 @@ def main():
     df_stats = pd.read_csv(args.detect_stats, sep='\t')
     df_block_hits['sample'] = df_block_hits['sample'].astype(str)
     df_stats['sample'] = df_stats['sample'].astype(str)
+
+    if df_blocks.empty or (df_kmer_hits['#kmer'] != 'total_evaluated').sum() == 0:
+        write_no_blocks(args, df_stats, strain)
+        return
 
     k = len(df_kmer_hits.loc[df_kmer_hits['#kmer'] != 'total_evaluated', '#kmer'].iloc[0])
     snp_n = args.snp_kmers

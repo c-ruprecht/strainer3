@@ -432,10 +432,10 @@ def build_blocks(df_sel, records, k, terminal_dist=0, max_ref_copies=5, min_segm
     stats.update(_quantiles(df_blocks.loc[rep, 'n_kmers'], 'repeat_blocks'))
     # spacing between consecutive blocks on a contig, in k-mer start positions (0 = back to back): the
     # exposure of the 'best' count depends on it (isolated blocks need a gap >= read length - k)
-    gaps = (df_blocks.sort_values(['contig_id', 'start']).groupby('contig_id')
-            .apply(lambda d: (d['start'].to_numpy()[1:] - (d['stop'].to_numpy()[:-1] - k + 1) - 1),
-                   include_groups=False))
-    gaps = np.concatenate([g for g in gaps if len(g)]) if len(gaps) else np.array([])
+    b = df_blocks.sort_values(['contig_id', 'start'])
+    same = b['contig_id'].to_numpy()[1:] == b['contig_id'].to_numpy()[:-1]   # neighbours on one contig
+    gaps = (b['start'].to_numpy()[1:] - (b['stop'].to_numpy()[:-1] - k + 1) - 1)[same] if len(b) > 1 \
+        else np.array([], dtype=int)
     stats.update(_quantiles(gaps, 'block_gap_kmers'))
     return df_loci, df_blocks, stats
 
@@ -712,7 +712,10 @@ def main():
         for key, val in stats.items():
             print(f"#block_mode {key}: {val}")
         if stats['kept_kmers'] == 0:
-            sys.exit("error: no kmers left after block filtering (check --min_segment_kmers/--min_segment_bp)")
+            # not an error: the strain has no rare segments long enough to be detected. Empty outputs (with
+            # headers) let detection and coverage write a 'no blocks' row instead of stopping the workflow
+            print("#WARNING: no kmers left after block filtering: strain not detectable with these settings "
+                  "(empty loci / blocks written)")
 
         df_loci.to_csv(os.path.join(args.output_dir, prefix + "kmer_loci.tsv.gz"),
                        sep='\t', index=False, compression='gzip')

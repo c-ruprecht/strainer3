@@ -354,7 +354,13 @@ static void load_loci(const char *file) {
     }
     gzclose(fp);
     free(line);
-    if (n_loci == 0) die("no loci loaded");
+    if (n_loci == 0) {
+        /* strain without detectable blocks (kmer_scrub_filter.py wrote an empty loci file): still scan the
+           reads so detect_stats / read_lengths are complete, and write header-only hit tables */
+        fprintf(stderr, "WARNING: no loci in %s: writing empty hit tables (strain not detectable)\n", file);
+        if (K == 0) { K = 31; KMASK = (1ULL << (2 * K)) - 1; }
+        hrehash(1u << 4);
+    }
 
     /* sort loci by segment, position and build segment geometry */
     qsort(loci, n_loci, sizeof(Locus), cmp_locus_seg_pos);

@@ -55,6 +55,7 @@ conda run -n strainer3_env python ../scripts/kmer_scrub_filter.py \
 --min_segment_kmers 31 \
 --max_segment_kmers 31 \
 --chunk_mode balanced
+--
 
 zcat "$OUT"/filter/${STRAIN}.kmer_loci.tsv.gz | head -n 3
 zcat "$OUT"/filter/${STRAIN}.blocks.tsv.gz | head -n 3
@@ -113,6 +114,7 @@ while IFS="$TAB" read -r NAME R1 R2 <&3; do
       2> "$OUT"/fastp/${NAME}.fastp.log
     printf '%s\t%s\n' "$NAME" "$OUT/fastp/${NAME}.fastp.fq.gz" >> "$OUT"/samples.tsv
     conda run -n strainer3_env python -c "
+
 import json
 j = json.load(open('$OUT/fastp/${NAME}.fastp.json'))
 b, a = j['summary']['before_filtering'], j['summary']['after_filtering']

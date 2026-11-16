@@ -1,25 +1,39 @@
 #!/usr/bin/env bash
-# Example strainer run with block-aware detection straight from FASTQ:
-#   - kmer_scrub_filter.py --reference places the rare k-mers on the genome (all copies)
-#     and annotates segments / blocks / repeat families
-#   - kmer_block_detect scans the FASTQ files directly (no kmdb). A read only counts for
-#     a segment if it hits every segment k-mer inside its footprint on one diagonal, so
-#     reads with mismatches (errors, relatives) are rejected and mates are counted once.
-#   - fastp (strict): adapter / poly-G / quality trimming, overlap merge with error correction, dedup.
-#     Merged and unmerged reads go into ONE file per sample (--include_unmerged), scanned as single-end:
-#     reads with adapter read-through or bad tails would otherwise be rejected by the completeness check.
-#   - block_coverage_depth.py turns the block / k-mer counts into hit-calling features
-#     (Poisson on read starts per SNP block, robust zero inflation, relative abundance)
+# Example strainer run with read-aware (pair mode) detection straight from FASTQ:
+#   - kmer_scrub_filter.py --reference places the rare k-mers on the genome (all copies), annotates
+#     segments / blocks / repeat families, and with --context_bp also writes the single-copy reference
+#     k-mers within 300 bp of a rare k-mer (context: used to check reads, never counted)
+#   - fastp: duplicate removal only. No merging and no extra trimming; fastp still trims the adapters of
+#     read pairs by overlap. The reads stay R1 / R2.
+#   - kmer_block_detect -P -V -Q 20 -c scans the pairs directly (no kmdb):
+#       -c  a read must match every rare AND context k-mer it covers on one diagonal
+#       -P  the two mates are one fragment: overlapping mates are booked once, a break in one mate is
+#           forgiven if the other mate reads the same reference k-mers cleanly, mates must face each other
+#       -Q  a break next to a base below Q20 is a sequencing error, not a difference to the strain
+#       -V  a fragment that contradicts the strain anywhere is dropped as a whole
+#     It writes TWO k-mer tables from the same reads:
+#       kmer_hits.tsv.gz       fragments whose reads passed the checks (read-aware)
+#       kmer_hits_any.tsv.gz   every fragment that holds the k-mer (what a non-aware detector counts)
+#   - block_coverage_depth.py turns both into hit-calling features: block_coverage_depth.tsv (read-aware)
+#     and block_coverage_depth_any.tsv (no rejection), same rows and the same k-mer column names
 # Run from strainer3/test after building the tools (cd ../src && make).
+# By default only the first 100,000 read pairs of each sample are used, so the example finishes in a few
+# minutes; MAX_PAIRS=0 bash example_blocks.sh runs all reads, FIGURES=png adds the coverage figures.
+# RUN is the prefix for python / fastp; set RUN="" if they are already on the PATH.
 set -e
 
 OUT=output_blocks
 STRAIN=D6331_Faecalibacterium_prausnitzii
 REF=D6331_genomes/${STRAIN}.fasta.gz
 THREADS=12
-RUN_FASTP=1          # 0 = scan the raw read pairs (for comparing rejection rates)
+CONTEXT_BP=300       # reference context around the rare k-mers (about the insert size)
+ERROR_QUALITY=20     # kmer_block_detect -Q
+RUN_FASTP=1          # 0 = scan the raw read pairs
+MAX_PAIRS=0 #${MAX_PAIRS-100000}   # read pairs per sample used by the example (0 = all 500,000); small = fast
+FIGURES=${FIGURES-none}         # png draws the classic coverage figures (slow)
+RUN=${RUN-conda run -n strainer3_env}
 
-echo "Example strainer run for ${STRAIN} (block-aware detection from FASTQ)"
+echo "Example strainer run for ${STRAIN} (read-aware detection from FASTQ pairs)"
 echo 'STEP 0: Removing old test data if present'
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -41,32 +55,36 @@ echo 'STEP1: complete'
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP2 '; printf '%*s\n' 20 '' | tr ' ' '='
 
-echo 'STEP2: keeping kmers never seen outside the strain (scrub count 0; count 1 added if < 1000 kmers)'
-echo '       and placing them on the genome'
-echo '       (all copies up to --max_ref_copies; runs >= 31 kmers cut into equal 31-61 kmer segments)'
-conda run -n strainer3_env python ../scripts/kmer_scrub_filter.py \
+echo 'STEP2: keeping kmers never seen outside the strain and placing them on the genome'
+echo '       (scrub count 0; count 1 added if fewer than max(1000, 0.1 % of the strain kmers) are left after'
+echo '        block filtering; all copies up to --max_ref_copies; runs >= 31 kmers cut into 31-61 kmer segments)'
+echo "       plus the context kmers within ${CONTEXT_BP} bp of a rare kmer"
+$RUN python ../scripts/kmer_scrub_filter.py \
 -s "$OUT"/scrub/${STRAIN}.global_counts.tsv.zst \
 -O "$OUT"/filter \
 -n ${STRAIN} \
 --selection count \
 --min_kmers 1000 \
+--min_kmers_frac 0.001 \
 --reference ${REF} \
 --max_ref_copies 5 \
 --min_segment_kmers 31 \
 --max_segment_kmers 31 \
---chunk_mode balanced
---
+--chunk_mode balanced \
+--context_bp ${CONTEXT_BP}
 
 zcat "$OUT"/filter/${STRAIN}.kmer_loci.tsv.gz | head -n 3
 zcat "$OUT"/filter/${STRAIN}.blocks.tsv.gz | head -n 3
+zcat "$OUT"/filter/${STRAIN}.context_loci.tsv.gz | head -n 3
 cat "$OUT"/filter/${STRAIN}.selection.json
 echo 'STEP2: complete'
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP3 '; printf '%*s\n' 20 '' | tr ' ' '='
 
 echo ''
-echo 'STEP3: Read preprocessing with fastp and sample sheet for the target metagenomes'
+echo 'STEP3: Read preprocessing with fastp (duplicate removal only) and sample sheet for the target metagenomes'
 # raw reads: sample name <TAB> R1 <TAB> R2   (POSIX sh compatible: no arrays)
+# A sample sequenced in several runs gets one line per run with the SAME name: kmer_block_detect pools them.
 printf '%s\t%s\t%s\n' \
   ATCC-10-even target_metagenomes/ATCC-10-even_S21_L001_R1_001.fastq.downsampled.gz target_metagenomes/ATCC-10-even_S21_L001_R2_001.fastq.downsampled.gz \
   D6331        target_metagenomes/D6331-231101-C4_R1_001.fastq.downsampled.gz        target_metagenomes/D6331-231101-C4_R2_001.fastq.downsampled.gz \
@@ -80,47 +98,35 @@ TAB=$(printf '\t')
 # read the sheet on fd 3 so conda run / fastp cannot consume the loop's stdin
 while IFS="$TAB" read -r NAME R1 R2 <&3; do
   [ -z "$NAME" ] && continue
+  if [ "$MAX_PAIRS" -gt 0 ]; then
+    # the first MAX_PAIRS pairs of each file: enough to see every step work
+    for M in 1 2; do
+      SRC=$R1; [ $M -eq 2 ] && SRC=$R2
+      gzip -dc "$SRC" | head -n $(( MAX_PAIRS * 4 )) | gzip -1 > "$OUT"/fastp/${NAME}.first.R${M}.fq.gz || true
+    done
+    R1="$OUT"/fastp/${NAME}.first.R1.fq.gz; R2="$OUT"/fastp/${NAME}.first.R2.fq.gz
+  fi
   if [ "$RUN_FASTP" -eq 1 ]; then
-    # strict settings for the block completeness check (a read must match every rare k-mer it overlaps):
-    #   --detect_adapter_for_pe        adapter read-through is the main cause of rejected reads
-    #   --trim_poly_g                  NovaSeq / NextSeq G-runs
-    #   --cut_front / --cut_right      sliding-window trim (4 bp, mean Q20); cut_right drops the rest of the read
-    #   -q 20 -u 10                    drop reads with > 10% bases below Q20
-    #   -n 2                           at most 2 N per read (kmer_block_detect splits reads at N)
-    #   -l 50                          short-insert libraries: 50 bp still carries 20 k-mers; the completeness check guards the rest
-    #   -y -Y 30                       low-complexity filter
-    #   --merge --correction           merge overlapping mates; mismatches in the overlap corrected by quality
-    #   --overlap_len_require 30 --overlap_diff_limit 3 --overlap_diff_percent_limit 10   strict merge
-    #   --include_unmerged             merged + unmerged reads in one file (single-end scan)
-    #   --dedup                        PCR duplicates inflate counts and overdispersion
-    conda run -n strainer3_env fastp \
+    # --dedup only: PCR duplicates inflate counts and overdispersion.
+    # Nothing is merged or quality-trimmed here; the detector deals with overlap (-P) and base quality (-Q).
+    # fastp's defaults still apply: adapter trimming of pairs by overlap, and its basic quality / length filter.
+    $RUN fastp \
       -i "$R1" -I "$R2" \
-      --detect_adapter_for_pe \
-      --trim_poly_g \
-      --cut_front --cut_front_window_size 4 --cut_front_mean_quality 20 \
-      --cut_right --cut_right_window_size 4 --cut_right_mean_quality 20 \
-      --qualified_quality_phred 20 --unqualified_percent_limit 10 \
-      --n_base_limit 2 \
-      --length_required 50 \
-      --low_complexity_filter --complexity_threshold 30 \
-      --merge --correction \
-      --overlap_len_require 30 --overlap_diff_limit 3 --overlap_diff_percent_limit 10 \
-      --include_unmerged \
-      --merged_out "$OUT"/fastp/${NAME}.fastp.fq.gz \
+      -o "$OUT"/fastp/${NAME}.fastp.R1.fq.gz -O "$OUT"/fastp/${NAME}.fastp.R2.fq.gz \
       --dedup \
       --thread $(( THREADS < 16 ? THREADS : 16 )) \
       --json "$OUT"/fastp/${NAME}.fastp.json \
       --html "$OUT"/fastp/${NAME}.fastp.html \
       2> "$OUT"/fastp/${NAME}.fastp.log
-    printf '%s\t%s\n' "$NAME" "$OUT/fastp/${NAME}.fastp.fq.gz" >> "$OUT"/samples.tsv
-    conda run -n strainer3_env python -c "
-
+    printf '%s\t%s\t%s\n' "$NAME" "$OUT/fastp/${NAME}.fastp.R1.fq.gz" "$OUT/fastp/${NAME}.fastp.R2.fq.gz" >> "$OUT"/samples.tsv
+    $RUN python -c "
 import json
 j = json.load(open('$OUT/fastp/${NAME}.fastp.json'))
 b, a = j['summary']['before_filtering'], j['summary']['after_filtering']
-print('{}: reads {:,} -> {:,}, mean length {} -> {}, duplication {:.1%}'.format(
+print('{}: reads {:,} -> {:,}, mean length {} -> {}, duplication {:.1%}, insert peak {}'.format(
     '${NAME}', b.get('total_reads', 0), a.get('total_reads', 0),
-    b.get('read1_mean_length', 'NA'), a.get('read1_mean_length', 'NA'), j.get('duplication', {}).get('rate', 0)))
+    b.get('read1_mean_length', 'NA'), a.get('read1_mean_length', 'NA'), j.get('duplication', {}).get('rate', 0),
+    j.get('insert_size', {}).get('peak', 'NA')))
 "
   else
     printf '%s\t%s\t%s\n' "$NAME" "$R1" "$R2" >> "$OUT"/samples.tsv
@@ -132,29 +138,34 @@ echo 'STEP3 - DONE'
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP4 '; printf '%*s\n' 20 '' | tr ' ' '='
 
 echo ''
-echo 'STEP4: Block-aware strain detection directly from FASTQ'
-echo '       (fastp output is scanned single-end: every merged / unmerged read is its own fragment)'
+echo 'STEP4: Read-aware strain detection directly from the FASTQ pairs'
 ../src/kmer_block_detect \
 -k "$OUT"/filter/${STRAIN}.kmer_loci.tsv.gz \
+-c "$OUT"/filter/${STRAIN}.context_loci.tsv.gz \
 -s "$OUT"/samples.tsv \
 -O "$OUT"/strain_detect \
 -n ${STRAIN} \
 -t ${THREADS} \
--m 1
+-m 1 \
+-P -V -Q ${ERROR_QUALITY}
 
-echo 'kmer hits (fragments per kmer and sample, validated reads only; last row total_evaluated):'
+echo 'kmer hits, read-aware (fragments per kmer and sample whose reads passed the checks; last row total_evaluated):'
 zcat "$OUT"/strain_detect/${STRAIN}.kmer_hits.tsv.gz | head -n 4
 zcat "$OUT"/strain_detect/${STRAIN}.kmer_hits.tsv.gz | tail -n 1
-echo 'block hits (frags = fragments placed on the block, starts = reads starting in it):'
+echo 'kmer hits, no rejection (every fragment that holds the kmer):'
+zcat "$OUT"/strain_detect/${STRAIN}.kmer_hits_any.tsv.gz | head -n 4
+echo 'block hits (frags = fragments placed on the block, starts = reads starting in it,'
+echo '            refused = fragments that hit the block but contradict the strain):'
 zcat "$OUT"/strain_detect/${STRAIN}.block_hits.tsv.gz | head -n 4
-echo 'read / group statistics:'
+echo 'read / group / pair statistics:'
 cat "$OUT"/strain_detect/${STRAIN}.detect_stats.tsv
 echo 'STEP4 - DONE'
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP5 '; printf '%*s\n' 20 '' | tr ' ' '='
-echo 'STEP5: Block features for hit calling (read starts per SNP block, zero inflation, relative abundance)'
-conda run -n strainer3_env python ../scripts/block_coverage_depth.py \
+echo 'STEP5: Block features for hit calling, read-aware and without rejection'
+$RUN python ../scripts/block_coverage_depth.py \
 --kmer_hits "$OUT"/strain_detect/${STRAIN}.kmer_hits.tsv.gz \
+--kmer_hits_any "$OUT"/strain_detect/${STRAIN}.kmer_hits_any.tsv.gz \
 --block_hits "$OUT"/strain_detect/${STRAIN}.block_hits.tsv.gz \
 --detect_stats "$OUT"/strain_detect/${STRAIN}.detect_stats.tsv \
 --blocks "$OUT"/filter/${STRAIN}.blocks.tsv.gz \
@@ -164,36 +175,46 @@ conda run -n strainer3_env python ../scripts/block_coverage_depth.py \
 --output_dir "$OUT"/block_coverage \
 --export_hist
 
-echo 'STEP5b: Classic coverage / depth on the validated kmer hits (input for the current hit_call model)'
-# kmer_hits.tsv.gz keeps the kmer_strain_detect layout, so coverage_depth.py runs unchanged
-conda run -n strainer3_env python ../scripts/coverage_depth.py \
---counts "$OUT"/scrub/${STRAIN}.global_counts.tsv.zst \
---hits "$OUT"/strain_detect/${STRAIN}.kmer_hits.tsv.gz \
---strain ${STRAIN} \
---output_dir "$OUT"/coverage \
---reference ${REF} \
---export_hist \
---figures 'png'
+echo 'STEP5b: Classic coverage / depth for the current hit_call model, once per k-mer table'
+# both tables keep the kmer_strain_detect layout, so coverage_depth.py runs unchanged on either
+for KIND in validated any; do
+  HITS="$OUT"/strain_detect/${STRAIN}.kmer_hits.tsv.gz
+  [ "$KIND" = any ] && HITS="$OUT"/strain_detect/${STRAIN}.kmer_hits_any.tsv.gz
+  $RUN python ../scripts/coverage_depth.py \
+  --counts "$OUT"/scrub/${STRAIN}.global_counts.tsv.zst \
+  --hits "$HITS" \
+  --strain ${STRAIN} \
+  --output_dir "$OUT"/coverage_${KIND} \
+  --reference ${REF} \
+  --export_hist \
+  --figures "$FIGURES"
+done
 echo 'STEP5 - DONE'
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' STEP6 '; printf '%*s\n' 20 '' | tr ' ' '='
-echo 'STEP6: Call hits'
+echo 'STEP6: Call hits on both tables (same model, same reads: the difference is the effect of read rejection)'
 # no sylph profiles in this example -> only the 2-feature model (the 5-feature model needs --sylph_file)
-# NOTE: the model was trained on unvalidated kmer counts; retrain on block_coverage_depth.tsv features
-#       (strain_challenge_2 + truth table) before trusting calls
-conda run -n strainer3_env python ../scripts/hit_call.py \
---coverage_dir "$OUT" \
---model ../data/xgb_hitcall_2param \
---output_dir "$OUT"
+# NOTE: the model was trained on unvalidated kmer counts; retrain before trusting calls on the read-aware table
+for KIND in validated any; do
+  $RUN python ../scripts/hit_call.py \
+  --coverage_dir "$OUT"/coverage_${KIND} \
+  --model ../data/xgb_hitcall_2param \
+  --output_dir "$OUT"/hit_calls_${KIND}
+done
 
-echo 'block-based summary (relative abundance in % of sequenced bases):'
-conda run -n strainer3_env python -c "
+echo 'read-aware against no rejection (k-mer coverage, zero inflation, relative abundance in % of sequenced bases):'
+$RUN python -c "
 import pandas as pd
 d = pd.read_csv('$OUT/block_coverage/block_coverage_depth.tsv', sep='\t')
-cols = ['strain', 'sample', 'blk_frac_hit', 'blk_starts_total', 'snp_starts_lambda', 'snp_starts_zi_frac',
-        'snp_starts_zero_vs_robust', 'reject_frac', 'rate_ratio_long_vs_snp',
-        'relative_abundance_starts_robust', 'relative_abundance_kmer_snp_robust', 'detection_limit_rel_abund']
+cols = ['strain', 'sample', 'any_kmer_all_coverage', 'kmer_all_coverage', 'rej_kmer_all_coverage',
+        'any_kmer_all_zi_frac', 'kmer_all_zi_frac', 'rej_kmer_all_hits_frac', 'frags_hit', 'frags_contradicted',
+        'pairs_overlap', 'groups_rescued', 'relative_abundance_any_kmer_all_naive',
+        'relative_abundance_kmer_all_naive', 'relative_abundance_best_naive', 'detection_limit_rel_abund']
 print(d[[c for c in cols if c in d.columns]].round(4).T.to_string(header=False))
+for kind in ('validated', 'any'):
+    h = pd.read_csv('$OUT/hit_calls_%s/hit_calls.tsv' % kind, sep='\t')
+    print('hit calls, %s:' % kind)
+    print(h[[c for c in h.columns if c in ('strain', 'sample') or c.endswith(('_prob', '_call'))]].to_string(index=False))
 "
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' FINISHED '; printf '%*s\n' 20 '' | tr ' ' '='

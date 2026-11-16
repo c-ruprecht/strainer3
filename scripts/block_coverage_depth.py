@@ -3,11 +3,19 @@
 block_coverage_depth.py
 
 Feature table for hit calling from kmer_block_detect output (the block-aware counterpart of coverage_depth.py).
+With --kmer_hits_any a second table, block_coverage_depth_any.tsv, holds the k-mer statistics without read
+rejection under the same column names.
+
 One row per strain x sample in block_coverage_depth.tsv, so tables from many runs can be concatenated and compared to a
 truth table (PR curves).
 
 Inputs (one strain, all samples of a kmer_block_detect run):
   --kmer_hits     <strain>.kmer_hits.tsv.gz      validated fragments per k-mer (+ total_evaluated row)
+  --kmer_hits_any <strain>.kmer_hits_any.tsv.gz  optional: every fragment that holds the k-mer, accepted or not.
+                                                 Adds the same k-mer statistics WITHOUT read rejection as
+                                                 any_kmer_* / depth_any_kmer_* / relative_abundance_any_kmer_*,
+                                                 and rej_kmer_* = what the read checks changed, so both versions
+                                                 of a metric come from the same reads and the same k-mers
   --block_hits    <strain>.block_hits.tsv.gz     frags / starts per block and sample
   --blocks        <strain>.blocks.tsv.gz         kmer_scrub_filter.py block table (n_kmers, ref_copies, ...)
   --detect_stats  <strain>.detect_stats.tsv      reads, fragments, accepted / rejected groups
@@ -53,6 +61,7 @@ import gzip
 import json
 import os
 import re
+import sys
 
 import numpy as np
 import pandas as pd
@@ -612,7 +621,7 @@ def hist_rows(strain, sample, subset, x):
                          'count': k, 'n': f[k]})
 
 
-def kmer_subset_features(df_hits, subset, zi_params, label):
+def kmer_subset_features(df_hits, subset, zi_params, label, prefix=''):
     """coverage, mean depth and robust zero inflation per sample for one k-mer subset"""
     df = df_hits.set_index('#kmer')
     rows = {}
@@ -625,7 +634,7 @@ def kmer_subset_features(df_hits, subset, zi_params, label):
                      'lambda': r['lambda'], 'zi_frac': r['zi_frac'], 'zi_index': r['zi_index'],
                      'frac_trimmed': r['frac_trimmed'],
                      'zero_lambda': lambda_from_zeros(x)[0]}
-    return (pd.DataFrame.from_dict(rows, orient='index').add_prefix(f'kmer_{subset}_')
+    return (pd.DataFrame.from_dict(rows, orient='index').add_prefix(f'{prefix}kmer_{subset}_')
             .reset_index(names=['sample']))
 
 
@@ -652,6 +661,8 @@ def write_no_blocks(args, df_stats, strain, k=31):
     out_path = os.path.join(args.output_dir, 'block_coverage_depth.tsv')
     df.set_index(['strain', 'sample']).to_csv(out_path, sep='\t')
     print(f'Saved {len(df)} not-detectable rows to\n {out_path}')
+    if getattr(args, 'kmer_hits_any', None):
+        df.set_index(['strain', 'sample']).to_csv(os.path.join(args.output_dir, 'block_coverage_depth_any.tsv'), sep='\t')
     if args.export_hist:
         pd.DataFrame(columns=['strain', 'sample', 'subset', 'subset_n', 'count', 'n']).to_csv(
             os.path.join(args.output_dir, f'{strain}.block_hist.tsv.gz'), sep='\t', index=False)
@@ -664,6 +675,9 @@ def write_no_blocks(args, df_stats, strain, k=31):
 def main():
     parser = argparse.ArgumentParser(description='Hit-calling features from kmer_block_detect output (one strain, all samples)')
     parser.add_argument('--kmer_hits', required=True, help='<strain>.kmer_hits.tsv.gz from kmer_block_detect')
+    parser.add_argument('--kmer_hits_any', help='<strain>.kmer_hits_any.tsv.gz from kmer_block_detect: the k-mer '
+                        'counts without read rejection. Adds any_kmer_* (same statistics, no rejection) and '
+                        'rej_kmer_* (difference made by the read checks) to the table')
     parser.add_argument('--block_hits', required=True, help='<strain>.block_hits.tsv.gz from kmer_block_detect')
     parser.add_argument('--blocks', required=True, help='<strain>.blocks.tsv.gz from kmer_scrub_filter.py --reference')
     parser.add_argument('--detect_stats', required=True, help='<strain>.detect_stats.tsv from kmer_block_detect')
@@ -731,6 +745,17 @@ def main():
     df_kmer_hits = df_kmer_hits.loc[df_kmer_hits['#kmer'] != 'total_evaluated'].copy()
     df_kmer_hits.columns = ['#kmer'] + [str(c) for c in df_kmer_hits.columns[1:]]
     samples = [c for c in df_kmer_hits.columns if c != '#kmer']
+
+    # the same k-mers counted without read rejection (optional), in the row order of the validated table
+    df_kmer_any = None
+    if args.kmer_hits_any:
+        df_kmer_any = pd.read_csv(args.kmer_hits_any, sep='\t')
+        df_kmer_any = df_kmer_any.loc[df_kmer_any['#kmer'] != 'total_evaluated'].copy()
+        df_kmer_any.columns = ['#kmer'] + [str(c) for c in df_kmer_any.columns[1:]]
+        if set(df_kmer_any['#kmer']) != set(df_kmer_hits['#kmer']) or set(df_kmer_any.columns) != set(df_kmer_hits.columns):
+            sys.exit('ERROR: --kmer_hits_any does not hold the same k-mers and samples as --kmer_hits '
+                     '(both must come from one kmer_block_detect run)')
+        df_kmer_any = df_kmer_any.set_index('#kmer').loc[df_kmer_hits['#kmer'], samples].reset_index()
 
     # ── reads / QC ──
     df_cov = df_stats.copy()
@@ -956,6 +981,27 @@ def main():
     if df_loc is not None:
         df_cov = df_cov.merge(window_evenness(df_loc, df_kmer_hits), on='sample', how='left')
 
+    # ── the same subsets without read rejection, and what rejection changed ──
+    #   any_kmer_<sub>_*            identical statistics on kmer_hits_any (what a non-aware detector reports)
+    #   rej_kmer_<sub>_coverage     coverage removed by the read checks (any - validated)
+    #   rej_kmer_<sub>_hits_frac    share of the k-mer hits that were rejected
+    #   rej_kmer_<sub>_zi_frac      zero inflation added by the read checks (validated - any)
+    any_subsets = {}
+    if df_kmer_any is not None:
+        for sub, df_sub in kmer_subsets.items():
+            if len(df_sub) == 0:
+                continue
+            df_any = df_kmer_any.loc[df_kmer_any['#kmer'].isin(df_sub['#kmer'])]
+            any_subsets[sub] = df_any
+            df_cov = df_cov.merge(kmer_subset_features(df_any, sub, zi_params, strain, prefix='any_'), on='sample', how='left')
+            df_cov[f'rej_kmer_{sub}_coverage'] = df_cov[f'any_kmer_{sub}_coverage'] - df_cov[f'kmer_{sub}_coverage']
+            df_cov[f'rej_kmer_{sub}_hits_frac'] = 1 - (df_cov[f'kmer_{sub}_depth_mean']
+                                                       / df_cov[f'any_kmer_{sub}_depth_mean'].where(df_cov[f'any_kmer_{sub}_depth_mean'] > 0))
+            df_cov[f'rej_kmer_{sub}_zi_frac'] = df_cov[f'kmer_{sub}_zi_frac'] - df_cov[f'any_kmer_{sub}_zi_frac']
+            if args.export_hist:
+                for smp in samples:
+                    hists.append(hist_rows(strain, smp, f'any_kmer_{sub}', df_any[smp].to_numpy()))
+
     # ── depth (fold coverage) and relative abundance (% of sequenced bases) for every estimate ──
     # an estimator whose column is missing (e.g. no SNP-size blocks -> no snp_starts_*) gives None and is skipped
     L = df_cov['read_len']
@@ -963,6 +1009,12 @@ def main():
     # fragments per k-mer -> read depth: a read covers L - k + 1 k-mers, and kmer_hits counts FRAGMENTS
     # (both mates of a pair count once), so scale by reads per fragment (2 for paired, 1 for single-end)
     kmer_scale = L / (L - k + 1) * df_cov['reads'] / df_cov['fragments']
+    # pair mode (kmer_block_detect -P): overlapping mates are already booked as ONE read and mates that do not
+    # overlap never share a k-mer, so a fragment covers a k-mer with exactly one (booked) read: no factor.
+    # (Without -P the factor above is right only for single-end or fully overlapping pairs; unmerged pairs
+    # that do not overlap come out up to 2x too deep.)
+    if 'pair_mode' in df_cov:
+        kmer_scale = kmer_scale.where(df_cov['pair_mode'] != 1, L / (L - k + 1))
     depth = {
         'starts_robust': _scaled(df_cov, 'snp_starts_lambda', starts_scale),
         'starts_ztp': _scaled(df_cov, 'snp_starts_ztp_lambda', starts_scale),
@@ -997,6 +1049,11 @@ def main():
             depth[f'kmer_{sub}_robust'] = df_cov[f'kmer_{sub}_lambda'] * kmer_scale
             depth[f'kmer_{sub}_naive'] = df_cov[f'kmer_{sub}_depth_mean'] * kmer_scale
             depth[f'kmer_{sub}_zero'] = df_cov[f'kmer_{sub}_zero_lambda'] * kmer_scale
+    for sub in any_subsets:
+        if f'any_kmer_{sub}_lambda' in df_cov:
+            depth[f'any_kmer_{sub}_robust'] = df_cov[f'any_kmer_{sub}_lambda'] * kmer_scale
+            depth[f'any_kmer_{sub}_naive'] = df_cov[f'any_kmer_{sub}_depth_mean'] * kmer_scale
+            depth[f'any_kmer_{sub}_zero'] = df_cov[f'any_kmer_{sub}_zero_lambda'] * kmer_scale
     for est, dep in depth.items():
         if dep is None:
             continue
@@ -1062,6 +1119,20 @@ def main():
     out_path = os.path.join(args.output_dir, 'block_coverage_depth.tsv')
     out.to_csv(out_path, sep='\t')
     print(f'Saved {out.shape[0]} strain x sample rows, {out.shape[1]} features to\n {out_path}')
+
+    # the non-rejected version as a table of its own, with the SAME column names as the validated table
+    # (kmer_all_coverage, kmer_all_zi_frac, depth_kmer_all_naive, relative_abundance_kmer_all_naive, ...), so
+    # one evaluation script scores both files. It holds the k-mer statistics and the sample / strain columns;
+    # block statistics (best, starts) exist only for validated reads and are left out.
+    if df_kmer_any is not None:
+        keep = [c for c in df_cov.columns if c in df_stats.columns or c.startswith('strain')
+                or c in ('read_len', 'total_bases', 'genome_length', 'total_evaluated')]
+        ren = {c: c.replace('any_kmer_', 'kmer_', 1) for c in df_cov.columns
+               if c.startswith(('any_kmer_', 'depth_any_kmer_', 'relative_abundance_any_kmer_'))}
+        out_any = df_cov[keep + list(ren)].rename(columns=ren).set_index(['strain', 'sample']).round(6)
+        any_path = os.path.join(args.output_dir, 'block_coverage_depth_any.tsv')
+        out_any.to_csv(any_path, sep='\t')
+        print(f'Saved the same k-mer statistics without read rejection ({out_any.shape[1]} columns) to\n {any_path}')
 
     if args.export_hist and hists:
         hist_path = os.path.join(args.output_dir, f'{strain}.block_hist.tsv.gz')

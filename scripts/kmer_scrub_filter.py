@@ -29,6 +29,9 @@ Outputs (in --output_dir, prefixed with --basename):
                         ref_rc = True if the #kmer string, as written, occurs on the
                         reverse strand of the reference at this locus.
                         kmer_position is the 0-based start on the forward strand.
+  .context_loci.tsv.gz  only with --context_bp: single-copy reference k-mers next to the rare
+                        segments (#kmer contig_id kmer_position ref_rc). kmer_block_detect -c uses
+                        them to check a read over its whole length; they are never counted.
   .blocks.tsv.gz        one row per block (block mode only):
                         block_id segment_id family_id contig_id start stop
                         length_bp n_kmers ref_copies pangenome_count
@@ -293,13 +296,17 @@ def _quantiles(x, prefix):
 
 
 def build_blocks(df_sel, records, k, terminal_dist=0, max_ref_copies=5, min_segment_kmers=1,
-                 max_segment_kmers=0, chunk_mode='fixed'):
+                 max_segment_kmers=0, chunk_mode='fixed', df_mapped=None):
     """Place selected k-mers on the reference and annotate segments, blocks and
     repeat families. Whenever a locus has to be dropped, the WHOLE k-mer is dropped
     (all copies), so a read can never be placed on the wrong copy because the
     true copy was removed."""
     stats = {}
-    df_loci = map_kmers_all_loci(records, df_sel['#kmer'].tolist())
+    if df_mapped is None:
+        df_loci = map_kmers_all_loci(records, df_sel['#kmer'].tolist())
+    else:
+        # loci of a superset of df_sel, mapped once (the scrub count is relaxed step by step on top of it)
+        df_loci = df_mapped[df_mapped['#kmer'].isin(set(df_sel['#kmer']))].copy()
 
     n_in = df_sel['#kmer'].nunique()
     n_found = df_loci['#kmer'].nunique()
@@ -440,15 +447,76 @@ def build_blocks(df_sel, records, k, terminal_dist=0, max_ref_copies=5, min_segm
     return df_loci, df_blocks, stats
 
 
-def select_by_count(df, min_kmers=1000, max_count=1, max_ref_copies=5):
-    """Keep k-mers never seen outside the strain: scrub count (pangenome + metagenome) == 0, drug count == 0,
-    1..max_ref_copies copies in the reference. If that leaves fewer than min_kmers, relax the scrub count
-    step by step (<= 1, <= 2, ... up to max_count). Returns the selection and the count threshold used."""
+def build_context(records, df_loci, k, context_bp):
+    """Context k-mers for whole-read validation: every reference k-mer that starts within context_bp of a
+    kept rare k-mer, is not itself a kept rare k-mer and occurs exactly once in the reference (either strand).
+    Multi-copy k-mers are left out on purpose: a read from another copy would look like a contradiction, so
+    the validation run simply ends there. Returns #kmer contig_id kmer_position ref_rc (ref_rc always False:
+    the k-mer is written as it stands on the forward strand)."""
+    cols = ['#kmer', 'contig_id', 'kmer_position', 'ref_rc']
+    if context_bp <= 0 or len(df_loci) == 0 or k > 32:
+        return pd.DataFrame(columns=cols)
+    lut = np.full(256, 4, dtype=np.uint8)
+    for i, ch in enumerate('ACGT'):
+        lut[ord(ch)] = i
+    codes, spans = [], {}
+    for cid, seq in records.items():
+        n = len(seq) - k + 1
+        if n <= 0:
+            continue
+        b = lut[np.frombuffer(seq.encode('ascii', 'replace'), dtype=np.uint8)]
+        bad = np.concatenate([[0], np.cumsum(b > 3)])
+        valid = (bad[k:] - bad[:-k]) == 0
+        b64 = np.where(b > 3, 0, b).astype(np.uint64)
+        fwd = np.zeros(n, dtype=np.uint64)
+        rc = np.zeros(n, dtype=np.uint64)
+        for j in range(k):
+            fwd = (fwd << np.uint64(2)) | b64[j:j + n]
+            rc = rc | ((np.uint64(3) - b64[j:j + n]) << np.uint64(2 * j))
+        canon = np.minimum(fwd, rc)
+        spans[cid] = (len(codes), canon, valid)
+        codes.append(canon[valid])
+    if not codes:
+        return pd.DataFrame(columns=cols)
+    uniq, counts = np.unique(np.concatenate(codes), return_counts=True)
+    single = uniq[counts == 1]
+    rows = []
+    rare_by_contig = {c: g['kmer_position'].to_numpy() for c, g in df_loci.groupby('contig_id')}
+    for cid, (_, canon, valid) in spans.items():
+        pos = rare_by_contig.get(cid)
+        if pos is None:
+            continue
+        n = len(canon)
+        diff = np.zeros(n + 1, dtype=np.int64)
+        np.add.at(diff, np.clip(pos - context_bp, 0, n), 1)
+        np.add.at(diff, np.clip(pos + context_bp + 1, 0, n), -1)
+        near = np.cumsum(diff[:n]) > 0
+        near[pos] = False
+        near &= valid
+        idx = np.flatnonzero(near)
+        idx = idx[np.isin(canon[idx], single)]
+        seq = records[cid]
+        rows.extend((seq[i:i + k], cid, int(i), False) for i in idx)
+    return pd.DataFrame(rows, columns=cols)
+
+
+def count_candidates(df, max_count=1, max_ref_copies=5):
+    """k-mers that may be selected at all: 1..max_ref_copies copies in the reference, no drug hits and a scrub
+    count (pangenome + metagenome) of at most max_count. Adds the scrub_count column."""
     df = df.copy()
     df['scrub_count'] = df['pangenome_count'] + df['metagenome_count']
     base = df['reference_count'].between(1, max_ref_copies) & (df['drug_count'] == 0)
+    return df[base & (df['scrub_count'] <= max_count)].copy()
+
+
+def select_by_count(df, min_kmers=1000, max_count=1, max_ref_copies=5):
+    """Keep k-mers never seen outside the strain: scrub count (pangenome + metagenome) == 0, drug count == 0,
+    1..max_ref_copies copies in the reference. If that leaves fewer than min_kmers, relax the scrub count
+    step by step (<= 1, <= 2, ... up to max_count). Returns the selection and the count threshold used.
+    (Block mode applies the target to the k-mers KEPT after block filtering instead: see main.)"""
+    cand = count_candidates(df, max_count, max_ref_copies)
     for t in range(0, max_count + 1):
-        sel = df[base & (df['scrub_count'] <= t)]
+        sel = cand[cand['scrub_count'] <= t]
         print(f"#count selection: scrub count <= {t}: {len(sel)} kmers")
         if len(sel) >= min_kmers:
             break
@@ -521,9 +589,28 @@ def main():
                              "percentile: rarest --min_fraction percentile (old --keep_equal_rare). "
                              "scrub: iterative joint/independent scrub down to --min_fraction (old default).")
     parser.add_argument("--min_kmers", type=int, default=1000,
-                        help="count selection: minimum number of kmers before scrub count 1 kmers are added (default 1000)")
+                        help="count selection: absolute minimum number of kmers; below it kmers with a higher scrub "
+                             "count are added (default 1000)")
+    parser.add_argument("--min_kmers_frac", type=float, default=0.001,
+                        help="count selection: minimum number of kmers as a fraction of the strain's distinct kmers "
+                             "(about the genome size), default 0.001 = 0.1%%. The target is the larger of this and "
+                             "--min_kmers. Scaling with the genome keeps the share of a strain's reads that carry a "
+                             "rare kmer, and so the detection limit in relative abundance, similar across genome "
+                             "sizes. 0 = only --min_kmers.")
     parser.add_argument("--max_rare_count", type=int, default=1,
-                        help="count selection: highest scrub count that may be added to reach --min_kmers (default 1)")
+                        help="count selection: highest scrub count that may be added to reach the target. The count "
+                             "is raised one step at a time (<= 1, <= 2, ...) and stops as soon as the target is "
+                             "reached (default 1)")
+    parser.add_argument("--target_on", choices=['kept', 'selected'], default='kept',
+                        help="count selection in block mode: kept (default) = the target applies to the kmers left "
+                             "after block filtering (short segments, tandem and high-copy kmers removed), which is "
+                             "what detection really uses; selected = to the kmers before block filtering (old "
+                             "behaviour). Without --reference the target always applies to the selected kmers.")
+    parser.add_argument("--context_bp", type=int, default=0,
+                        help="block mode: also write <name>.context_loci.tsv.gz with the single-copy reference kmers "
+                             "that start within N bp of a kept rare kmer (default 0 = off). kmer_block_detect -c "
+                             "uses them to validate a read over its whole length; about one read length (150) "
+                             "covers a read, about the insert size covers both mates.")
     parser.add_argument("--keep_equal_rare", action='store_true',
                         help='alias for --selection percentile (kept for old scripts)')
 
@@ -576,9 +663,17 @@ def main():
                 df_scrub = read_counts_list([l.strip() for l in fh if l.strip()])
         df_scrub, n_non_acgt = drop_non_acgt(df_scrub)
         all_kmers = len(df_scrub)
-        df_sel, t = select_by_count(df_scrub, min_kmers=args.min_kmers, max_count=args.max_rare_count,
+        target_kmers = max(args.min_kmers, int(np.ceil(args.min_kmers_frac * all_kmers)))
+        print(f"#count selection: target {target_kmers} kmers (max of --min_kmers {args.min_kmers} and "
+              f"{args.min_kmers_frac:g} x {all_kmers} strain kmers)")
+        df_cand = count_candidates(df_scrub, args.max_rare_count, args.max_ref_copies)
+        df_sel, t = select_by_count(df_scrub, min_kmers=target_kmers, max_count=args.max_rare_count,
                                     max_ref_copies=args.max_ref_copies)
-        selection_info.update(rare_count=t, min_kmers=args.min_kmers, selected_kmers=len(df_sel))
+        selection_info.update(rare_count=t, min_kmers=args.min_kmers, min_kmers_frac=args.min_kmers_frac,
+                              target_kmers=target_kmers, max_rare_count=args.max_rare_count,
+                              selected_kmers=len(df_sel),
+                              candidates_by_count={str(c): int(n) for c, n in
+                                                   df_cand['scrub_count'].value_counts().sort_index().items()})
         del df_scrub
 
     elif args.selection == 'percentile':
@@ -701,14 +796,28 @@ def main():
               + (f", segments cut into {args.chunk_mode} chunks of {args.max_segment_kmers} kmers"
                  if args.max_segment_kmers > 0 else ""))
         records = load_genome(args.reference)
-        df_loci, df_blocks, stats = build_blocks(
-            df_sel, records, k,
-            terminal_dist=args.terminal_dist,
-            max_ref_copies=args.max_ref_copies,
-            min_segment_kmers=min_seg,
-            max_segment_kmers=args.max_segment_kmers,
-            chunk_mode=args.chunk_mode,
-        )
+        block_args = dict(terminal_dist=args.terminal_dist, max_ref_copies=args.max_ref_copies,
+                          min_segment_kmers=min_seg, max_segment_kmers=args.max_segment_kmers,
+                          chunk_mode=args.chunk_mode)
+        df_loci, df_blocks, stats = build_blocks(df_sel, records, k, **block_args)
+        if args.selection == 'count' and args.target_on == 'kept':
+            # block filtering removes k-mers (median about a fifth, far more in k-mer-poor strains), so the
+            # target is checked on what is left. The scrub count is raised one step at a time until the kept
+            # k-mers reach the target or --max_rare_count is hit. The candidates are mapped only once.
+            t = selection_info['rare_count']
+            df_mapped = None
+            while stats['kept_kmers'] < target_kmers and t < args.max_rare_count:
+                t += 1
+                if df_mapped is None:
+                    df_mapped = map_kmers_all_loci(records, df_cand['#kmer'].tolist())
+                df_sel = df_cand[df_cand['scrub_count'] <= t].drop(columns='scrub_count')
+                df_loci, df_blocks, stats = build_blocks(df_sel, records, k, df_mapped=df_mapped, **block_args)
+                print(f"#count selection: scrub count <= {t}: {len(df_sel)} kmers selected, "
+                      f"{stats['kept_kmers']} kept after block filtering")
+            selection_info.update(rare_count=t, selected_kmers=len(df_sel))
+            if stats['kept_kmers'] < target_kmers:
+                print(f"#WARNING: {stats['kept_kmers']} kmers kept with scrub count <= {t} "
+                      f"(target {target_kmers}): strain has few strain-specific kmers")
         for key, val in stats.items():
             print(f"#block_mode {key}: {val}")
         if stats['kept_kmers'] == 0:
@@ -721,6 +830,12 @@ def main():
                        sep='\t', index=False, compression='gzip')
         df_blocks.to_csv(os.path.join(args.output_dir, prefix + "blocks.tsv.gz"),
                          sep='\t', index=False, compression='gzip')
+        if args.context_bp > 0:
+            df_ctx = build_context(records, df_loci, k, args.context_bp)
+            df_ctx.to_csv(os.path.join(args.output_dir, prefix + "context_loci.tsv.gz"),
+                          sep='\t', index=False, compression='gzip')
+            print(f"#block_mode context_kmers: {len(df_ctx)} (within {args.context_bp} bp of a kept rare kmer)")
+            selection_info.update(context_bp=args.context_bp, context_kmers=int(len(df_ctx)))
         kept = pd.unique(df_loci['#kmer'])
     else:
         kept = df_sel['#kmer'].to_numpy()
@@ -735,8 +850,10 @@ def main():
                               **{f'filter_{key}': (int(v) if isinstance(v, (np.integer,)) else
                                                    float(v) if isinstance(v, np.floating) else v)
                                  for key, v in stats.items()})
-    if selection_info.get('kept_kmers', 0) < args.min_kmers and args.selection == 'count':
-        print(f"#WARNING: {len(kept)} kmers left after block filtering (< --min_kmers {args.min_kmers})")
+    if args.selection == 'count':
+        selection_info['target_reached'] = bool(len(kept) >= target_kmers)
+        if len(kept) < target_kmers:
+            print(f"#WARNING: {len(kept)} kmers left (< target {target_kmers})")
     with open(os.path.join(args.output_dir, prefix + "selection.json"), 'w') as fh:
         json.dump(selection_info, fh, indent=2)
 

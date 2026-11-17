@@ -610,6 +610,56 @@ static char *basename_no_ext(const char *path)
 	return out;
 }
 
+/* Sample id for an -A/-B/-C entry.
+
+   A .kmdb.fasta[.gz] written by kmdb2fasta gets the same sample_id as the
+   .kmdb it was exported from, so summary/presence rows do not change name
+   when the database is stored as unitig FASTA:
+     1) the "sample_id" line of the sidecar <dir>/<x>.kmdb.meta.tsv next to
+        it (written by the metagenome_scrub_db workflow; `kmdb_dump -i`
+        format: "sample_id<TAB><id>"),
+     2) else the file name without ".kmdb.fasta[.gz]".
+   Every other input keeps basename_no_ext(). Returns a malloc'd string. */
+static char *sample_id_for_path(const char *path)
+{
+	char *id = basename_no_ext(path);        /* "x.kmdb" for x.kmdb.fasta.gz */
+	size_t l = strlen(id);
+	if (l <= 5 || strcmp(id + l - 5, ".kmdb") != 0)
+		return id;
+
+	const char *slash = strrchr(path, '/');
+	size_t dl = slash ? (size_t)(slash - path) + 1 : 0;
+	char *meta = malloc(dl + l + sizeof ".meta.tsv");
+	if (!meta) { perror("malloc"); exit(EXIT_FAILURE); }
+	memcpy(meta, path, dl);
+	memcpy(meta + dl, id, l);
+	memcpy(meta + dl + l, ".meta.tsv", sizeof ".meta.tsv");
+
+	id[l - 5] = '\0';                        /* fallback: drop ".kmdb" */
+
+	FILE *f = fopen(meta, "r");
+	if (f) {
+		char *line = NULL;
+		size_t cap = 0;
+		ssize_t n;
+		while ((n = getline(&line, &cap, f)) != -1) {
+			if (strncmp(line, "sample_id\t", 10) != 0) continue;
+			while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+				line[--n] = '\0';
+			if (n > 10) {
+				free(id);
+				id = strdup(line + 10);
+				if (!id) { perror("strdup"); exit(EXIT_FAILURE); }
+			}
+			break;
+		}
+		free(line);
+		fclose(f);
+	}
+	free(meta);
+	return id;
+}
+
 extern int   contains_N(char *str);
 extern char *orient_string(char *seed_seq, char *seedStrRevComp, int seed);
 
@@ -1097,7 +1147,7 @@ static void *worker_main(void *arg)
 			}
 			id = kmdb_meta_get(db, "sample_id");
 		}
-		if (!id) id = basename_no_ext(path);
+		if (!id) id = sample_id_for_path(path);
 		if (seen_registry_check_and_add(p->seen, p->sample_type, id)) {
 			fprintf(stderr,
 			        "skipping %s: sample_id '%s' (type=%s) already processed\n",

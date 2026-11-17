@@ -50,7 +50,7 @@ endif
 shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
 BASE_TARGETS = genome_compare genome_compare_presence \
-               kmer_strain_detect kmer_strain_detect_genome
+               kmer_strain_detect kmer_strain_detect_genome kmdb_dump
 
 all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 
@@ -84,6 +84,9 @@ kmer_scrub_count: kmer_scrub_count.o kmer_scrub_streaming.o kmdb.o $(shared_obj)
 
 kmer_metagenome_db: kmer_metagenome_db.o kmdb.o
 	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
+
+kmdb_dump: kmdb_dump.o kmdb.o
+	$(CC) -o $@ $^ $(ZSTD_LIBS)
 
 # kmdb.o / -lzstd only when zstd was found; without them the .kmdb code is
 # compiled out (#ifdef HAVE_ZSTD) and .kmdb targets are rejected at run time

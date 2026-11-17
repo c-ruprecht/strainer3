@@ -75,7 +75,8 @@ printf '%*s' 20 '' | tr ' ' '='; printf ' STEP6 '; printf '%*s\n' 20 '' | tr ' '
 echo 'STEP6: Call hits'
 conda run -n strainer3_env python ../scripts/hit_call.py \
 --coverage_dir output \
---output_dir output 
+--output_dir output \
+--model /metrica/codebase/strainer3-kmdb/data/xgb_hitcall_2param
 
 printf '%*s' 20 '' | tr ' ' '='; printf ' FINISHED '; printf '%*s\n' 20 '' | tr ' ' '='
 

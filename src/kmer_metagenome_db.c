@@ -3,20 +3,29 @@
 
 	Two modes, chosen with -T:
 
-	-m scrub  (default; unchanged behaviour)
+	-m scrub  (default)
 	  A PRESENCE database that supplements the genome scrub database.
 	  Keeps exactly the metagenome k-mers with
 
 	    metagenome_count >= -c        (default 2: drops most error k-mers)
-	    pangenome_count  == 0         (absent from every genome in -A)
+	    pangenome_count  <= -a        (default 0: absent from every genome in -A)
+
+	pangenome_count is the number of -A genome FILES that contain the
+	k-mer (a k-mer repeated inside one genome, e.g. in rRNA operons,
+	counts once). -a 0 is the original behaviour: any genome hit scrubs.
+	-a 1 keeps k-mers private to a single genome, -a 2 those shared by at
+	most two, and so on (0..254).
 
 	Only presence is stored: a k-mer seen 3x is identical to one seen 100x.
 	Counts exist only transiently, as an 8-bit saturating counter used to
-	apply -c (so -c must be <= 255). The database is a sorted k-mer list.
+	apply -c (so -c must be <= 255). After step 2 the same byte is reused
+	as 1 + genome hits for -a, so -a costs no table memory. The database
+	is a sorted k-mer list.
 
 	Scrubbing a reference with `kmer_scrub_count -B x.kmdb`
 	then attributes each reference k-mer to the genomes OR to the
-	metagenome, never both.
+	metagenome, never both (with -a 0; with -a > 0 a k-mer found in up
+	to -a genomes can be in both).
 
 	Steps
 	  1) count   all canonical k-mers of the reads (-i, repeatable; R1 and R2
@@ -26,9 +35,14 @@
 	  2) filter  drop k-mers with count < -c, rebuilding each partition at a
 	             lower load factor so step 3's lookups are fast.
 	  3) subtract stream every genome in -A (in parallel, one genome per
-	             thread at a time) and delete every metagenome k-mer it
-	             contains. Genome k-mers are never stored, so memory is set by
-	             the metagenome alone.
+	             thread at a time). With -a 0 every metagenome k-mer it
+	             contains is deleted on the spot. With -a > 0 each thread
+	             collects the table slots its genome hits, sorts and
+	             dedups them, then adds 1 to each slot's genome count
+	             (atomic CAS) and deletes the k-mer once the count exceeds
+	             -a. Genome k-mers are never stored, so memory is set by
+	             the metagenome alone (plus 8 bytes per hit slot per
+	             thread for the genome in flight when -a > 0).
 	  4) write   sort partitions in parallel, k-way merge, write zstd blocks.
 
 	-m sample
@@ -437,6 +451,7 @@ typedef struct {
 	int        mode;           /* MODE_SCRUB / MODE_SAMPLE */
 	uint32_t   P;              /* partitions == worker threads */
 	uint32_t   min_count;      /* scrub 1..COUNT_MAX, sample 1..COUNT32_MAX */
+	uint32_t   max_gcount;     /* scrub -a: keep k-mers in <= this many genomes */
 	tab_t     *tabs;
 
 	/* low-memory passes */
@@ -913,7 +928,8 @@ static void *filter_main(void *arg)
 
 	tab_t nt;
 	tab_init(&nt, pow2_at_least(keep * 2), 0);   /* load <= 0.5 */
-	for (size_t i = 0; i < keep; i++) tab_put_new(&nt, ks[i], cs[i]);
+	/* survivors restart at 1 = alive, 0 genome hits (step 3 counts up) */
+	for (size_t i = 0; i < keep; i++) tab_put_new(&nt, ks[i], 1);
 	free(ks);
 	free(cs);
 	*t = nt;
@@ -931,7 +947,7 @@ static void *filter_inplace_main(void *arg)
 	size_t keep = 0;
 	for (size_t i = 0; i < t->cap; i++) {
 		if (t->keys[i] == EMPTY_KEY) continue;
-		if (t->counts[i] >= c->min_count) keep++;
+		if (t->counts[i] >= c->min_count) { keep++; t->counts[i] = 1; }
 		else t->counts[i] = 0;
 	}
 	t->n = keep;
@@ -940,15 +956,42 @@ static void *filter_inplace_main(void *arg)
 
 /* ── step 3: genome subtraction ───────────────────────────────────── */
 
+static void sort_keys(uint64_t *k, size_t n);
+
+/* hit slot, encoded as partition (8 bits, P <= 256) | slot index (56 bits) */
+#define HIT_IDX_BITS 56
+#define HIT_IDX_MASK ((1ull << HIT_IDX_BITS) - 1)
+
+/* One more genome contains the k-mer in slot cp. The byte holds
+   1 + genomes seen so far (0 = deleted / dropped by -c). Deletes the
+   k-mer once more than max_gcount genomes contain it. 1 = this call
+   deleted it (so removals are counted exactly once). */
+static inline int genome_hit(uint8_t *cp, uint32_t max_gcount)
+{
+	uint8_t v = __atomic_load_n(cp, __ATOMIC_RELAXED);
+	for (;;) {
+		if (v == 0) return 0;
+		/* genomes seen after this hit = (v - 1) + 1 = v */
+		uint8_t nv = v > max_gcount ? 0 : (uint8_t)(v + 1);
+		if (__atomic_compare_exchange_n(cp, &v, nv, 0,
+		                                __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+			return nv == 0;
+	}
+}
+
 static void *subtract_main(void *arg)
 {
 	targ_t *a = arg;
 	ctx_t *c = a->c;
 	const uint32_t P = c->P, M = c->M, pass = c->pass;
+	const uint32_t maxg = c->max_gcount;
 	const int k = c->k;
 	const int shift = 2 * (k - 1);
 	const uint64_t mask = (1ull << (2 * k)) - 1;
 	uint64_t removed = 0;
+	/* -a > 0: slots hit by the current genome, deduplicated per genome */
+	uint64_t *hits = NULL;
+	size_t nh = 0, hcap = 0;
 
 	for (;;) {
 		int g = __atomic_fetch_add(&c->next_genome, 1, __ATOMIC_RELAXED);
@@ -975,20 +1018,40 @@ static void *subtract_main(void *arg)
 				uint64_t can = fwd > rev ? fwd : rev;
 				uint64_t h = mix64(can);
 				if (M > 1 && pass_of(h, M) != pass) continue;
-				tab_t *t = &c->tabs[part_of(h, P)];
+				uint32_t part = part_of(h, P);
+				tab_t *t = &c->tabs[part];
 				size_t tm = t->cap - 1, i = h & tm;
 				uint64_t key;
 				while ((key = t->keys[i]) != EMPTY_KEY) {
 					if (key == can) {
-						/* mark deleted (count 0); count removals once */
-						if (__atomic_load_n(&t->counts[i], __ATOMIC_RELAXED) &&
-						    __atomic_exchange_n(&t->counts[i], 0, __ATOMIC_RELAXED))
-							removed++;
+						if (maxg == 0) {
+							/* original rule: mark deleted (count 0); count
+							   removals once */
+							if (__atomic_load_n(&t->counts[i], __ATOMIC_RELAXED) &&
+							    __atomic_exchange_n(&t->counts[i], 0, __ATOMIC_RELAXED))
+								removed++;
+						} else if (__atomic_load_n(&t->counts[i], __ATOMIC_RELAXED)) {
+							if (nh == hcap) {
+								hcap = hcap ? hcap * 2 : 65536;
+								hits = xrealloc(hits, hcap * sizeof(uint64_t));
+							}
+							hits[nh++] = ((uint64_t)part << HIT_IDX_BITS) | i;
+						}
 						break;
 					}
 					i = (i + 1) & tm;
 				}
 			}
+		}
+		/* -a > 0: each distinct slot hit by this genome counts one genome */
+		if (nh) {
+			sort_keys(hits, nh);
+			for (size_t j = 0; j < nh; j++) {
+				if (j && hits[j] == hits[j - 1]) continue;
+				tab_t *t = &c->tabs[hits[j] >> HIT_IDX_BITS];
+				removed += genome_hit(&t->counts[hits[j] & HIT_IDX_MASK], maxg);
+			}
+			nh = 0;
 		}
 		if (l < -1) {
 			fprintf(stderr, "error: genome %s is truncated or malformed\n",
@@ -1003,6 +1066,7 @@ static void *subtract_main(void *arg)
 			fprintf(stderr, "  subtracted %d / %d genomes (%.1fs)\n",
 			        done, c->n_genomes, now_s() - c->t_start);
 	}
+	free(hits);
 	__atomic_fetch_add(&c->removed, removed, __ATOMIC_RELAXED);
 	return NULL;
 }
@@ -1360,6 +1424,7 @@ static void usage(int status)
 	"                          [--pair-dedup | --no-pair-dedup] [--interleaved]\n"
 	"                          [--stats <file>]\n"
 	"                          [-A <genome list | single genome FASTA>]\n"
+"                          [-a <max genomes, scrub 0..254, default 0>]\n"
 	"                          [-n <sample id>] [-O <output dir, default .>]\n"
 	"                          [-o <output path, overrides -O/-n naming>]\n"
 	"                          [-c <min count; scrub 1..255, default 2; sample default 1>]\n"
@@ -1378,6 +1443,11 @@ static void usage(int status)
 	"  first read file's name without its extension.\n"
 	"  -A is the genome scrub DB list (the same list you pass to\n"
 	"  kmer_scrub_count -A). Without -A nothing is subtracted.\n"
+"  -a N  scrub a k-mer only if MORE than N -A genomes contain it (each\n"
+"        genome file counts once). -a 0 (default) scrubs on any hit, as\n"
+"        before; -a 1 keeps k-mers private to one genome, -a 2 to <= 2.\n"
+"        -a > 0 adds ~8 bytes per hit k-mer per thread for the genome\n"
+"        being streamed.\n"
 	"  -c 1 keeps every k-mer seen at least once.\n"
 	"  Memory: ~13-26 bytes per distinct k-mer in the reads (all k-mers,\n"
 	"  including errors, before -c), briefly up to ~39 while a table grows,\n"
@@ -1435,6 +1505,8 @@ int main(int argc, char *argv[])
 	char *reads_list = NULL, *genome_list = NULL;
 	char *name = NULL, *out_dir = NULL, *out_path = NULL, *tmp_dir = NULL;
 	long long min_count = 0;
+	long long max_gcount = 0;
+	int a_given = 0;
 	int c_given = 0;           /* -c not given -> mode default */
 	long k = 31, threads = 4, block_n = 0, level = 3, passes = 0;
 	double ram_gb = 0.0;
@@ -1451,7 +1523,7 @@ int main(int argc, char *argv[])
 		{ "help",          no_argument,       NULL, 'h' },
 		{ NULL, 0, NULL, 0 }
 	};
-	while ((c = getopt_long(argc, argv, "m:T:i:I:A:n:O:o:c:k:t:b:z:M:R:EW:h",
+	while ((c = getopt_long(argc, argv, "m:T:i:I:A:a:n:O:o:c:k:t:b:z:M:R:EW:h",
 	                        longopts, NULL)) != -1) {
 		switch (c) {
 		case OPT_PAIR_DEDUP:    pair_dedup = 1; break;
@@ -1470,6 +1542,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'I': reads_list  = strdup(optarg); break;
 		case 'A': genome_list = strdup(optarg); break;
+		case 'a': max_gcount  = atoll(optarg); a_given = 1; break;
 		case 'n': name        = strdup(optarg); break;
 		case 'O': out_dir     = strdup(optarg); break;
 		case 'o': out_path    = strdup(optarg); break;
@@ -1542,6 +1615,19 @@ int main(int argc, char *argv[])
 		        COUNT32_MAX, min_count);
 		return 1;
 	}
+	if (max_gcount < 0 || max_gcount > (long long)COUNT_MAX - 1) {
+		fprintf(stderr, "error: -a must be 0..%u (got %lld)\n",
+		        COUNT_MAX - 1, max_gcount);
+		return 1;
+	}
+	if (mode == MODE_SAMPLE && a_given) {
+		fprintf(stderr, "error: -a is only for -m scrub (sample mode does no "
+		        "genome subtraction)\n");
+		return 1;
+	}
+	if (a_given && max_gcount > 0 && !genome_list)
+		fprintf(stderr, "WARNING: -a %lld without -A: nothing is subtracted\n",
+		        max_gcount);
 	if (mode == MODE_SAMPLE && genome_list) {
 		fprintf(stderr, "error: -A is not used with -m sample (no scrubbing is "
 		        "performed); drop -A or use -m scrub\n");
@@ -1601,6 +1687,7 @@ int main(int argc, char *argv[])
 	C.mode         = mode;
 	C.P            = (uint32_t)threads;
 	C.min_count    = (uint32_t)min_count;
+	C.max_gcount   = (uint32_t)max_gcount;
 	C.M            = passes > 0 ? (uint32_t)passes : 1;
 	C.inputs       = inputs;
 	C.n_inputs     = n_inputs;
@@ -1685,8 +1772,9 @@ int main(int argc, char *argv[])
 
 	if (mode == MODE_SCRUB)
 		fprintf(stderr, "kmer_metagenome_db (presence-only): sample %s, k=%d, "
-		        "min count %u, %u threads, %d read file(s), %d genome(s) to subtract",
-		        name, C.k, C.min_count, C.P, n_reads, C.n_genomes);
+		        "min count %u, max genomes %u, %u threads, %d read file(s), "
+		        "%d genome(s) to subtract",
+		        name, C.k, C.min_count, C.max_gcount, C.P, n_reads, C.n_genomes);
 	else
 		fprintf(stderr, "kmer_metagenome_db (sample counts): sample %s, k=%d, "
 		        "min count %u, %u threads, %d read file(s)",
@@ -1825,8 +1913,8 @@ int main(int argc, char *argv[])
 
 			/* 3) subtract genomes */
 			if (C.n_genomes > 0) {
-				fprintf(stderr, "[3/4] %sremoving k-mers present in %d genome(s)\n",
-				        tag, C.n_genomes);
+				fprintf(stderr, "[3/4] %sremoving k-mers present in more than %u "
+				        "of %d genome(s)\n", tag, C.max_gcount, C.n_genomes);
 				C.next_genome = 0; C.genomes_done = 0; C.removed = 0;
 				run_parallel(&C, subtract_main, C.P);
 				if (C.genome_errors > 0) {
@@ -1836,7 +1924,7 @@ int main(int argc, char *argv[])
 					return 1;
 				}
 				removed_total += C.removed;
-				fprintf(stderr, "      removed %" PRIu64 " k-mers shared with genomes, "
+				fprintf(stderr, "      removed %" PRIu64 " k-mers shared with > -a genomes, "
 				        "%" PRIu64 " remain (%.1fs)\n", C.removed,
 				        pass_min - C.removed, now_s() - C.t_start);
 			} else {
@@ -1906,6 +1994,8 @@ int main(int argc, char *argv[])
 	for (int i = 0; i < n_reads; i++) kmdb_writer_meta(w, "read_file", reads[i]);
 	kmdb_writer_meta(w, "genome_list", genome_list ? genome_list : "none");
 	kmdb_writer_meta_u64(w, "n_genomes", (uint64_t)C.n_genomes);
+	if (mode == MODE_SCRUB)
+		kmdb_writer_meta_u64(w, "max_genome_count", C.max_gcount);
 	kmdb_writer_meta_u64(w, "n_reads", st_reads);
 	kmdb_writer_meta_u64(w, "kmer_positions", st_positions);
 	kmdb_writer_meta_u64(w, "valid_kmer_positions", st_valid);

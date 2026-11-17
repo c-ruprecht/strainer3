@@ -191,12 +191,15 @@ def main():
         sys.stderr.write("error: one of scrub_count_file or scrub_count_list must be provided.")
     if args.scrub_count_file and args.scrub_count_list:
         sys.stderr.write("error: can provide only one of either scrub_count_file or scrub_count_list.")
-    
+
+    # keeping equally rare kmers as the rarest 1%
     if args.keep_equal_rare:
         df_scrub = pd.read_csv(args.scrub_count_file, sep = '\t')
         df_perc = get_lowest_percentile(df_scrub, percentile = args.min_fraction, drug_scrub= 'count_hard')
         all_kmers = len(df_scrub)                                    
         strain_hash_scrubbed = dict.fromkeys(df_perc['#kmer'])      
+    
+    
     else:
         scrub_count_files = []
         if args.scrub_count_file:

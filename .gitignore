@@ -19,7 +19,7 @@ example_workflows/config_strainer3_test_minerva.yaml
 /src/kmer_metagenome_db
 /src/kmer_strain_detect
 /src/kmer_strain_detect_genome
-
+/src/kmdb2fasta
 # python / dev
 /scripts/dev/
 **/__pycache__/

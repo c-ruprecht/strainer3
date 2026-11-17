@@ -5,8 +5,8 @@ LDLIBS    = -lz -lm -lpthread
 # ---------------------------------------------------------------------------
 # libzstd detection
 #
-# Only kmer_scrub_count and kmer_metagenome_db actually need zstd
-# (they write .kmdb / compressed presence indexes), kmer_strain_detect uses it
+# kmer_scrub_count, kmer_metagenome_db, kmdb_dump and kmdb2fasta need zstd
+# (they read or write .kmdb files through kmdb.c), kmer_strain_detect uses it
 # only to read .kmdb targets, and genome_compare_presence uses it only when
 # you ask for a .zst output. The old Makefile put -lzstd in the global
 # LDFLAGS, so a machine without libzstd failed to link *every* target with
@@ -36,9 +36,12 @@ else
   ZSTD_LIBS   := -lzstd
 endif
 
+# tools that cannot be built without zstd (all link kmdb.o)
+KMDB_TOOLS = kmer_scrub_count kmer_metagenome_db kmdb_dump kmdb2fasta
+
 ifeq ($(HAVE_ZSTD),1)
   ZSTD_DEF     := -DHAVE_ZSTD $(ZSTD_CFLAGS)
-  ZSTD_TARGETS := kmer_scrub_count kmer_metagenome_db
+  ZSTD_TARGETS := $(KMDB_TOOLS)
   KMDB_OBJ     := kmdb.o
 else
   ZSTD_DEF     :=
@@ -50,18 +53,17 @@ endif
 shared_obj = BIO_sequence.o BIO_hash.o genome_compare.o up2bit.o
 
 BASE_TARGETS = genome_compare genome_compare_presence \
-               kmer_strain_detect kmer_strain_detect_genome kmdb_dump
+               kmer_strain_detect kmer_strain_detect_genome
 
 all: $(BASE_TARGETS) $(ZSTD_TARGETS) zstd-note
 
 zstd-note:
 ifneq ($(HAVE_ZSTD),1)
 	@echo ""
-	@echo "  NOTE: libzstd was not found, so kmer_scrub_count and"
-	@echo "        kmer_metagenome_db were NOT built, kmer_strain_detect was built"
-	@echo "        without .kmdb target support, and genome_compare_presence was"
-	@echo "        built without .zst output (-z falls back to .gz). Everything"
-	@echo "        else is fine."
+	@echo "  NOTE: libzstd was not found, so $(KMDB_TOOLS)"
+	@echo "        were NOT built, kmer_strain_detect was built without .kmdb"
+	@echo "        target support, and genome_compare_presence was built without"
+	@echo "        .zst output (-z falls back to .gz). Everything else is fine."
 	@echo "        To get zstd back, install it and rebuild:"
 	@echo "          conda install -c conda-forge zstd zstd-static"
 	@echo "          make clean && make ZSTD_HOME=\$$CONDA_PREFIX"
@@ -88,6 +90,9 @@ kmer_metagenome_db: kmer_metagenome_db.o kmdb.o
 kmdb_dump: kmdb_dump.o kmdb.o
 	$(CC) -o $@ $^ $(ZSTD_LIBS)
 
+kmdb2fasta: kmdb2fasta.o kmdb.o
+	$(CC) -o $@ $^ $(LDLIBS) $(ZSTD_LIBS)
+
 # kmdb.o / -lzstd only when zstd was found; without them the .kmdb code is
 # compiled out (#ifdef HAVE_ZSTD) and .kmdb targets are rejected at run time
 kmer_strain_detect: kmer_strain_detect.o $(shared_obj) $(KMDB_OBJ)
@@ -96,6 +101,10 @@ kmer_strain_detect: kmer_strain_detect.o $(shared_obj) $(KMDB_OBJ)
 kmer_strain_detect_genome: kmer_strain_detect_genome.o $(shared_obj)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# rebuild the kmdb users when the format header changes
+kmdb.o kmer_scrub_count.o kmer_metagenome_db.o kmdb_dump.o kmdb2fasta.o \
+kmer_strain_detect.o: kmdb.h
+
 # quick end-to-end check on the toy genomes (poly-A / poly-T / half-and-half)
 .PHONY: test
 test: genome_compare_presence
@@ -103,7 +112,7 @@ test: genome_compare_presence
 
 .PHONY: clean
 clean:
-	$(RM) *.o $(BASE_TARGETS) kmer_scrub_count kmer_metagenome_db
+	$(RM) *.o $(BASE_TARGETS) $(KMDB_TOOLS)
 	$(RM) -r test/out
 
 .PHONY: all zstd-note

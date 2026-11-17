@@ -56,7 +56,7 @@
 	  The metadata key total_evaluated equals kmer_strain_detect's
 	  total_evaluated for the same reads and the same pair-dedup setting.
 
-	  Pair dedup (--pair-dedup, default ON in sample mode)
+	  Pair dedup (--pair-dedup, default ON in sample mode, OFF in scrub mode)
 	  Mates are given as one comma-separated value, -i R1.fq.gz,R2.fq.gz
 	  (repeat -i for more lanes of the same sample), or as one interleaved
 	  file with --interleaved. Within one fragment (a read pair) every
@@ -70,6 +70,10 @@
 	  "1:N:0:..." comment). A mismatch is an error.
 	  --no-pair-dedup restores the old counts: every file is then read as
 	  single-end, in the given order, as before.
+	  In scrub mode counts are only used for -c, so --pair-dedup there
+	  makes -c mean "seen in >= c fragments": overlapping mates and repeats
+	  inside a pair no longer let one fragment pass -c 2 on its own.
+	  Off by default in scrub mode, so existing builds are reproduced.
 	  Implementation: each worker keeps a small per-thread set of the k-mers
 	  of its own partition seen in the current fragment (generation-stamped,
 	  so it is never cleared). The hash tables are unchanged, so -R/-M
@@ -1449,6 +1453,9 @@ static void usage(int status)
 "        -a > 0 adds ~8 bytes per hit k-mer per thread for the genome\n"
 "        being streamed.\n"
 	"  -c 1 keeps every k-mer seen at least once.\n"
+	"  --pair-dedup (off by default in scrub mode): count each k-mer at most\n"
+	"        once per read pair, so -c counts fragments, not reads. Mates must\n"
+	"        be given as -i R1.fq.gz,R2.fq.gz (or --interleaved).\n"
 	"  Memory: ~13-26 bytes per distinct k-mer in the reads (all k-mers,\n"
 	"  including errors, before -c), briefly up to ~39 while a table grows,\n"
 	"  plus ~70 MB of read buffers.\n"
@@ -1572,13 +1579,8 @@ int main(int argc, char *argv[])
 	}
 	if (n_inputs == 0) usage(1);
 
-	/* pair dedup: sample-mode only, on by default there */
-	if (mode == MODE_SCRUB && pair_dedup == 1) {
-		fprintf(stderr, "error: --pair-dedup is only for -m sample: a scrub "
-		        "database stores presence, not counts, so there is nothing to "
-		        "deduplicate. Drop --pair-dedup or use -m sample.\n");
-		return 1;
-	}
+	/* pair dedup: default ON in sample mode, OFF in scrub mode (where it
+	   only matters for -c: with it, -c counts fragments, not reads) */
 	if (pair_dedup < 0) pair_dedup = mode == MODE_SAMPLE;
 	int n_pe = 0, n_pei = 0, n_se = 0;
 	for (int i = 0; i < n_inputs; i++) {
@@ -1780,14 +1782,15 @@ int main(int argc, char *argv[])
 		        "min count %u, %u threads, %d read file(s)",
 		        name, C.k, C.min_count, C.P, n_reads);
 	fprintf(stderr, lowmem ? ", low-memory: %u pass(es)\n" : "\n", C.M);
-	if (mode == MODE_SAMPLE) {
+	{
 		if (pair_dedup)
 			fprintf(stderr, "pair dedup: ON (each k-mer counted at most once per "
 			        "read pair): %d PE pair input(s), %d interleaved, %d single-end\n",
 			        n_pe, n_pei, n_se);
 		else
-			fprintf(stderr, "pair dedup: OFF (--no-pair-dedup): every file counted "
-			        "as single-end, as before\n");
+			fprintf(stderr, "pair dedup: OFF%s: every file counted as single-end\n",
+			        mode == MODE_SCRUB ? " (scrub default; --pair-dedup to enable)"
+			                           : " (--no-pair-dedup)");
 		if (pair_dedup && n_pe + n_pei == 0 && n_se >= 2)
 			fprintf(stderr, "WARNING: pair dedup is on but no read pairs were given: "
 			        "%d files are read as single-end, so nothing is deduplicated. "
@@ -1996,6 +1999,8 @@ int main(int argc, char *argv[])
 	kmdb_writer_meta_u64(w, "n_genomes", (uint64_t)C.n_genomes);
 	if (mode == MODE_SCRUB)
 		kmdb_writer_meta_u64(w, "max_genome_count", C.max_gcount);
+	if (mode == MODE_SCRUB)
+		kmdb_writer_meta_u64(w, "pair_dedup", (uint64_t)pair_dedup);
 	kmdb_writer_meta_u64(w, "n_reads", st_reads);
 	kmdb_writer_meta_u64(w, "kmer_positions", st_positions);
 	kmdb_writer_meta_u64(w, "valid_kmer_positions", st_valid);

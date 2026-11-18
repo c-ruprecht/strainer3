@@ -335,14 +335,12 @@ static void usage(int status)
 
 static unsigned long count_seeded_kmers(BIO_hash seqHash)
 {
+	/* walk the slots directly (same keys as BIO_getHashKeys + lookup) */
 	unsigned long n = 0;
-	int hash_size = BIO_getHashSize(seqHash);
-	char **allKeys = BIO_getHashKeys(seqHash);
-	for (unsigned int i = 0; i < (unsigned int)hash_size; i++) {
-		unsigned int *counts = (unsigned int *)BIO_searchHash(seqHash, allKeys[i]);
+	for (unsigned int i = 0; i < seqHash->M; i++) {
+		unsigned int *counts = (unsigned int *)seqHash->data[i].DATA;
 		if (counts && counts[0] > 0) n++;
 	}
-	BIO_destroyHashKeys(allKeys);
 	return n;
 }
 
@@ -361,42 +359,45 @@ static void write_global_counts(BIO_hash seqHash, const char *path,
 		: "#kmer\treference_count\tpangenome_count\tmetagenome_count\n";
 	zstd_out_write(z, header, strlen(header));
 
-	char **allKeys = BIO_getHashKeys(seqHash);
-	int hash_size = BIO_getHashSize(seqHash);
-
-	size_t row_cap = 4096;
+	/* Rows in hash-slot order (the order BIO_getHashKeys() returns), formatted
+	   as "%s\t%u\t%u\t%u[\t%u]\n" into a large buffer handed to zstd when
+	   full: the same byte stream as one zstd_out_write() per row. */
+	size_t row_cap = 4u << 20, len = 0;
 	char  *rowbuf  = malloc(row_cap);
 	if (!rowbuf) { perror("malloc rowbuf"); exit(EXIT_FAILURE); }
+	const int ncol = with_drug_col ? 4 : 3;
 
 	uint64_t emitted = 0;
-	for (unsigned int i = 0; i < (unsigned int)hash_size; i++) {
-		unsigned int *counts =
-			(unsigned int *)BIO_searchHash(seqHash, allKeys[i]);
+	for (unsigned int i = 0; i < seqHash->M; i++) {
+		unsigned int *counts = (unsigned int *)seqHash->data[i].DATA;
 		if (!counts) continue;
-
-		size_t need = strlen(allKeys[i]) + 4 * 12 + 8;
-		if (need > row_cap) {
-			while (row_cap < need) row_cap *= 2;
-			char *nbuf = realloc(rowbuf, row_cap);
-			if (!nbuf) { perror("realloc rowbuf"); exit(EXIT_FAILURE); }
-			rowbuf = nbuf;
+		const char *key = seqHash->data[i].key;
+		size_t klen = strlen(key);
+		size_t need = klen + 4 * 12 + 8;
+		if (len + need > row_cap) {
+			if (len) { zstd_out_write(z, rowbuf, len); len = 0; }
+			if (need > row_cap) {
+				while (row_cap < need) row_cap *= 2;
+				char *nbuf = realloc(rowbuf, row_cap);
+				if (!nbuf) { perror("realloc rowbuf"); exit(EXIT_FAILURE); }
+				rowbuf = nbuf;
+			}
 		}
-
-		int n;
-		if (with_drug_col)
-			n = snprintf(rowbuf, row_cap, "%s\t%u\t%u\t%u\t%u\n",
-			             allKeys[i], counts[0], counts[1], counts[2],
-			             counts[3]);
-		else
-			n = snprintf(rowbuf, row_cap, "%s\t%u\t%u\t%u\n",
-			             allKeys[i], counts[0], counts[1], counts[2]);
-
-		zstd_out_write(z, rowbuf, (size_t)n);
+		char *o = rowbuf + len;
+		memcpy(o, key, klen); o += klen;
+		for (int c = 0; c < ncol; c++) {
+			*o++ = '\t';
+			char tmp[10]; int nd = 0; unsigned int v = counts[c];
+			do { tmp[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+			while (nd) *o++ = tmp[--nd];
+		}
+		*o++ = '\n';
+		len = (size_t)(o - rowbuf);
 		emitted++;
 	}
+	if (len) zstd_out_write(z, rowbuf, len);
 
 	free(rowbuf);
-	BIO_destroyHashKeys(allKeys);
 	if (zstd_out_close(z) != 0)
 		fprintf(stderr, "write_global_counts: error closing %s\n", path);
 

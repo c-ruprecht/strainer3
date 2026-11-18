@@ -40,7 +40,7 @@ rule kmer_scrub:
         STRAINDIR + '/{strain}/scrub/{strain}.global_counts.tsv.zst'
     params:
         outdir = lambda wc: f"{STRAINDIR}/{wc.strain}/scrub"
-    threads: 4
+    threads: 5
     shell:
         '''
         ../src/kmer_scrub_count \
@@ -82,7 +82,7 @@ rule target_kmdb:
         OUTPUTDIR + '/target_samples_kmdb/{sample}.kmdb'
     params:
         outdir = OUTPUTDIR + '/target_samples_kmdb'
-    threads: 4
+    threads: 2
     shell:
         '''
         ../src/kmer_metagenome_db -m sample \

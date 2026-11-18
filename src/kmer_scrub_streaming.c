@@ -414,9 +414,9 @@ void presence_writer_flush(presence_writer *w, BIO_hash h)
 	const char *header = "#kmer\tlist_scrub_id\n";
 	zstd_out_write(z, header, strlen(header));
 
-	/* Buffer for one row. Worst case: kmer string + tab + N_max ids x 11
-	   bytes (uint32) + commas + \n. We grow on demand. */
-	size_t row_cap = 256 * 1024;
+	/* Rows are formatted (same text as "%s\t%u,%u...\n") into one large
+	   buffer that is handed to zstd when full: same byte stream, fewer calls. */
+	size_t row_cap = 4u << 20, len = 0;
 	char  *rowbuf  = malloc(row_cap);
 	if (!rowbuf) { perror("malloc rowbuf"); exit(EXIT_FAILURE); }
 
@@ -427,23 +427,31 @@ void presence_writer_flush(presence_writer *w, BIO_hash h)
 		const char *key = h->data[i].key;
 		if (!key) continue;
 
-		size_t need = strlen(key) + 2 + (size_t)l->size * 12 + 2;
-		if (need > row_cap) {
-			while (row_cap < need) row_cap *= 2;
-			char *nbuf = realloc(rowbuf, row_cap);
-			if (!nbuf) { perror("realloc rowbuf"); exit(EXIT_FAILURE); }
-			rowbuf = nbuf;
+		size_t klen = strlen(key);
+		size_t need = klen + 2 + (size_t)l->size * 12 + 2;
+		if (len + need > row_cap) {
+			if (len) { zstd_out_write(z, rowbuf, len); len = 0; }
+			if (need > row_cap) {
+				while (row_cap < need) row_cap *= 2;
+				char *nbuf = realloc(rowbuf, row_cap);
+				if (!nbuf) { perror("realloc rowbuf"); exit(EXIT_FAILURE); }
+				rowbuf = nbuf;
+			}
 		}
-
-		int n = snprintf(rowbuf, row_cap, "%s\t", key);
+		char *o = rowbuf + len;
+		memcpy(o, key, klen); o += klen;
+		*o++ = '\t';
 		for (uint32_t j = 0; j < l->size; j++) {
-			n += snprintf(rowbuf + n, row_cap - (size_t)n,
-			              j == 0 ? "%u" : ",%u", l->ids[j]);
+			if (j) *o++ = ',';
+			char tmp[10]; int nd = 0; uint32_t v = l->ids[j];
+			do { tmp[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+			while (nd) *o++ = tmp[--nd];
 		}
-		rowbuf[n++] = '\n';
-		zstd_out_write(z, rowbuf, (size_t)n);
+		*o++ = '\n';
+		len = (size_t)(o - rowbuf);
 		emitted++;
 	}
+	if (len) zstd_out_write(z, rowbuf, len);
 
 	free(rowbuf);
 	zstd_out_close(z);
@@ -684,9 +692,19 @@ extern char *orient_string(char *seed_seq, char *seedStrRevComp, int seed);
 #define REF_INDEX_EMPTY UINT64_MAX
 
 typedef struct {
-	uint64_t *keys;     /* canonical 2-bit k-mer, REF_INDEX_EMPTY = free slot */
-	uint32_t *bucket;   /* BIO_hash bucket of that k-mer */
+	uint64_t key;       /* canonical 2-bit k-mer */
+	uint32_t row1;      /* row (index into the sorted ref_kmers) + 1; 0 = free */
+} ri_slot;
+
+typedef struct {
+	ri_slot  *slots;    /* key and row in one 16-byte slot: one cache line per probe */
 	size_t    mask;
+	uint64_t *bits;     /* prefilter: a clear bit proves the k-mer is absent */
+	int       bshift;
+	uint32_t *row_bucket;         /* row -> BIO_hash bucket */
+	uint8_t  *row_ref;            /* row -> counts[0] > 0 (reference column: fixed) */
+	uint32_t *gacc;               /* row -> pending global count (current list), atomic adds */
+	size_t    n_rows;
 	int       has_iupac;   /* reference has k-mers with non-ACGT bases */
 } ref_index_t;
 
@@ -728,12 +746,48 @@ static void scan_class_init(void)
 	__atomic_store_n(&done, 1, __ATOMIC_RELEASE);
 }
 
+#define RI_BATCH 32
+
+static inline int ri_probe(const ref_index_t *ix, uint64_t key, uint64_t *hv_out)
+{
+	uint64_t hv = ri_mix64(key), b = hv >> ix->bshift;
+	if (!(ix->bits[b >> 6] & (1ull << (b & 63)))) return 0;
+	__builtin_prefetch(&ix->slots[hv & ix->mask]);
+	*hv_out = hv;
+	return 1;
+}
+
+/* row + 1, or 0 */
+static inline uint32_t ri_resolve(const ref_index_t *ix, uint64_t key, uint64_t hv)
+{
+	size_t i = hv & ix->mask;
+	for (;;) {
+		const ri_slot *sl = &ix->slots[i];
+		if (!sl->row1) return 0;
+		if (sl->key == key) return sl->row1;
+		i = (i + 1) & ix->mask;
+	}
+}
+
+/* Per-worker private scratch: counts by row plus the rows in first-hit order.
+   Only the owning worker thread ever touches it. */
+typedef struct {
+	uint32_t *cnt;       /* n_rows */
+	touched_t rows;
+} scratch_t;
+
+static inline void scr_hit(scratch_t *sc, uint32_t row)
+{
+	if (sc->cnt[row]++ == 0) touched_push(&sc->rows, row);
+}
+
 /* Returns 0 on success, 1 if a window was matched via the string path (the
-   caller must then use the sweeps for this sample), -1 if the file could
-   not be opened (as before: warning, sample counted with no hits). */
+   caller must then use the sweeps for this sample; the private counts have
+   been folded into the scratch column), -1 if the file could not be opened
+   (as before: warning, sample counted with no hits). */
 static int calculate_kmer_count_scratch_fast(const char *file, const int seed,
                                              BIO_hash h, unsigned int scratch_col,
-                                             const ref_index_t *ix, touched_t *t)
+                                             const ref_index_t *ix, scratch_t *sc)
 {
 	gzFile fp = gzopen(file, "r");
 	if (fp == NULL) {
@@ -749,6 +803,7 @@ static int calculate_kmer_count_scratch_fast(const char *file, const int seed,
 	const uint64_t kmask = (seed == 32) ? UINT64_MAX : ((1ull << (2 * seed)) - 1);
 	char *win = malloc(seed + 1), *winrc = malloc(seed + 1);
 	int used_string_path = 0;
+	uint64_t pk[RI_BATCH], ph[RI_BATCH];
 
 	while (kseq_read(seq) >= 0) {
 		const size_t L = seq->seq.l;
@@ -756,6 +811,7 @@ static int calculate_kmer_count_scratch_fast(const char *file, const int seed,
 		const char *s = seq->seq.s;
 		uint64_t fwd = 0, rev = 0;
 		long last_n = -1, last_other = -1;   /* last position of each class */
+		int np = 0;
 		for (size_t pos = 0; pos < L; pos++) {
 			uint8_t c = SCAN_CLASS[(unsigned char)s[pos]];
 			if (c < 4) {
@@ -783,39 +839,54 @@ static int calculate_kmer_count_scratch_fast(const char *file, const int seed,
 			}
 
 			uint64_t can = fwd > rev ? fwd : rev;
-			size_t i = ri_mix64(can) & ix->mask;
-			uint64_t key;
-			while ((key = ix->keys[i]) != REF_INDEX_EMPTY) {
-				if (key == can) {
-					uint32_t b = ix->bucket[i];
-					unsigned int *counts = (unsigned int *)h->data[b].DATA;
-					if (counts[scratch_col]++ == 0) touched_push(t, b);
-					break;
+			if (ri_probe(ix, can, &ph[np])) {
+				pk[np++] = can;
+				if (np == RI_BATCH) {        /* slots were prefetched meanwhile */
+					for (int q = 0; q < np; q++) {
+						uint32_t r1 = ri_resolve(ix, pk[q], ph[q]);
+						if (r1) scr_hit(sc, r1 - 1);
+					}
+					np = 0;
 				}
-				i = (i + 1) & ix->mask;
 			}
+		}
+		for (int q = 0; q < np; q++) {
+			uint32_t r1 = ri_resolve(ix, pk[q], ph[q]);
+			if (r1) scr_hit(sc, r1 - 1);
 		}
 	}
 	free(win); free(winrc);
 	kseq_destroy(seq);
 	gzclose(fp);
+
+	if (used_string_path) {
+		/* the sweeps read the scratch column: move the private counts there
+		   (the column is owned by this worker, so a plain add is safe) */
+		for (size_t q = 0; q < sc->rows.n; q++) {
+			uint32_t r = sc->rows.b[q];
+			unsigned int *counts = (unsigned int *)h->data[ix->row_bucket[r]].DATA;
+			counts[scratch_col] += sc->cnt[r];
+			sc->cnt[r] = 0;
+		}
+		sc->rows.n = 0;
+	}
 	return used_string_path;
 }
 
-/* Bookkeeping over the touched buckets only. Same results as
+/* Bookkeeping over the touched rows only. Same results as
    count_unique_in_column() + collect_zero_and_maybe_merge(). */
-static unsigned long count_unique_touched(BIO_hash h, const touched_t *t)
+static unsigned long count_unique_touched(BIO_hash h, const ref_index_t *ix,
+                                          const scratch_t *sc)
 {
+	(void)h;
 	unsigned long n = 0;
-	for (size_t q = 0; q < t->n; q++) {
-		unsigned int *counts = (unsigned int *)h->data[t->b[q]].DATA;
-		if (counts[0] > 0) n++;
-	}
+	for (size_t q = 0; q < sc->rows.n; q++)
+		n += ix->row_ref[sc->rows.b[q]];
 	return n;
 }
 
-static uint32_t *collect_zero_and_maybe_merge_touched(BIO_hash h, const touched_t *t,
-                                                      unsigned int scratch_col,
+static uint32_t *collect_zero_and_maybe_merge_touched(BIO_hash h, const ref_index_t *ix,
+                                                      scratch_t *sc,
                                                       unsigned int global_col,
                                                       int merge_into_global,
                                                       unsigned long n_collect)
@@ -825,17 +896,18 @@ static uint32_t *collect_zero_and_maybe_merge_touched(BIO_hash h, const touched_
 		out = malloc((size_t)n_collect * sizeof(uint32_t));
 		if (!out) { perror("malloc kmer indices"); exit(EXIT_FAILURE); }
 	}
+	(void)h; (void)global_col;
 	uint32_t k = 0;
-	for (size_t q = 0; q < t->n; q++) {
-		uint32_t b = t->b[q];
-		unsigned int *counts = (unsigned int *)h->data[b].DATA;
-		unsigned int c = counts[scratch_col];
+	for (size_t q = 0; q < sc->rows.n; q++) {
+		uint32_t r = sc->rows.b[q];
+		unsigned int c = sc->cnt[r];
 		if (c == 0) continue;
-		if (counts[0] > 0 && k < (uint32_t)n_collect) out[k++] = b;
-		if (merge_into_global)
-			__sync_fetch_and_add(&counts[global_col], c);   /* shared column */
-		counts[scratch_col] = 0;
+		if (ix->row_ref[r] && k < (uint32_t)n_collect) out[k++] = ix->row_bucket[r];
+		if (merge_into_global)   /* shared accumulator, folded into global_col per list */
+			__sync_fetch_and_add(&ix->gacc[r], c);
+		sc->cnt[r] = 0;
 	}
+	sc->rows.n = 0;
 	return out;
 }
 
@@ -896,25 +968,71 @@ static ref_index_t *build_ref_index(const ref_kmer_t *ref, size_t n,
 	ref_index_t *ix = calloc(1, sizeof(*ix));
 	size_t cap = 1024;
 	while (cap < n * 2) cap <<= 1;               /* load <= 0.5 */
-	ix->keys   = malloc(cap * sizeof(uint64_t));
-	ix->bucket = malloc(cap * sizeof(uint32_t));
-	if (!ix || !ix->keys || !ix->bucket) { perror("malloc ref index"); exit(EXIT_FAILURE); }
-	memset(ix->keys, 0xFF, cap * sizeof(uint64_t));
+	int lb = 16;
+	while (lb < 24 && ((size_t)1 << lb) < 16 * n) lb++;   /* <= 2 MB filter */
+	uint32_t *rb = malloc((n ? n : 1) * sizeof(uint32_t));
+	if (!ix) { perror("malloc ref index"); exit(EXIT_FAILURE); }
+	ix->slots = calloc(cap, sizeof(ri_slot));
+	ix->bits  = calloc(((size_t)1 << lb) / 64, sizeof(uint64_t));
+	if (!ix->slots || !ix->bits || !rb) { perror("malloc ref index"); exit(EXIT_FAILURE); }
 	ix->mask = cap - 1;
+	ix->bshift = 64 - lb;
 	ix->has_iupac = n_skipped > 0;
+	ix->n_rows = n;
 	for (size_t j = 0; j < n; j++) {
-		size_t i = ri_mix64(ref[j].kmer) & ix->mask;
-		while (ix->keys[i] != REF_INDEX_EMPTY) i = (i + 1) & ix->mask;
-		ix->keys[i]   = ref[j].kmer;
-		ix->bucket[i] = ref[j].bucket;
+		uint64_t hv = ri_mix64(ref[j].kmer), bb = hv >> ix->bshift;
+		ix->bits[bb >> 6] |= 1ull << (bb & 63);
+		size_t i = hv & ix->mask;
+		while (ix->slots[i].row1) i = (i + 1) & ix->mask;   /* keys are unique */
+		ix->slots[i].key  = ref[j].kmer;
+		ix->slots[i].row1 = (uint32_t)j + 1;
+		rb[j] = ref[j].bucket;
 	}
+	ix->row_bucket = rb;
 	return ix;
 }
 
 static void free_ref_index(ref_index_t *ix)
 {
 	if (!ix) return;
-	free(ix->keys); free(ix->bucket); free(ix);
+	free(ix->slots); free(ix->bits); free(ix->row_bucket);
+	free(ix->row_ref); free(ix->gacc); free(ix);
+}
+
+/* The reference hash keys do not change between the -A/-B/-C calls, so the
+   sorted k-mer array and the index are built once and reused. */
+static struct {
+	BIO_hash     h;
+	unsigned int M, N;
+	ref_kmer_t  *ref;
+	size_t       n_ref, skipped;
+	ref_index_t *ix;
+} g_ref_cache;
+
+static void ref_cache_free(void)
+{
+	free(g_ref_cache.ref);
+	free_ref_index(g_ref_cache.ix);
+	memset(&g_ref_cache, 0, sizeof g_ref_cache);
+}
+
+static void ref_cache_get(BIO_hash h, int seed)
+{
+	if (g_ref_cache.ref && g_ref_cache.h == h && g_ref_cache.M == h->M && g_ref_cache.N == h->N)
+		return;
+	if (g_ref_cache.ref) ref_cache_free();
+	else atexit(ref_cache_free);
+	g_ref_cache.ref = build_ref_kmers(h, seed, &g_ref_cache.n_ref, &g_ref_cache.skipped);
+	g_ref_cache.ix  = build_ref_index(g_ref_cache.ref, g_ref_cache.n_ref, g_ref_cache.skipped);
+	ref_index_t *ix = g_ref_cache.ix;
+	ix->row_ref = malloc(ix->n_rows ? ix->n_rows : 1);
+	ix->gacc    = calloc(ix->n_rows ? ix->n_rows : 1, sizeof(uint32_t));
+	if (!ix->row_ref || !ix->gacc) { perror("malloc ref rows"); exit(EXIT_FAILURE); }
+	for (size_t r = 0; r < ix->n_rows; r++) {
+		unsigned int *counts = (unsigned int *)h->data[ix->row_bucket[r]].DATA;
+		ix->row_ref[r] = counts[0] > 0;     /* the reference column never changes */
+	}
+	g_ref_cache.h = h; g_ref_cache.M = h->M; g_ref_cache.N = h->N;
 }
 
 typedef struct {
@@ -1107,6 +1225,10 @@ static void *worker_main(void *arg)
 
 	int tid = __sync_fetch_and_add(&p->tid_counter, 1);
 	unsigned int scratch_col = (unsigned int)(GLOBAL_COLS + tid);
+	scratch_t sc;
+	memset(&sc, 0, sizeof sc);
+	sc.cnt = calloc(p->ref_index->n_rows ? p->ref_index->n_rows : 1, sizeof(uint32_t));
+	if (!sc.cnt) { perror("calloc scratch"); exit(EXIT_FAILURE); }
 
 	for (;;) {
 		pthread_mutex_lock(&p->jmtx);
@@ -1178,16 +1300,15 @@ static void *worker_main(void *arg)
 			}
 			kmdb_close(db);
 		}
-		touched_t touched = { NULL, 0, 0 };
 		int use_sweep = db != NULL;   /* .kmdb: helpers share the column, sweep */
 		if (!db) {
 			int rc = calculate_kmer_count_scratch_fast(path, p->seed, p->h, scratch_col,
-			                                           p->ref_index, &touched);
+			                                           p->ref_index, &sc);
 			if (rc == 1) use_sweep = 1;           /* string-path hits not in list */
 		}
 
 		unsigned long n_unique = use_sweep ? count_unique_in_column(p->h, scratch_col)
-		                                   : count_unique_touched(p->h, &touched);
+		                                   : count_unique_touched(p->h, p->ref_index, &sc);
 		double coverage = p->total_ref_kmers > 0
 		    ? (double)n_unique / (double)p->total_ref_kmers
 		    : 0.0;
@@ -1212,10 +1333,9 @@ static void *worker_main(void *arg)
 		uint32_t *idxs = use_sweep
 		    ? collect_zero_and_maybe_merge(p->h, scratch_col, p->global_col,
 		                                   is_in_global, n_collect)
-		    : collect_zero_and_maybe_merge_touched(p->h, &touched, scratch_col,
+		    : collect_zero_and_maybe_merge_touched(p->h, p->ref_index, &sc,
 		                                           p->global_col, is_in_global,
 		                                           n_collect);
-		free(touched.b);
 
 		if (p->writer) {
 			/* Hand off to writer; writer assigns scrub_id and writes summary. */
@@ -1249,6 +1369,8 @@ static void *worker_main(void *arg)
 		free(job->filepath);
 		free(job);
 	}
+	free(sc.cnt);
+	free(sc.rows.b);
 	return NULL;
 }
 
@@ -1325,10 +1447,12 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	p.progress        = progress;
 	p.n_jobs          = nlines;
 	{
-		size_t skipped = 0;
 		scan_class_init();
-		p.ref_kmers = build_ref_kmers(h, seed, &p.n_ref_kmers, &skipped);
-		p.ref_index = build_ref_index(p.ref_kmers, p.n_ref_kmers, skipped);
+		ref_cache_get(h, seed);
+		size_t skipped = g_ref_cache.skipped;
+		p.ref_kmers   = g_ref_cache.ref;
+		p.n_ref_kmers = g_ref_cache.n_ref;
+		p.ref_index   = g_ref_cache.ix;
 		fprintf(stderr, "%s: %zu reference k-mers indexed",
 		        sample_type, p.n_ref_kmers);
 		if (skipped)
@@ -1375,10 +1499,20 @@ void GEN_per_sample_kmer_counts_dual(const char *list_path,
 	for (int i = 0; i < num_threads; i++)
 		pthread_join(threads[i], NULL);
 
+	/* fold this list's global counts into its hash column (all workers joined) */
+	{
+		ref_index_t *ix = p.ref_index;
+		for (size_t r = 0; r < ix->n_rows; r++) {
+			if (!ix->gacc[r]) continue;
+			unsigned int *counts = (unsigned int *)h->data[ix->row_bucket[r]].DATA;
+			counts[global_col] += ix->gacc[r];
+			ix->gacc[r] = 0;
+		}
+	}
+
 	free(threads);
 	free(p.jobs);
-	free(p.ref_kmers);
-	free_ref_index(p.ref_index);
+	/* ref_kmers / ref_index belong to g_ref_cache */
 	pthread_mutex_destroy(&p.jmtx);
 	pthread_cond_destroy(&p.jhas_work);
 	pthread_mutex_destroy(&p.progress_mtx);

@@ -1,7 +1,14 @@
 /* genome_compare_presence -- serial inverted k-mer presence index over a set
  * of genomes, plus the pairwise k-mer identity matrix that falls out of it.
  *
- *   genome_compare_presence -A <list|dir> [-k 31] [-O dir] [-n name | -o prefix]
+ *   genome_compare_presence -A <list|dir> [-k 31] [-t threads] [-O dir] [-n name | -o prefix]
+ *
+ * THREADS (-t, default 4) never change the output: the default sorted mode
+ * builds the index in hash shards (one writer per shard, genomes inserted in
+ * strain_id order, so every id list is identical); -U keeps one table filled
+ * in the original order (readers parse ahead, one thread inserts), so even the
+ * hash order is the same. Sorting and the sweep run in parallel parts that
+ * are written in order; see test/speedup/run_tests_presence.sh.
  *
  * WHAT IT DOES
  * ------------
@@ -84,6 +91,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <zlib.h>
+#include <pthread.h>
 
 #ifdef HAVE_ZSTD
 #include <zstd.h>
@@ -616,13 +624,568 @@ static inline uint64_t and_popcount(const uint64_t *a, const uint64_t *b,
 	return n;
 }
 
-static int cmp_entry_ptr(const void *a, const void *b)
+
+/* ------------------------------------------------------- parallel helpers */
+
+typedef void (*par_fn)(void *ctx, int tid, int nth);
+typedef struct { par_fn fn; void *ctx; int tid, nth; } par_arg;
+
+static void *par_tramp(void *a)
 {
-	const kentry *x = *(const kentry *const *)a;
-	const kentry *y = *(const kentry *const *)b;
-	if (x->key < y->key) return -1;
-	if (x->key > y->key) return 1;
-	return 0;
+	par_arg *p = (par_arg *)a;
+	p->fn(p->ctx, p->tid, p->nth);
+	return NULL;
+}
+
+/* run fn(ctx, tid, nth) on nth threads (tid 0 on the caller) and join all */
+static void par_run(int nth, par_fn fn, void *ctx)
+{
+	if (nth <= 1) { fn(ctx, 0, 1); return; }
+	pthread_t *th = (pthread_t *)xmalloc(sizeof(pthread_t) * (size_t)nth);
+	par_arg   *pa = (par_arg *)xmalloc(sizeof(par_arg) * (size_t)nth);
+	for (int t = 0; t < nth; t++) { pa[t].fn = fn; pa[t].ctx = ctx; pa[t].tid = t; pa[t].nth = nth; }
+	for (int t = 1; t < nth; t++)
+		if (pthread_create(&th[t], NULL, par_tramp, &pa[t]) != 0) die("pthread_create failed", NULL);
+	fn(ctx, 0, nth);
+	for (int t = 1; t < nth; t++) pthread_join(th[t], NULL);
+	free(th); free(pa);
+}
+
+/* ------------------------------------------- pipelined genome k-mer reader
+ * Worker threads read, 2-bit encode and hash genomes ahead of the main
+ * thread (at most W genomes in flight). The main thread inserts them into the
+ * single global table strictly in strain_id order and in sequence position
+ * order -- the exact sequence of table_add() calls of the serial version, so
+ * the table (and with it every output, including -U hash order) is identical.
+ */
+
+typedef struct {
+	kmer_t   *key;
+	uint64_t *hv;            /* key_hash(key), computed by the reader */
+	size_t    n, cap;
+	gstat     gs;
+	uint32_t  id;
+	int       ready;
+} gbuf;
+
+typedef struct {
+	const pathvec  *files;
+	int             k, canonical;
+	uint32_t        N, W;
+	gbuf           *ring;
+	uint32_t        next, consumed;
+	pthread_mutex_t m;
+	pthread_cond_t  cv;
+} gprod;
+
+static void gbuf_push(gbuf *b, kmer_t key)
+{
+	if (b->n == b->cap) {
+		b->cap = b->cap ? b->cap * 2 : (1u << 20);
+		b->key = (kmer_t *)realloc(b->key, b->cap * sizeof *b->key);
+		b->hv  = (uint64_t *)realloc(b->hv, b->cap * sizeof *b->hv);
+		if (!b->key || !b->hv) die("out of memory", NULL);
+	}
+	b->key[b->n] = key;
+	b->hv[b->n]  = key_hash(key);
+	b->n++;
+}
+
+/* same parsing and statistics as scan_genome(); k-mers go to the buffer */
+static void read_genome(const char *path, int k, int canonical, gbuf *b)
+{
+	memset(&b->gs, 0, sizeof b->gs);
+	b->n = 0;
+	gzFile fp = gzopen(path, "r");
+	if (!fp) { fprintf(stderr, "warning: cannot open %s\n", path); return; }
+
+	kseq_t *seq = kseq_init(fp);
+	const kmer_t mask = (k == 64) ? (~(kmer_t)0)
+	                              : ((((kmer_t)1) << (2 * k)) - 1);
+	const unsigned shift = (unsigned)(2 * (k - 1));
+	int l;
+	gstat *gs = &b->gs;
+
+	while ((l = kseq_read(seq)) >= 0) {
+		gs->contigs++;
+		gs->bases += (uint64_t)seq->seq.l;
+		if ((size_t)l < (size_t)k) { gs->short_contigs++; continue; }
+
+		kmer_t fwd = 0, rc = 0;
+		int filled = 0;
+		const char *s = seq->seq.s;
+
+		for (size_t i = 0; i < seq->seq.l; i++) {
+			uint8_t code = BASE_CODE[(unsigned char)s[i]];
+			if (code > 3) { filled = 0; fwd = rc = 0; continue; }
+
+			fwd = ((fwd << 2) | (kmer_t)code) & mask;
+			rc  = (rc >> 2) | (((kmer_t)(3 - code)) << shift);
+
+			if (filled < k) filled++;
+			if (filled < k) continue;
+
+			gs->positions++;
+			kmer_t key = fwd;
+			if (canonical && rc > fwd) key = rc;
+			gbuf_push(b, key);
+		}
+	}
+	kseq_destroy(seq);
+	gzclose(fp);
+}
+
+static void reader_thread(void *ctx, int tid, int nth)
+{
+	gprod *g = (gprod *)ctx;
+	(void)nth;
+	if (tid == 0) return;                 /* tid 0 is the inserting main thread */
+	for (;;) {
+		pthread_mutex_lock(&g->m);
+		while (g->next < g->N && g->next >= g->consumed + g->W)
+			pthread_cond_wait(&g->cv, &g->m);
+		if (g->next >= g->N) { pthread_mutex_unlock(&g->m); break; }
+		uint32_t id = g->next++;
+		pthread_mutex_unlock(&g->m);
+
+		gbuf *b = &g->ring[id % g->W];    /* free: genome id - W was consumed */
+		read_genome(g->files->path[id], g->k, g->canonical, b);
+
+		pthread_mutex_lock(&g->m);
+		b->id = id; b->ready = 1;
+		pthread_cond_broadcast(&g->cv);
+		pthread_mutex_unlock(&g->m);
+	}
+}
+
+/* table_add() with the hash already computed */
+static inline int table_add_h(ktable *t, kmer_t key, uint64_t hv, uint32_t id)
+{
+	uint64_t i = hv & t->mask;
+
+	while (t->slot[i].n != 0) {
+		if (t->slot[i].key == key) {
+			kentry *e = &t->slot[i];
+			uint32_t *ids = entry_ids(e);
+			if (ids[e->n - 1] == id) return 0;   /* lists are id-ordered */
+			if (e->n == e->cap) {
+				uint32_t ncap = e->cap * 2;
+				uint32_t *heap = (uint32_t *)xmalloc((size_t)ncap * sizeof *heap);
+				memcpy(heap, ids, (size_t)e->n * sizeof *heap);
+				if (e->cap != INLINE_IDS) free(e->ids.ptr);
+				e->ids.ptr = heap;
+				e->cap = ncap;
+				ids = heap;
+			}
+			ids[e->n++] = id;
+			return 1;
+		}
+		i = (i + 1) & t->mask;
+	}
+
+	t->slot[i].key = key;
+	t->slot[i].cap = INLINE_IDS;
+	t->slot[i].ids.inl[0] = id;
+	t->slot[i].n = 1;
+	if (++t->used > t->limit) table_grow(t);
+	return 1;
+}
+
+typedef struct {
+	gprod   *g;
+	ktable  *t;
+	gstat   *gs;
+} build_ctx;
+
+static void inserter(build_ctx *bc)
+{
+	gprod *g = bc->g;
+	ktable *t = bc->t;
+	const size_t D = 16;                  /* prefetch distance (k-mers) */
+	for (uint32_t i = 0; i < g->N; i++) {
+		gbuf *b = &g->ring[i % g->W];
+		pthread_mutex_lock(&g->m);
+		while (!(b->ready && b->id == i)) pthread_cond_wait(&g->cv, &g->m);
+		pthread_mutex_unlock(&g->m);
+
+		uint64_t distinct = 0;
+		for (size_t j = 0; j < b->n; j++) {
+			if (j + D < b->n) __builtin_prefetch(&t->slot[b->hv[j + D] & t->mask]);
+			distinct += (uint64_t)table_add_h(t, b->key[j], b->hv[j], i);
+		}
+		bc->gs[i] = b->gs;
+		bc->gs[i].distinct = distinct;
+
+		pthread_mutex_lock(&g->m);
+		b->ready = 0;
+		g->consumed = i + 1;
+		pthread_cond_broadcast(&g->cv);
+		pthread_mutex_unlock(&g->m);
+
+		if (g->N > 20 && (i + 1) % 50 == 0)
+			fprintf(stderr, "[presence]   %u/%u genomes, %" PRIu64
+			        " distinct k-mers so far\n", i + 1, g->N, t->used);
+	}
+}
+
+static void build_thread(void *ctx, int tid, int nth)
+{
+	build_ctx *bc = (build_ctx *)ctx;
+	if (tid == 0) inserter(bc);
+	else reader_thread(bc->g, tid, nth);
+}
+
+/* --------------------------------------------- sharded build (sorted mode)
+ * The table is split into NSHARD independent tables by the top hash bits.
+ * Genomes are read in batches (one per thread); then every thread inserts the
+ * whole batch, genome by genome in id order, into the shards it owns. Each
+ * k-mer therefore sees exactly the same sequence of table_add() calls as in
+ * the serial build (its strain list and the per-genome distinct counts are
+ * identical); only the table layout differs, which is invisible once the
+ * entries are sorted by k-mer. Threads never touch another thread's shard. */
+
+#define NSHARD 64
+#define SHARD_OF(hv) ((unsigned)((hv) >> 58))
+
+typedef struct {
+	const pathvec *files;
+	int            k, canonical;
+	ktable        *shard;
+	gbuf          *buf;        /* one per thread */
+	uint64_t     **dist;       /* [thread][genome] distinct k-mers */
+	gstat         *gs;
+	uint32_t       b0, nb;     /* current batch */
+} shard_ctx;
+
+static void shard_read(void *c, int tid, int nth)
+{
+	shard_ctx *s = (shard_ctx *)c;
+	(void)nth;
+	if ((uint32_t)tid >= s->nb) return;
+	read_genome(s->files->path[s->b0 + (uint32_t)tid], s->k, s->canonical, &s->buf[tid]);
+	s->gs[s->b0 + (uint32_t)tid] = s->buf[tid].gs;
+}
+
+static void shard_insert(void *c, int tid, int nth)
+{
+	shard_ctx *s = (shard_ctx *)c;
+	const size_t D = 16;
+	for (uint32_t g = 0; g < s->nb; g++) {
+		const gbuf *b = &s->buf[g];
+		const uint32_t id = s->b0 + g;
+		uint64_t d = 0;
+		for (size_t j = 0; j < b->n; j++) {
+			if (j + D < b->n) {
+				uint64_t h2 = b->hv[j + D];
+				if ((int)(SHARD_OF(h2) % (unsigned)nth) == tid) {
+					const ktable *t2 = &s->shard[SHARD_OF(h2)];
+					__builtin_prefetch(&t2->slot[h2 & t2->mask]);
+				}
+			}
+			uint64_t hv = b->hv[j];
+			unsigned sh = SHARD_OF(hv);
+			if ((int)(sh % (unsigned)nth) != tid) continue;
+			d += (uint64_t)table_add_h(&s->shard[sh], b->key[j], hv, id);
+		}
+		s->dist[tid][id] += d;
+	}
+}
+
+static void build_index_sharded(const pathvec *files, int k, int canonical, uint32_t N,
+                                ktable *shard, gstat *gs, int nth)
+{
+	shard_ctx s;
+	memset(&s, 0, sizeof s);
+	s.files = files; s.k = k; s.canonical = canonical; s.shard = shard; s.gs = gs;
+	s.buf  = (gbuf *)xcalloc((size_t)nth, sizeof(gbuf));
+	s.dist = (uint64_t **)xmalloc(sizeof(uint64_t *) * (size_t)nth);
+	for (int t = 0; t < nth; t++) s.dist[t] = (uint64_t *)xcalloc(N, sizeof(uint64_t));
+	for (uint32_t b0 = 0; b0 < N; b0 += (uint32_t)nth) {
+		s.b0 = b0;
+		s.nb = (N - b0 < (uint32_t)nth) ? N - b0 : (uint32_t)nth;
+		par_run(nth, shard_read, &s);
+		par_run(nth, shard_insert, &s);
+		if (N > 20) {
+			uint64_t used = 0;
+			for (int x = 0; x < NSHARD; x++) used += shard[x].used;
+			for (uint32_t i = b0; i < b0 + s.nb; i++)
+				if ((i + 1) % 50 == 0)
+					fprintf(stderr, "[presence]   %u/%u genomes, %" PRIu64
+					        " distinct k-mers so far\n", i + 1, N, used);
+		}
+	}
+	for (uint32_t i = 0; i < N; i++) {
+		uint64_t d = 0;
+		for (int t = 0; t < nth; t++) d += s.dist[t][i];
+		gs[i].distinct = d;
+	}
+	for (int t = 0; t < nth; t++) { free(s.dist[t]); free(s.buf[t].key); free(s.buf[t].hv); }
+	free(s.dist); free(s.buf);
+}
+
+/* build the index with `nth` threads (1 inserter + nth-1 readers) */
+static void build_index(const pathvec *files, int k, int canonical, uint32_t N,
+                        ktable *t, gstat *gs, int nth)
+{
+	if (nth < 2) {                         /* serial: original loop */
+		for (uint32_t i = 0; i < N; i++) {
+			scan_genome(files->path[i], k, canonical, i, t, &gs[i]);
+			if (N > 20 && (i + 1) % 50 == 0)
+				fprintf(stderr, "[presence]   %u/%u genomes, %" PRIu64
+				        " distinct k-mers so far\n", i + 1, N, t->used);
+		}
+		return;
+	}
+	gprod g;
+	memset(&g, 0, sizeof g);
+	g.files = files; g.k = k; g.canonical = canonical; g.N = N;
+	g.W = (uint32_t)(nth + 1);
+	g.ring = (gbuf *)xcalloc(g.W, sizeof *g.ring);
+	pthread_mutex_init(&g.m, NULL);
+	pthread_cond_init(&g.cv, NULL);
+	build_ctx bc = { &g, t, gs };
+	par_run(nth, build_thread, &bc);
+	for (uint32_t w = 0; w < g.W; w++) { free(g.ring[w].key); free(g.ring[w].hv); }
+	free(g.ring);
+	pthread_mutex_destroy(&g.m);
+	pthread_cond_destroy(&g.cv);
+}
+
+/* ------------------------------------------------------ sorted entry list
+ * The sweep walks `sk`: slot index + list length per entry, in output order
+ * (k-mer order, or table slot order with -U). With k <= 32 the k-mer is kept
+ * inline and sorted by a parallel bucket sort; k-mers are unique, so any
+ * correct sort gives the same order as the original qsort. */
+
+typedef struct { uint64_t key; kentry *e; } skent;
+
+static int cmp_skent(const void *a, const void *b)
+{
+	uint64_t x = ((const skent *)a)->key, y = ((const skent *)b)->key;
+	return (x > y) - (x < y);
+}
+
+/* k > 32: full 128-bit key, same order as cmp_entry_ptr */
+static int cmp_skent128(const void *a, const void *b)
+{
+	kmer_t x = ((const skent *)a)->e->key, y = ((const skent *)b)->e->key;
+	return (x > y) - (x < y);
+}
+
+typedef struct {
+	skent   *src, *dst;
+	size_t   n;
+	int      shift, nb;
+	size_t  *hist;          /* nth x nb */
+	size_t  *bstart;        /* nb + 1 */
+	int      next_bucket;   /* atomic */
+} sort_ctx;
+
+static void sort_hist(void *c, int tid, int nth)
+{
+	sort_ctx *s = (sort_ctx *)c;
+	size_t lo = s->n * (size_t)tid / (size_t)nth, hi = s->n * (size_t)(tid + 1) / (size_t)nth;
+	size_t *h = s->hist + (size_t)tid * (size_t)s->nb;
+	for (size_t i = lo; i < hi; i++) h[s->src[i].key >> s->shift]++;
+}
+
+static void sort_scatter(void *c, int tid, int nth)
+{
+	sort_ctx *s = (sort_ctx *)c;
+	size_t lo = s->n * (size_t)tid / (size_t)nth, hi = s->n * (size_t)(tid + 1) / (size_t)nth;
+	size_t *h = s->hist + (size_t)tid * (size_t)s->nb;     /* holds write offsets now */
+	for (size_t i = lo; i < hi; i++) s->dst[h[s->src[i].key >> s->shift]++] = s->src[i];
+}
+
+static void sort_buckets(void *c, int tid, int nth)
+{
+	sort_ctx *s = (sort_ctx *)c;
+	(void)tid; (void)nth;
+	for (;;) {
+		int b = __atomic_fetch_add(&s->next_bucket, 1, __ATOMIC_RELAXED);
+		if (b >= s->nb) break;
+		size_t lo = s->bstart[b], hi = s->bstart[b + 1];
+		if (hi - lo > 1) qsort(s->dst + lo, hi - lo, sizeof(skent), cmp_skent);
+	}
+}
+
+/* sorts sk[0..n) by key; returns the array holding the result */
+static skent *parallel_sort(skent *sk, size_t n, int bits, int nth)
+{
+	skent *tmp = (skent *)xmalloc(n * sizeof *tmp);
+	sort_ctx s;
+	memset(&s, 0, sizeof s);
+	s.src = sk; s.dst = tmp; s.n = n;
+	int bb = bits < 12 ? bits : 12;
+	s.nb = 1 << bb;
+	s.shift = bits - bb;
+	s.hist = (size_t *)xcalloc((size_t)nth * (size_t)s.nb, sizeof(size_t));
+	s.bstart = (size_t *)xcalloc((size_t)s.nb + 1, sizeof(size_t));
+	par_run(nth, sort_hist, &s);
+	size_t off = 0;
+	for (int b = 0; b < s.nb; b++) {
+		s.bstart[b] = off;
+		for (int t = 0; t < nth; t++) {
+			size_t c = s.hist[(size_t)t * (size_t)s.nb + (size_t)b];
+			s.hist[(size_t)t * (size_t)s.nb + (size_t)b] = off;
+			off += c;
+		}
+	}
+	s.bstart[s.nb] = off;
+	par_run(nth, sort_scatter, &s);
+	par_run(nth, sort_buckets, &s);
+	free(s.hist); free(s.bstart);
+	free(sk);
+	return tmp;
+}
+
+/* ------------------------------------------------------------ parallel sweep
+ * Rounds of entries are split into one contiguous part per thread. Each part
+ * formats its presence rows into its own buffer (written to the output in
+ * part order afterwards), counts its statistics and adds its direct-path
+ * intersections to a private N x N matrix (summed at the end). Dense entries
+ * get their global bitset column from a prefix count, and bits are set with
+ * an atomic OR, since two parts can touch the same 64-bit word. */
+
+typedef struct {
+	char  *buf;
+	size_t len, cap;
+} pbuf;
+
+static inline void pb_reserve(pbuf *b, size_t need)
+{
+	if (b->len + need > b->cap) {
+		b->cap = (b->len + need) * 2;
+		b->buf = (char *)realloc(b->buf, b->cap);
+		if (!b->buf) die("out of memory", NULL);
+	}
+}
+
+static inline void pb_u32(pbuf *b, uint32_t v)
+{
+	char tmp[12];
+	int i = 12;
+	do { tmp[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+	memcpy(b->buf + b->len, tmp + i, (size_t)(12 - i));
+	b->len += (size_t)(12 - i);
+}
+
+typedef struct {
+	skent     *sk;
+	size_t     lo, hi;               /* this round */
+	int        k;
+	uint32_t   N;
+	uint64_t   thresh, words;
+	uint64_t  *bits;
+	long       min_strains, max_strains;
+	uint64_t **inter_t;              /* per thread, N x N */
+	pbuf      *out;                  /* per thread */
+	uint64_t  *dcount, *dbase;       /* per thread */
+	uint64_t  *singletons, *core, *written;   /* per thread */
+} sweep_ctx;
+
+static inline void part_range(const sweep_ctx *s, int tid, int nth, size_t *lo, size_t *hi)
+{
+	size_t n = s->hi - s->lo;
+	*lo = s->lo + n * (size_t)tid / (size_t)nth;
+	*hi = s->lo + n * (size_t)(tid + 1) / (size_t)nth;
+}
+
+static void sweep_count_dense(void *c, int tid, int nth)
+{
+	sweep_ctx *s = (sweep_ctx *)c;
+	size_t lo, hi; part_range(s, tid, nth, &lo, &hi);
+	uint64_t d = 0;
+	for (size_t i = lo; i < hi; i++) if (s->sk[i].e->n > s->thresh) d++;
+	s->dcount[tid] = d;
+}
+
+static void sweep_part(void *c, int tid, int nth)
+{
+	sweep_ctx *s = (sweep_ctx *)c;
+	size_t lo, hi; part_range(s, tid, nth, &lo, &hi);
+	const uint32_t N = s->N;
+	uint64_t *inter = s->inter_t[tid];
+	uint64_t dense_col = s->dbase[tid];
+	pbuf *pb = &s->out[tid];
+	pb->len = 0;
+	char kbuf[MAX_K + 1];
+	/* thread-local counters: the per-thread result slots share cache lines,
+	   so they are written once at the end of the part */
+	uint64_t n_single = 0, n_core = 0, n_written = 0;
+
+	for (size_t i = lo; i < hi; i++) {
+		if (i + 8 < hi) __builtin_prefetch(s->sk[i + 8].e);
+		kentry *e = s->sk[i].e;
+		uint32_t *ids = entry_ids(e);
+
+		if (e->n == 1) n_single++;
+		if (e->n == N) n_core++;
+
+		if (e->n > s->thresh) {
+			uint64_t w = dense_col >> 6;
+			uint64_t b = 1ULL << (dense_col & 63);
+			for (uint32_t a = 0; a < e->n; a++)
+				__atomic_fetch_or(&s->bits[(size_t)ids[a] * s->words + w], b, __ATOMIC_RELAXED);
+			dense_col++;
+		} else {
+			for (uint32_t a = 0; a < e->n; a++)
+				for (uint32_t b = a + 1; b < e->n; b++)
+					inter[(size_t)ids[a] * N + ids[b]]++;
+		}
+
+		if ((long)e->n < s->min_strains) continue;
+		if (s->max_strains > 0 && (long)e->n > s->max_strains) continue;
+
+		pb_reserve(pb, (size_t)s->k + 2 + 11 + (size_t)e->n * 11 + 1);
+		kmer_to_string(e->key, s->k, kbuf);
+		memcpy(pb->buf + pb->len, kbuf, (size_t)s->k); pb->len += (size_t)s->k;
+		pb->buf[pb->len++] = '\t';
+		pb_u32(pb, e->n);
+		pb->buf[pb->len++] = '\t';
+		for (uint32_t a = 0; a < e->n; a++) {
+			if (a) pb->buf[pb->len++] = ',';
+			pb_u32(pb, ids[a]);
+		}
+		pb->buf[pb->len++] = '\n';
+		n_written++;
+	}
+	s->singletons[tid] += n_single;
+	s->core[tid]       += n_core;
+	s->written[tid]    += n_written;
+}
+
+typedef struct {
+	uint64_t *inter, *bits, words;
+	uint32_t  N;
+	int       next_row;       /* atomic */
+} pop_ctx;
+
+static void popcount_rows(void *c, int tid, int nth)
+{
+	pop_ctx *p = (pop_ctx *)c;
+	(void)tid; (void)nth;
+	for (;;) {
+		int i = __atomic_fetch_add(&p->next_row, 1, __ATOMIC_RELAXED);
+		if (i >= (int)p->N) break;
+		for (uint32_t j = (uint32_t)i + 1; j < p->N; j++)        /* cell (i,j): this thread only */
+			p->inter[(size_t)i * p->N + j] +=
+				and_popcount(p->bits + (size_t)i * p->words,
+				             p->bits + (size_t)j * p->words, p->words);
+	}
+}
+
+typedef struct { uint64_t *dst; uint64_t **src; int ns; size_t n; } sum_ctx;
+
+static void sum_matrices(void *c, int tid, int nth)
+{
+	sum_ctx *s = (sum_ctx *)c;
+	size_t lo = s->n * (size_t)tid / (size_t)nth, hi = s->n * (size_t)(tid + 1) / (size_t)nth;
+	for (size_t x = lo; x < hi; x++) {
+		uint64_t v = 0;
+		for (int t = 0; t < s->ns; t++) v += s->src[t][x];
+		s->dst[x] += v;
+	}
 }
 
 /* ------------------------------------------------------------------- main */
@@ -653,6 +1216,7 @@ static void usage(int status)
 "  -x <int>    strain-count crossover between the direct and bitset paths for\n"
 "              the intersection sweep (default auto = N/8). Tuning only; both\n"
 "              paths give identical numbers. -x 0 forces all-bitset.\n"
+"  -t <int>    threads (default 4). Output is identical for any value.\n"
 "  -h          this message.\n"
 "  (renamed: -B -> -A, -M -> -P, -z now takes a level; -s = -k)\n"
 "\n"
@@ -680,9 +1244,10 @@ int main(int argc, char *argv[])
 	int k = DEFAULT_K;
 	int canonical = 1, compress = 0, sorted = 1;
 	long min_strains = 1, max_strains = 0, crossover = -1;
+	int nthreads = 4;
 	int c;
 
-	while ((c = getopt(argc, argv, "A:k:s:O:n:o:m:P:x:z:FUhBM")) != -1) {
+	while ((c = getopt(argc, argv, "A:k:s:O:n:o:m:P:x:z:t:FUhBM")) != -1) {
 		switch (c) {
 		case 'A': b_arg = optarg; break;
 		case 'k':
@@ -693,6 +1258,7 @@ int main(int argc, char *argv[])
 		case 'm': min_strains = atol(optarg); break;
 		case 'P': max_strains = atol(optarg); break;
 		case 'x': crossover = atol(optarg); break;
+		case 't': nthreads = atoi(optarg); break;
 		case 'z': {
 			long lvl = cli_parse_nonneg("genome_compare_presence", 'z', optarg);
 			compress = lvl > 0;
@@ -721,6 +1287,7 @@ int main(int argc, char *argv[])
 	if (k < 1 || k > MAX_K)
 		die("-k must be between 1 and 64", NULL);
 	if (min_strains < 1) min_strains = 1;
+	if (nthreads < 1) nthreads = 1;
 
 	init_codes();
 	double t0 = now_s();
@@ -734,17 +1301,19 @@ int main(int argc, char *argv[])
 	        N, k, canonical ? "canonical" : "forward-only");
 
 	/* ---- pass over the genomes: build the inverted index -------------- */
-	ktable table;
-	table_init(&table, INITIAL_TABLE_SLOTS);
+	/* sorted output (default): sharded parallel build; -U (hash order) or one
+	   thread: one table filled in the original order, so its layout is the same */
+	int ntab = (sorted && nthreads > 1) ? NSHARD : 1;
+	ktable *tabs = (ktable *)xcalloc((size_t)ntab, sizeof *tabs);
+	for (int x = 0; x < ntab; x++)
+		table_init(&tabs[x], ntab == 1 ? INITIAL_TABLE_SLOTS : INITIAL_TABLE_SLOTS / 16);
 	gstat *gs = (gstat *)xcalloc(N, sizeof *gs);
 
-	for (uint32_t i = 0; i < N; i++) {
-		scan_genome(files.path[i], k, canonical, i, &table, &gs[i]);
-		if (N > 20 && (i + 1) % 50 == 0)
-			fprintf(stderr, "[presence]   %u/%u genomes, %" PRIu64
-			        " distinct k-mers so far\n",
-			        i + 1, N, table.used);
-	}
+	if (ntab == 1) build_index(&files, k, canonical, N, &tabs[0], gs, nthreads);
+	else           build_index_sharded(&files, k, canonical, N, tabs, gs, nthreads);
+	ktable table;                       /* totals, for the log line */
+	memset(&table, 0, sizeof table);
+	for (int x = 0; x < ntab; x++) { table.used += tabs[x].used; table.cap += tabs[x].cap; }
 
 	double t1 = now_s();
 	fprintf(stderr, "[presence] index: %" PRIu64 " distinct %d-mers "
@@ -775,23 +1344,37 @@ int main(int argc, char *argv[])
 	fclose(mf);
 	fprintf(stderr, "[presence] wrote %s.manifest.tsv\n", prefix);
 
-	/* ---- collect entries (sorted by default for reproducible output) --- */
-	kentry **ent = (kentry **)xmalloc((size_t)table.used * sizeof *ent);
+	/* ---- presence file + intersections ------------------------------- */
+	uint64_t *inter = NULL;
+	uint64_t written = 0, singletons = 0, core = 0;
 	size_t nent = 0;
-	for (uint64_t i = 0; i < table.cap; i++)
-		if (table.slot[i].n != 0) ent[nent++] = &table.slot[i];
-	if (sorted) qsort(ent, nent, sizeof *ent, cmp_entry_ptr);
-
-	/* auto crossover: direct sweep costs L^2/2 increments, the bitset path
-	 * N^2/128 words -- equal at L = N/8. */
+	{
+	/* ---- entry list in output order (k-mer order, or slot order with -U) */
+	nent = (size_t)table.used;
+	skent *sk = (skent *)xmalloc((nent ? nent : 1) * sizeof *sk);
+	uint64_t n_dense = 0;
 	uint64_t thresh;
 	if (crossover >= 0)      thresh = (uint64_t)crossover;
 	else if (N < 64)         thresh = N;              /* never dense for tiny N */
 	else                     thresh = N / 8 < 16 ? 16 : N / 8;
-
-	uint64_t n_dense = 0;
-	for (size_t i = 0; i < nent; i++)
-		if (ent[i]->n > thresh) n_dense++;
+	{
+		size_t m = 0;
+		for (int x = 0; x < ntab; x++)
+			for (uint64_t i = 0; i < tabs[x].cap; i++)
+				if (tabs[x].slot[i].n != 0) {
+					sk[m].key = (uint64_t)tabs[x].slot[i].key;
+					sk[m].e   = &tabs[x].slot[i];
+					if (tabs[x].slot[i].n > thresh) n_dense++;
+					m++;
+				}
+	}
+	if (sorted) {
+		if (k <= 32) {
+			sk = parallel_sort(sk, nent, 2 * k, nthreads);
+		} else {                       /* 128-bit keys */
+			qsort(sk, nent, sizeof *sk, cmp_skent128);
+		}
+	}
 
 	uint64_t words = (n_dense + 63) / 64;
 	uint64_t *bits = NULL;
@@ -806,9 +1389,15 @@ int main(int argc, char *argv[])
 		        n_dense, thresh, (double)N * words * 8 / 1e6);
 	}
 
-	uint64_t *inter = (uint64_t *)xcalloc((size_t)N * N, sizeof *inter);
+	inter = (uint64_t *)xcalloc((size_t)N * N, sizeof *inter);
 
-	/* ---- one sweep: write presence rows and accumulate intersections --- */
+	/* private intersection matrices: only while they stay small */
+	int sth = nthreads;
+	while (sth > 1 && (double)N * N * 8.0 * sth > 2e9) sth--;
+	uint64_t **inter_t = (uint64_t **)xmalloc(sizeof(uint64_t *) * (size_t)sth);
+	inter_t[0] = inter;
+	for (int t = 1; t < sth; t++) inter_t[t] = (uint64_t *)xcalloc((size_t)N * N, sizeof(uint64_t));
+
 	snprintf(path, sizeof path, "%s.presence.tsv%s", prefix,
 	         compress ?
 #ifdef HAVE_ZSTD
@@ -821,54 +1410,50 @@ int main(int argc, char *argv[])
 	const char *phdr = "#kmer\tn_strains\tlist_strain_ids\n";
 	ow_puts(pw, phdr, strlen(phdr));
 
-	char kbuf[MAX_K + 1];
-	uint64_t written = 0, dense_col = 0, singletons = 0, core = 0;
-
-	for (size_t i = 0; i < nent; i++) {
-		kentry *e = ent[i];
-		uint32_t *ids = entry_ids(e);
-
-		if (e->n == 1) singletons++;
-		if (e->n == N) core++;
-
-		if (e->n > thresh) {
-			uint64_t w = dense_col >> 6;
-			uint64_t b = 1ULL << (dense_col & 63);
-			for (uint32_t a = 0; a < e->n; a++)
-				bits[(size_t)ids[a] * words + w] |= b;
-			dense_col++;
-		} else {
-			for (uint32_t a = 0; a < e->n; a++)
-				for (uint32_t b = a + 1; b < e->n; b++)
-					inter[(size_t)ids[a] * N + ids[b]]++;
+	sweep_ctx sc;
+	memset(&sc, 0, sizeof sc);
+	sc.sk = sk; sc.k = k; sc.N = N; sc.thresh = thresh; sc.words = words;
+	sc.bits = bits; sc.min_strains = min_strains; sc.max_strains = max_strains;
+	sc.inter_t = inter_t;
+	sc.out = (pbuf *)xcalloc((size_t)sth, sizeof(pbuf));
+	sc.dcount = (uint64_t *)xcalloc((size_t)sth, sizeof(uint64_t));
+	sc.dbase  = (uint64_t *)xcalloc((size_t)sth, sizeof(uint64_t));
+	sc.singletons = (uint64_t *)xcalloc((size_t)sth, sizeof(uint64_t));
+	sc.core       = (uint64_t *)xcalloc((size_t)sth, sizeof(uint64_t));
+	sc.written    = (uint64_t *)xcalloc((size_t)sth, sizeof(uint64_t));
+	const size_t ROUND = (size_t)sth << 18;
+	uint64_t dense_col = 0;
+	for (size_t r = 0; r < nent; r += ROUND) {
+		sc.lo = r; sc.hi = r + ROUND < nent ? r + ROUND : nent;
+		if (n_dense) {
+			par_run(sth, sweep_count_dense, &sc);
+			for (int t = 0; t < sth; t++) { sc.dbase[t] = dense_col; dense_col += sc.dcount[t]; }
 		}
-
-		if ((long)e->n < min_strains) continue;
-		if (max_strains > 0 && (long)e->n > max_strains) continue;
-
-		kmer_to_string(e->key, k, kbuf);
-		ow_puts(pw, kbuf, (size_t)k);
-		ow_ch(pw, '\t');
-		ow_u32(pw, e->n);
-		ow_ch(pw, '\t');
-		for (uint32_t a = 0; a < e->n; a++) {
-			if (a) ow_ch(pw, ',');
-			ow_u32(pw, ids[a]);
-		}
-		ow_ch(pw, '\n');
-		written++;
+		par_run(sth, sweep_part, &sc);
+		for (int t = 0; t < sth; t++) ow_puts(pw, sc.out[t].buf ? sc.out[t].buf : "", sc.out[t].len);
+	}
+	for (int t = 0; t < sth; t++) {
+		written += sc.written[t]; singletons += sc.singletons[t]; core += sc.core[t];
+		free(sc.out[t].buf);
 	}
 	ow_close(pw);
 	fprintf(stderr, "[presence] wrote %s (%" PRIu64 " of %zu k-mers)\n",
 	        path, written, nent);
 
+	if (sth > 1) {
+		sum_ctx su = { inter, inter_t + 1, sth - 1, (size_t)N * N };
+		par_run(nthreads, sum_matrices, &su);
+		for (int t = 1; t < sth; t++) free(inter_t[t]);
+	}
+	free(inter_t);
+	free(sc.out); free(sc.dcount); free(sc.dbase); free(sc.singletons); free(sc.core); free(sc.written);
+
 	if (n_dense) {
-		for (uint32_t i = 0; i < N; i++)
-			for (uint32_t j = i + 1; j < N; j++)
-				inter[(size_t)i * N + j] +=
-					and_popcount(bits + (size_t)i * words,
-					             bits + (size_t)j * words, words);
+		pop_ctx pc = { inter, bits, words, N, 0 };
+		par_run(nthreads, popcount_rows, &pc);
 		free(bits);
+	}
+	free(sk);
 	}
 
 	double t2 = now_s();
@@ -934,9 +1519,9 @@ int main(int argc, char *argv[])
 	free(sid);
 	free(files.path);
 	free(inter);
-	free(ent);
 	free(gs);
-	table_free(&table);
+	for (int x = 0; x < ntab; x++) table_free(&tabs[x]);
+	free(tabs);
 	free(prefix);
 	return 0;
 }

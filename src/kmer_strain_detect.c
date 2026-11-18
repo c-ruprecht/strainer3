@@ -46,12 +46,21 @@
  * .kmdb targets built from the same reads give identical counts and
  * total_evaluated when both use the same setting.
  *
- * Each metagenome is processed in its own thread. Because each thread only
- * writes to its own column index in the per-kmer count array, no mutex is
- * needed for count updates. The hash is read-only during scanning.
+ * Each metagenome is processed in its own thread and counts into its own
+ * cache-line-aligned column (one per target, indexed by k-mer row), so no
+ * two threads write the same cache line; the query index is read-only during
+ * scanning. With fewer targets than threads, the blocks of a .kmdb target are
+ * split over the spare threads (a key is in one block only, so the rows they
+ * write are disjoint). Workers are joined before the pool is destroyed.
+ *
+ * FASTQ lookups (k <= 31): the query k-mers are 2-bit packed into an
+ * open-addressing table with a bit prefilter; lookups are batched and
+ * prefetched. Window selection, orientation and pair dedup are unchanged, so
+ * counts are identical to the string path (still used for k > 31).
+ * test/speedup/run_tests_kmer_strain_detect.sh checks all of this.
  *
  * Usage:
- *   kmer_strain_detect -k <kmers[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-j threads]
+ *   kmer_strain_detect -k <kmers[.gz]> -B <targets.txt> -o <out.kmer_hits.tsv.gz> [-t threads] [-z level]
  *
  * Build without libzstd (no -DHAVE_ZSTD): .kmdb targets are rejected with an
  * error, everything else works as before.
@@ -97,11 +106,22 @@ typedef struct {
     int   type;
 } Metagenome;
 
-/* query k-mer, 2-bit packed canonical key -> its count vector */
+/* query k-mer, 2-bit packed canonical key -> its row (output order) */
 typedef struct {
     uint64_t      key;
-    unsigned int *counts;
+    uint32_t      row;
 } QKmer;
+
+/* 2-bit index of the query k-mers for FASTQ targets (k <= 31): bit
+   prefilter + open addressing with {key,row} slots; read-only while
+   scanning. Lookup order per read is batched so table loads overlap. */
+typedef struct { uint64_t key; uint32_t row1; } qslot;   /* row1 = row + 1, 0 = empty */
+typedef struct {
+    qslot    *slots;
+    uint64_t  mask;
+    uint64_t *bits;
+    int       bshift;
+} qindex;
 
 typedef struct {
     int        mg_idx;
@@ -110,6 +130,9 @@ typedef struct {
     int        seed;
     uint64_t  *total_kmer_counts;
     const QKmer *qk;     /* sorted by key; NULL unless a .kmdb target exists */
+    const qindex *qi;    /* FASTQ lookup index; NULL -> string hash (k > 31) */
+    unsigned int *col;   /* this target's private count column (by row) */
+    int        kmdb_helpers; /* threads for the blocks of one .kmdb target */
     size_t     n_qk;
     int        pair_dedup;   /* --pair-dedup */
     int        have_fastq;   /* any FASTQ target (for the .kmdb mismatch warning) */
@@ -122,6 +145,8 @@ typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t  has_work;
     pthread_cond_t  all_done;
+    pthread_t      *threads;
+    int             nthreads;
 } ksd_pool;
 
 typedef struct {
@@ -453,8 +478,9 @@ static void add_kmer_line(KmerLoad *L, char *line, int kmer_col, const char *del
     /* skip duplicates (same canonical kmer) */
     if (BIO_searchHash(L->h, oriented) != NULL) { L->n_dup++; return; }
 
-    unsigned int *counts = calloc(L->n_mg, sizeof(unsigned int));
-    BIO_addHashData(L->h, oriented, counts);
+    unsigned int *row = malloc(sizeof(unsigned int));   /* row = output order */
+    *row = (unsigned int)L->n;
+    BIO_addHashData(L->h, oriented, row);
 
     if (L->n == L->cap) {
         L->cap *= 2;
@@ -589,6 +615,8 @@ static inline int fset_add(fset_t *s, uint64_t key) {
 
 typedef struct {
     BIO_hash  h;
+    const qindex *qi;
+    unsigned int *col;          /* private count column of this target */
     int       k, mg_idx;
     uint64_t  total;            /* increments made = total_evaluated */
     uint64_t  hits;             /* query-k-mer increments made */
@@ -599,12 +627,75 @@ typedef struct {
     fset_t    fs;
 } scan_t;
 
+static inline uint64_t qi_hash(uint64_t key) { return mix64(key ^ 0x5bd1e9955bd1e995ull); }
+
+static inline int qi_probe(const qindex *qi, uint64_t key, uint64_t *hv) {
+    uint64_t h = qi_hash(key), b = h >> qi->bshift;
+    if (!(qi->bits[b >> 6] & (1ull << (b & 63)))) return 0;
+    __builtin_prefetch(&qi->slots[h & qi->mask]);
+    *hv = h;
+    return 1;
+}
+
+static inline uint32_t qi_resolve(const qindex *qi, uint64_t key, uint64_t h) {
+    uint64_t i = h & qi->mask;
+    for (;;) {
+        const qslot *sl = &qi->slots[i];
+        if (!sl->row1) return 0;
+        if (sl->key == key) return sl->row1;
+        i = (i + 1) & qi->mask;
+    }
+}
+
+#define QI_BATCH 32
+
+/* 2-bit path (k <= 31): same windows, orientation (max(fwd, rev) == the
+   strcmp-larger string for ACGT) and pair-dedup decisions as the string
+   loop below; only the query lookup is done on the packed key, batched. */
+static void scan_read_fast(scan_t *S, const char *s, size_t len, fset_t *fs) {
+    const int k = S->k;
+    const qindex *qi = S->qi;
+    const int shift = 2 * (k - 1);
+    const uint64_t mask = (1ull << (2 * k)) - 1;
+    uint64_t fwd = 0, rev = 0;
+    uint64_t pk[QI_BATCH], ph[QI_BATCH];
+    uint8_t  pc[QI_BATCH];          /* counted (1) or skipped by pair dedup (0) */
+    int run = 0, np = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t x = NT2BIT[(unsigned char)s[i]];
+        if (x > 3) { run = 0; fwd = rev = 0; continue; }
+        fwd = ((fwd << 2) | x) & mask;
+        rev = (rev >> 2) | ((uint64_t)(3 - x) << shift);
+        if (++run < k) continue;
+        uint64_t key = fwd > rev ? fwd : rev;
+        int counted = fs ? fset_add(fs, key) : 1;
+        if (counted) S->total++; else S->skip_total++;
+        if (qi_probe(qi, key, &ph[np])) {
+            pk[np] = key; pc[np] = (uint8_t)counted; np++;
+            if (np == QI_BATCH) {
+                for (int q = 0; q < np; q++) {
+                    uint32_t r1 = qi_resolve(qi, pk[q], ph[q]);
+                    if (!r1) continue;
+                    if (pc[q]) { S->col[r1 - 1]++; S->hits++; } else S->skip_hits++;
+                }
+                np = 0;
+            }
+        }
+    }
+    for (int q = 0; q < np; q++) {
+        uint32_t r1 = qi_resolve(qi, pk[q], ph[q]);
+        if (!r1) continue;
+        if (pc[q]) { S->col[r1 - 1]++; S->hits++; } else S->skip_hits++;
+    }
+}
+
 /* Count the k-mers of one read. fs != NULL: pair dedup (skip k-mers already
    counted in this pair). Only ACGT-only windows count, as in
    kmer_metagenome_db. */
 static void scan_read(scan_t *S, char *s, size_t len, fset_t *fs) {
     const int k = S->k;
     if (len < (size_t)k) return;
+    if (S->qi) { scan_read_fast(S, s, len, fs); return; }
     BIO_stringToUpper(s);
     if (len + 1 > S->rc_cap) {
         S->rc_cap = len + 1;
@@ -650,7 +741,7 @@ static void scan_read(scan_t *S, char *s, size_t len, fset_t *fs) {
 
         if (counted) {
             S->total++;
-            if (count) { count[S->mg_idx]++; S->hits++; }   /* only this thread writes this column */
+            if (count) { S->col[*count]++; S->hits++; }   /* private column of this target */
         } else {
             S->skip_total++;
             if (count) S->skip_hits++;
@@ -772,6 +863,7 @@ static void scan_target(ksd_job *job) {
     scan_t S;
     memset(&S, 0, sizeof S);
     S.h = job->h; S.k = job->seed; S.mg_idx = job->mg_idx;
+    S.qi = job->qi; S.col = job->col;
 
     const char *how;
     if (!job->pair_dedup) {
@@ -829,9 +921,75 @@ static size_t qk_lower_bound(const QKmer *qk, size_t lo, size_t n, uint64_t key)
     return lo;
 }
 
+typedef struct {
+    kmdb_t       *db;
+    const QKmer  *qk;
+    size_t        n_qk;
+    unsigned int *col;
+    const char   *path;
+    uint64_t      next_block, decoded, hits;     /* atomics */
+} kmdb_blk_ctx;
+
+/* match the query k-mers of one block against it (same logic as before:
+   binary search per query when they are few, linear merge otherwise) */
+static void *kmdb_blk_worker(void *arg) {
+    kmdb_blk_ctx *c = (kmdb_blk_ctx *)arg;
+    const QKmer *qk = c->qk;
+    const size_t n_qk = c->n_qk;
+    kmdb_block_buf buf;
+    kmdb_block_buf_init(&buf);
+    uint64_t decoded = 0, hits = 0;
+    for (;;) {
+        uint64_t b = __atomic_fetch_add(&c->next_block, 1, __ATOMIC_RELAXED);
+        if (b >= c->db->n_blocks) break;
+        const kmdb_block_info *bi = &c->db->blocks[b];
+        size_t j = qk_lower_bound(qk, 0, n_qk, bi->first_kmer);
+        if (j == n_qk || qk[j].key > bi->last_kmer) continue;   /* nothing here */
+
+        size_t jend = qk_lower_bound(qk, j, n_qk, bi->last_kmer);
+        if (jend < n_qk && qk[jend].key == bi->last_kmer) jend++;
+
+        long n = kmdb_read_block(c->db, b, &buf);
+        if (n < 0) {
+            fprintf(stderr, "error: cannot read %s\n", c->path);
+            exit(1);
+        }
+        decoded++;
+        const uint64_t *keys = buf.kmers;
+        size_t m = jend - j;
+        if (m * 24 < (size_t)n) {
+            for (; j < jend; j++) {
+                size_t lo = 0, hi = (size_t)n;
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if (keys[mid] < qk[j].key) lo = mid + 1; else hi = mid;
+                }
+                if (lo < (size_t)n && keys[lo] == qk[j].key) {
+                    c->col[qk[j].row] += buf.counts[lo];
+                    hits++;
+                }
+            }
+        } else {
+            size_t i = 0;
+            while (j < jend && i < (size_t)n) {
+                if      (keys[i] < qk[j].key) i++;
+                else if (keys[i] > qk[j].key) j++;
+                else {
+                    c->col[qk[j].row] += buf.counts[i];
+                    hits++; i++; j++;
+                }
+            }
+        }
+    }
+    kmdb_block_buf_free(&buf);
+    __atomic_fetch_add(&c->decoded, decoded, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&c->hits, hits, __ATOMIC_RELAXED);
+    return NULL;
+}
+
 static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
                       int mg_idx, uint64_t *total_kmer_counts, int pair_dedup,
-                      int have_fastq) {
+                      int have_fastq, unsigned int *col, int helpers) {
     kmdb_t *db = kmdb_open(path);
     if (!db) exit(1);
 
@@ -872,57 +1030,22 @@ static void scan_kmdb(const char *path, const QKmer *qk, size_t n_qk, int seed,
                 "this run are counted %s it; their counts are not comparable\n",
                 path, db_dedup ? "with" : "without", pair_dedup ? "with" : "without");
 
-    kmdb_block_buf buf;
-    kmdb_block_buf_init(&buf);
-    size_t j = 0;
-    uint64_t decoded = 0, hits = 0;
-    for (uint64_t b = 0; b < db->n_blocks && j < n_qk; b++) {
-        const kmdb_block_info *bi = &db->blocks[b];
-        j = qk_lower_bound(qk, j, n_qk, bi->first_kmer);
-        if (j == n_qk) break;
-        if (qk[j].key > bi->last_kmer) continue;          /* nothing here */
-
-        size_t jend = qk_lower_bound(qk, j, n_qk, bi->last_kmer);
-        if (jend < n_qk && qk[jend].key == bi->last_kmer) jend++;
-
-        long n = kmdb_read_block(db, b, &buf);
-        if (n < 0) {
-            fprintf(stderr, "error: cannot read %s\n", path);
-            exit(1);
-        }
-        decoded++;
-        const uint64_t *keys = buf.kmers;
-        size_t m = jend - j;
-        if (m * 24 < (size_t)n) {
-            /* few queries: binary-search each one in the block */
-            for (; j < jend; j++) {
-                size_t lo = 0, hi = (size_t)n;
-                while (lo < hi) {
-                    size_t mid = lo + (hi - lo) / 2;
-                    if (keys[mid] < qk[j].key) lo = mid + 1; else hi = mid;
-                }
-                if (lo < (size_t)n && keys[lo] == qk[j].key) {
-                    qk[j].counts[mg_idx] += buf.counts[lo];
-                    hits++;
-                }
-            }
-        } else {
-            /* many queries: linear merge */
-            size_t i = 0;
-            while (j < jend && i < (size_t)n) {
-                if      (keys[i] < qk[j].key) i++;
-                else if (keys[i] > qk[j].key) j++;
-                else {
-                    qk[j].counts[mg_idx] += buf.counts[i];
-                    hits++; i++; j++;
-                }
-            }
-            j = jend;
-        }
+    /* Blocks are matched independently (by `helpers` threads when there are
+       fewer targets than threads). A key occurs in one block only, so two
+       blocks never touch the same row of this target's private column. */
+    kmdb_blk_ctx bc = { db, qk, n_qk, col, path, 0, 0, 0 };
+    if (helpers < 1) helpers = 1;
+    if ((uint64_t)helpers > db->n_blocks) helpers = db->n_blocks ? (int)db->n_blocks : 1;
+    if (helpers == 1) kmdb_blk_worker(&bc);
+    else {
+        pthread_t *th = malloc(sizeof(pthread_t) * (size_t)helpers);
+        for (int t = 0; t < helpers; t++) pthread_create(&th[t], NULL, kmdb_blk_worker, &bc);
+        for (int t = 0; t < helpers; t++) pthread_join(th[t], NULL);
+        free(th);
     }
+    uint64_t decoded = bc.decoded, hits = bc.hits;
     fprintf(stderr, "  %s: decoded %" PRIu64 " / %" PRIu64 " blocks, %" PRIu64
             " query k-mers present\n", path, decoded, db->n_blocks, hits);
-    kmdb_block_buf_free(&buf);
     kmdb_close(db);
 }
 #endif
@@ -949,7 +1072,7 @@ static void *ksd_worker(void *arg) {
 #ifdef HAVE_ZSTD
             scan_kmdb(job->mg->file1, job->qk, job->n_qk, job->seed,
                       job->mg_idx, job->total_kmer_counts, job->pair_dedup,
-                      job->have_fastq);
+                      job->have_fastq, job->col, job->kmdb_helpers);
 #endif
         } else {
             scan_target(job);
@@ -973,10 +1096,10 @@ static ksd_pool *ksd_pool_create(int nthreads, int capacity) {
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->has_work, NULL);
     pthread_cond_init(&pool->all_done, NULL);
-    pthread_t *threads = malloc(sizeof(pthread_t) * nthreads);
+    pool->threads  = malloc(sizeof(pthread_t) * nthreads);
+    pool->nthreads = nthreads;
     for (int i = 0; i < nthreads; i++)
-        pthread_create(&threads[i], NULL, ksd_worker, pool);
-    free(threads);
+        pthread_create(&pool->threads[i], NULL, ksd_worker, pool);
     return pool;
 }
 
@@ -996,8 +1119,9 @@ static void ksd_pool_wait_and_destroy(ksd_pool *pool) {
     pool->shutdown = 1;
     pthread_cond_broadcast(&pool->has_work);
     pthread_mutex_unlock(&pool->mutex);
-    struct timespec ts = {0, 10000000};
-    nanosleep(&ts, NULL);
+    for (int i = 0; i < pool->nthreads; i++)      /* all workers gone before teardown */
+        pthread_join(pool->threads[i], NULL);
+    free(pool->threads);
     pthread_mutex_destroy(&pool->mutex);
     pthread_cond_destroy(&pool->has_work);
     pthread_cond_destroy(&pool->all_done);
@@ -1022,7 +1146,10 @@ static void usage(void) {
     fprintf(stderr, "  -n  output basename (default: -k filename without extensions);\n");
     fprintf(stderr, "      writes <-O>/<-n>.kmer_hits.tsv.gz\n");
     fprintf(stderr, "  -o  output file; overrides -O/-n (e.g. sample.kmer_hits.tsv.gz)\n");
-    fprintf(stderr, "  -t  threads (default: 4)   [was -j]\n");
+    fprintf(stderr, "  -t  threads (default: 4)   [was -j]; with fewer targets than threads\n");
+    fprintf(stderr, "      the blocks of a .kmdb target are split over the spare threads\n");
+    fprintf(stderr, "  -z  gzip level of the output, 1-9 (default: 9). Lower is much faster\n");
+    fprintf(stderr, "      for large k-mer sets; the TSV is identical, only the .gz bytes differ\n");
     fprintf(stderr, "  --pair-dedup (default) / --no-pair-dedup\n");
     fprintf(stderr, "      PE / PEI FASTQ targets: count each k-mer at most once per read pair\n");
     fprintf(stderr, "      (in R1, R2 or both, repeats included). SE targets are unchanged.\n");
@@ -1046,6 +1173,7 @@ int main(int argc, char *argv[]) {
     char *out_name        = NULL;
     int   num_threads     = 4;
     int   pair_dedup      = 1;
+    int   zlevel          = 9;     /* default 9 = byte-identical to before */
     int   c;
 
     enum { OPT_PAIR_DEDUP = 1000, OPT_NO_PAIR_DEDUP };
@@ -1056,7 +1184,7 @@ int main(int argc, char *argv[]) {
         { NULL, 0, NULL, 0 }
     };
     nt2bit_init();
-    while ((c = getopt_long(argc, argv, "k:B:G:O:n:o:t:j:h", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "k:B:G:O:n:o:t:j:z:h", longopts, NULL)) != -1) {
         switch (c) {
             case OPT_PAIR_DEDUP:    pair_dedup = 1; break;
             case OPT_NO_PAIR_DEDUP: pair_dedup = 0; break;
@@ -1067,6 +1195,7 @@ int main(int argc, char *argv[]) {
             case 'n': out_name        = strdup(optarg); break;
             case 'o': outfile         = strdup(optarg); break;
             case 't': num_threads     = atoi(optarg);   break;
+            case 'z': zlevel          = atoi(optarg);   break;
             case 'j': cli_renamed_flag("kmer_strain_detect", 'j', "-t"); break;
             case 'h': usage(); return 0;
             default:  usage(); return 1;
@@ -1152,8 +1281,8 @@ int main(int argc, char *argv[]) {
             char *oriented = orient_string(kmer_list[i], rc, seed);
             uint64_t key;
             if (kmdb_encode(oriented, seed, &key) != 0) continue;   /* cannot happen: ACGT only */
-            qk[n_qk].key    = key;
-            qk[n_qk].counts = (unsigned int *)BIO_searchHash(h, oriented);
+            qk[n_qk].key = key;
+            qk[n_qk].row = (uint32_t)i;              /* kmer_list[i] is row i */
             n_qk++;
         }
         qsort(qk, n_qk, sizeof(QKmer), cmp_qkmer);
@@ -1174,6 +1303,44 @@ int main(int argc, char *argv[]) {
                            : "OFF (--no-pair-dedup: every mate counted on its own)",
                 n_paired, n_fastq);
     uint64_t *total_kmer_counts = calloc(n_total, sizeof(uint64_t));
+
+    /* one private, cache-line-aligned count column per target */
+    size_t col_bytes = (((size_t)(n_kmers > 0 ? n_kmers : 1) * sizeof(unsigned int)) + 63) & ~(size_t)63;
+    unsigned int **cols = malloc((size_t)n_total * sizeof(unsigned int *));
+    for (int i = 0; i < n_total; i++) {
+        cols[i] = aligned_alloc(64, col_bytes);
+        if (!cols[i]) { perror("aligned_alloc"); exit(1); }
+        memset(cols[i], 0, col_bytes);
+    }
+
+    /* FASTQ lookup index (k <= 31, the packed range); k > 31: string hash */
+    qindex *qi = NULL;
+    if (n_kmers > 0 && n_fastq > 0 && seed <= 31) {
+        qi = calloc(1, sizeof *qi);
+        uint64_t cap = 1024;
+        while (cap < 2 * (uint64_t)n_kmers) cap <<= 1;
+        int lb = 16;
+        while (lb < 24 && ((uint64_t)1 << lb) < 16 * (uint64_t)n_kmers) lb++;
+        qi->slots = calloc(cap, sizeof(qslot));
+        qi->bits  = calloc(((uint64_t)1 << lb) / 64, sizeof(uint64_t));
+        if (!qi->slots || !qi->bits) { fprintf(stderr, "out of memory\n"); exit(1); }
+        qi->mask = cap - 1; qi->bshift = 64 - lb;
+        char rcb[MAX_KMER_LEN];
+        for (int i = 0; i < n_kmers; i++) {
+            size_t kl = strlen(kmer_list[i]);
+            memcpy(rcb, kmer_list[i], kl + 1);
+            BIO_reverseComplement(rcb);
+            const char *o = orient_string(kmer_list[i], rcb, seed);
+            uint64_t key = 0;
+            for (int q = 0; q < seed; q++) key = (key << 2) | NT2BIT[(unsigned char)o[q]];
+            uint64_t hv = qi_hash(key), b = hv >> qi->bshift;
+            qi->bits[b >> 6] |= 1ull << (b & 63);
+            uint64_t x = hv & qi->mask;
+            while (qi->slots[x].row1) x = (x + 1) & qi->mask;     /* keys are unique */
+            qi->slots[x].key = key; qi->slots[x].row1 = (uint32_t)i + 1;
+        }
+    }
+
     if (n_kmers > 0) {
         ksd_pool *pool = ksd_pool_create(num_threads, n_total + 1);
         for (int i = 0; i < n_total; i++) {
@@ -1185,6 +1352,9 @@ int main(int argc, char *argv[]) {
             job->total_kmer_counts = total_kmer_counts;
             job->qk               = qk;
             job->n_qk             = n_qk;
+            job->qi               = qi;
+            job->col              = cols[i];
+            job->kmdb_helpers     = num_threads / (n_total < num_threads ? n_total : num_threads);
             job->pair_dedup       = pair_dedup;
             job->have_fastq       = n_fastq > 0;
             ksd_pool_submit(pool, job);
@@ -1196,7 +1366,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* 4. write gzipped TSV output */
-    gzFile out = gzopen(outfile, "wb9");
+    if (zlevel < 1 || zlevel > 9) { fprintf(stderr, "-z must be 1..9\n"); return 1; }
+    char zmode[4] = { 'w', 'b', (char)('0' + zlevel), '\0' };
+    gzFile out = gzopen(outfile, zmode);
     if (!out) {
         fprintf(stderr, "cannot open output %s: %s\n", outfile, strerror(errno));
         return 1;
@@ -1207,21 +1379,29 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < n_total; i++) gzprintf(out, "\t%s", mgs[i].basename);
     gzprintf(out, "\n");
 
-    /* data rows — in the same order as the input file */
-    char kmer_rc[MAX_KMER_LEN];
+    /* data rows — in the same order as the input file; each row formatted
+       into one buffer (same bytes as "%s" + "\t%u"... + "\n") */
+    size_t rowcap = MAX_KMER_LEN + (size_t)n_total * 11 + 2;
+    char  *rowbuf = malloc(rowcap);
     for (int i = 0; i < n_kmers; i++) {
-        strncpy(kmer_rc, kmer_list[i], MAX_KMER_LEN - 1);
-        kmer_rc[MAX_KMER_LEN - 1] = '\0';
-        BIO_reverseComplement(kmer_rc);
-        char *oriented = orient_string(kmer_list[i], kmer_rc, seed);
-        unsigned int *counts = (unsigned int *)BIO_searchHash(h, oriented);
-
-        gzprintf(out, "%s", kmer_list[i]);
-        for (int j = 0; j < n_total; j++)
-            gzprintf(out, "\t%u", counts ? counts[j] : 0);
-        gzprintf(out, "\n");
+        size_t klen = strlen(kmer_list[i]);
+        char *w = rowbuf;
+        memcpy(w, kmer_list[i], klen); w += klen;
+        for (int j = 0; j < n_total; j++) {
+            unsigned int v = cols[j][i];
+            char tmp[10]; int nd = 0;
+            do { tmp[nd++] = (char)('0' + v % 10); v /= 10; } while (v);
+            *w++ = '\t';
+            while (nd) *w++ = tmp[--nd];
+        }
+        *w++ = '\n';
+        if (gzwrite(out, rowbuf, (unsigned)(w - rowbuf)) != (int)(w - rowbuf)) {
+            fprintf(stderr, "write error on %s\n", outfile);
+            return 1;
+        }
         free(kmer_list[i]);
     }
+    free(rowbuf);
 
     /* summary row: total_evaluated = sum of the counts of ALL k-mers of the
        sample (ACGT-only windows, after pair dedup), see the header comment */
@@ -1235,6 +1415,9 @@ int main(int argc, char *argv[]) {
 
     /* cleanup */
     free(qk);
+    if (qi) { free(qi->slots); free(qi->bits); free(qi); }
+    for (int i = 0; i < n_total; i++) free(cols[i]);
+    free(cols);
     free(total_kmer_counts);
     free(kmer_list);
     BIO_destroyHashD(h);
